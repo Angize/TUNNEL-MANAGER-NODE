@@ -166,13 +166,11 @@ def used_ids():
 
 
 def unique_name(ttype, tid):
-    for suf in range(0, 100):
-        name = f"{ttype}{tid}_{suf}"
-        if not os.path.exists(os.path.join(CONFIG_DIR, name + ".json")):
-            rc, _, _ = run(["ip", "link", "show", name])
-            if rc != 0:
-                return name
-    return None
+    name = f"{ttype}{tid}"
+    if os.path.exists(os.path.join(CONFIG_DIR, name + ".json")):
+        return None
+    rc, _, _ = run(["ip", "link", "show", name])
+    return name if rc != 0 else None
 
 # ----------------------------------------------------------------------------- network
 
@@ -285,7 +283,8 @@ def build_vxlan(cfg):
     run(["ip", "link", "del", f"veth{tid}b"])
     run(["ovs-vsctl", "--if-exists", "del-br", name])
     run(["ovs-vsctl", "add-br", name])
-    run(["ovs-vsctl", "add-port", name, f"vxlan{tid}", "--", "set", "interface", f"vxlan{tid}",
+    port = f"vx{tid}"  # tunnel port name must differ from the bridge name (name == vxlan{tid})
+    run(["ovs-vsctl", "add-port", name, port, "--", "set", "interface", port,
          "type=vxlan", f"options:remote_ip={cfg['remote_ip']}", f"options:local_ip={cfg['local_ip']}",
          f"options:key={tid}", "options:dst_port=4789", "options:csum=true"])
     _ovs_veth(cfg, 50)
@@ -297,7 +296,8 @@ def build_gre(cfg):
     run(["ip", "link", "del", f"veth{tid}b"])
     run(["ovs-vsctl", "--if-exists", "del-br", name])
     run(["ovs-vsctl", "add-br", name])
-    run(["ovs-vsctl", "add-port", name, f"gre{tid}", "--", "set", "interface", f"gre{tid}",
+    port = f"gr{tid}"  # tunnel port name must differ from the bridge name (name == gre{tid})
+    run(["ovs-vsctl", "add-port", name, port, "--", "set", "interface", port,
          "type=gre", f"options:remote_ip={cfg['remote_ip']}", f"options:local_ip={cfg['local_ip']}",
          f"options:key={tid}"])
     _ovs_veth(cfg, 24)
@@ -751,13 +751,8 @@ def op_portfw(d):
         if c.get("type") == "portfw" and c.get("iface") == iface and str(c.get("listen_port")) == lp:
             raise ValueError(f"port {lp} on {iface} is already forwarded (delete it first)")
     tid = int(d.get("id") or 0) or (max(used_ids(), default=41) + 1)
-    name = None
-    for suf in range(0, 100):
-        cand = f"portfw{tid}_{suf}"
-        if not os.path.exists(os.path.join(CONFIG_DIR, cand + ".json")):
-            name = cand
-            break
-    if not name:
+    name = f"portfw{tid}"
+    if os.path.exists(os.path.join(CONFIG_DIR, name + ".json")):
         raise ValueError("no free name")
     obj = {"name": name, "type": "portfw", "id": tid, "iface": iface, "listen_port": lp,
            "dst_ips": ips, "dst_port": dp, "switch_interval": interval,
