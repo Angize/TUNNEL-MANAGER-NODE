@@ -30,6 +30,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, wait as futures_wait
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -45,6 +46,10 @@ IFACE_RE = re.compile(r"^[A-Za-z0-9_.@-]+$")
 
 _apply_lock = threading.Lock()  # serialize all state mutations (API writes + rotation thread)
 _restart_pending = threading.Event()  # set once op_update swaps the binary → reject NEW mutating ops until the bounce
+_central_cb = None              # (ip, port) the panel last reached us from → where we call back /api/checkin
+_central_cb_lock = threading.Lock()
+_last_reported_ips = None       # last IP set we successfully checked in with (skip redundant check-ins)
+CHECKIN_GAP = 20                # seconds between our own IP-change checks
 
 # ----------------------------------------------------------------------------- config
 
@@ -166,13 +171,11 @@ def used_ids():
 
 
 def unique_name(ttype, tid):
-    for suf in range(0, 100):
-        name = f"{ttype}{tid}_{suf}"
-        if not os.path.exists(os.path.join(CONFIG_DIR, name + ".json")):
-            rc, _, _ = run(["ip", "link", "show", name])
-            if rc != 0:
-                return name
-    return None
+    name = f"{ttype}{tid}"
+    if os.path.exists(os.path.join(CONFIG_DIR, name + ".json")):
+        return None
+    rc, _, _ = run(["ip", "link", "show", name])
+    return name if rc != 0 else None
 
 # ----------------------------------------------------------------------------- network
 
@@ -285,7 +288,8 @@ def build_vxlan(cfg):
     run(["ip", "link", "del", f"veth{tid}b"])
     run(["ovs-vsctl", "--if-exists", "del-br", name])
     run(["ovs-vsctl", "add-br", name])
-    run(["ovs-vsctl", "add-port", name, f"vxlan{tid}", "--", "set", "interface", f"vxlan{tid}",
+    port = f"vx{tid}"  # tunnel port name must differ from the bridge name (name == vxlan{tid})
+    run(["ovs-vsctl", "add-port", name, port, "--", "set", "interface", port,
          "type=vxlan", f"options:remote_ip={cfg['remote_ip']}", f"options:local_ip={cfg['local_ip']}",
          f"options:key={tid}", "options:dst_port=4789", "options:csum=true"])
     _ovs_veth(cfg, 50)
@@ -297,7 +301,8 @@ def build_gre(cfg):
     run(["ip", "link", "del", f"veth{tid}b"])
     run(["ovs-vsctl", "--if-exists", "del-br", name])
     run(["ovs-vsctl", "add-br", name])
-    run(["ovs-vsctl", "add-port", name, f"gre{tid}", "--", "set", "interface", f"gre{tid}",
+    port = f"gr{tid}"  # tunnel port name must differ from the bridge name (name == gre{tid})
+    run(["ovs-vsctl", "add-port", name, port, "--", "set", "interface", port,
          "type=gre", f"options:remote_ip={cfg['remote_ip']}", f"options:local_ip={cfg['local_ip']}",
          f"options:key={tid}"])
     _ovs_veth(cfg, 24)
@@ -469,7 +474,9 @@ def health_of(cfg, thorough=False):
             try:
                 socket.create_connection((active, int(dp)), timeout=2).close()
                 reachable = True
-            except Exception:
+            except ConnectionRefusedError:
+                reachable = True   # host answered with RST -> IP is reachable, the port just isn't TCP-listening
+            except Exception:      # (normal for a UDP forward: WireGuard/OpenVPN-UDP). timeout/other -> unreachable
                 reachable = False
         return {"active": active, "rule": rule, "reachable": reachable, "up": rule}
     up = False
@@ -676,6 +683,61 @@ def _self_sha():
 _SELF_SHA = _self_sha()
 
 
+# ----------------------------------------------------------------------------- central check-in
+# The panel reaches us at host:port (from its registry). If our public IP changes, the panel can no
+# longer find us — so we phone home. We learn the panel's address purely from its INCOMING requests
+# (it stamps X-Central-Port; the source IP is the address it reached us from), never at install time.
+# When our IP set changes we POST /api/checkin so the panel can fix our host and heal the tunnels.
+
+def note_central(ip, port):
+    global _central_cb
+    try:
+        p = int(port)
+    except (TypeError, ValueError):
+        return
+    with _central_cb_lock:
+        _central_cb = (ip, p)
+
+
+def get_central():
+    with _central_cb_lock:
+        return _central_cb
+
+
+def do_checkin():
+    cb = get_central()
+    if not cb:
+        return False
+    try:
+        conf = load_conf()
+    except Exception:
+        return False
+    body = json.dumps({"token": conf.get("token", ""), "ips": all_ips(),
+                       "hostname": socket.gethostname()}).encode()
+    url = f"http://{cb[0]}:{cb[1]}/api/checkin"
+    req = urllib.request.Request(url, data=body, method="POST",
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=8) as r:
+            return bool(json.loads(r.read().decode()).get("ok"))
+    except Exception:
+        return False
+
+
+def checkin_loop():
+    """Watch our own IPs; when the set changes (or was never reported), keep phoning home until acked."""
+    global _last_reported_ips
+    while True:
+        time.sleep(CHECKIN_GAP)
+        try:
+            flat = sorted(local_ips_flat())
+            if flat and flat != _last_reported_ips:
+                if do_checkin():
+                    _last_reported_ips = flat
+        except Exception as e:
+            logline(f"checkin: {e}")
+
+
 def op_ping(d):
     cfgs = public_configs()
     stats = read_stats()
@@ -683,7 +745,7 @@ def op_ping(d):
         stats["net"] = _read_net(cfgs)   # per-tunnel + node byte counters (skipped if unreadable — never fails ping)
     except Exception:
         pass
-    return {"ok": True, "agent": "tnl-node", "version": 4, "ready": True,
+    return {"ok": True, "agent": "tnl-node", "version": 5, "ready": True,
             "hostname": socket.gethostname(), "ips": all_ips(), "sha256": _SELF_SHA,
             "ovs": run(["ovs-vsctl", "--version"])[0] == 0,
             "tunnels": len([c for c in cfgs if c.get("type") != "portfw"]),
@@ -751,13 +813,8 @@ def op_portfw(d):
         if c.get("type") == "portfw" and c.get("iface") == iface and str(c.get("listen_port")) == lp:
             raise ValueError(f"port {lp} on {iface} is already forwarded (delete it first)")
     tid = int(d.get("id") or 0) or (max(used_ids(), default=41) + 1)
-    name = None
-    for suf in range(0, 100):
-        cand = f"portfw{tid}_{suf}"
-        if not os.path.exists(os.path.join(CONFIG_DIR, cand + ".json")):
-            name = cand
-            break
-    if not name:
+    name = f"portfw{tid}"
+    if os.path.exists(os.path.join(CONFIG_DIR, name + ".json")):
         raise ValueError("no free name")
     obj = {"name": name, "type": "portfw", "id": tid, "iface": iface, "listen_port": lp,
            "dst_ips": ips, "dst_port": dp, "switch_interval": interval,
@@ -962,6 +1019,9 @@ class Handler(BaseHTTPRequestHandler):
         if not self._authed():
             self._send(401, {"error": "bad or missing node token"})
             return
+        cp = self.headers.get("X-Central-Port")
+        if cp:
+            note_central(self.client_address[0], cp)  # learn where to call /api/checkin back from
         if cmd not in OPS:
             self._send(404, {"error": "unknown endpoint"})
             return
@@ -1200,6 +1260,7 @@ def serve():
         logline(f"startup apply_all: {e}")
     threading.Thread(target=rotation_loop, daemon=True).start()
     threading.Thread(target=health_loop, daemon=True).start()  # keep the health snapshot fresh (O(1) op_list)
+    threading.Thread(target=checkin_loop, daemon=True).start()  # phone home to the panel if our IP changes
     httpd = ThreadingHTTPServer(("0.0.0.0", int(conf.get("port", 8099))), Handler)
     httpd.conf = conf
     print(f"tnl-node agent on http://0.0.0.0:{conf.get('port', 8099)}/  (self-contained, token-auth)")
