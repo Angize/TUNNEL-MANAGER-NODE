@@ -15,14 +15,14 @@
 
 ## ⚡ نصب
 
-روی هر سرورِ **نود**:
+روی هر سرورِ **نود** — تک‌خطی (با توکنِ دسترسی، چون ریپو private است):
 
 ```bash
-git clone https://github.com/Angize/TUNNEL-MANAGER-NODE.git
-cd TUNNEL-MANAGER-NODE && sudo python3 tnl-node.py --install
+curl -fsSL -H "Authorization: token <TOKEN>" https://raw.githubusercontent.com/Angize/TUNNEL-MANAGER-NODE/main/tnl-node.py -o tnl-node.py && sudo python3 tnl-node.py --install
 ```
 
-پورت را می‌پرسد، توکن می‌سازد و سرویس را راه می‌اندازد.
+> `<TOKEN>` = یک GitHub PAT با دسترسیِ **Contents: Read**.
+> جایگزینِ git: `git clone https://github.com/Angize/TUNNEL-MANAGER-NODE.git && cd TUNNEL-MANAGER-NODE && sudo python3 tnl-node.py --install`
 
 **بروزرسانی:** از پنل، تبِ **«بروزرسانیِ ایجنت»** → آپلود و push (بدونِ SSH).
 
