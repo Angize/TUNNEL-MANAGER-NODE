@@ -13,15 +13,18 @@
 
 ---
 
-## ⚡ نصبِ آسان
+## ⚡ نصب
 
-روی هر سرورِ **نود** بزن:
+روی هر سرورِ **نود**:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Angize/TUNNEL-MANAGER-NODE/main/tnl-node.py -o tnl-node.py && sudo python3 tnl-node.py --install
+git clone https://github.com/Angize/TUNNEL-MANAGER-NODE.git
+cd TUNNEL-MANAGER-NODE && sudo python3 tnl-node.py --install
 ```
 
 پورت را می‌پرسد، توکن می‌سازد و سرویس را راه می‌اندازد.
+
+**بروزرسانی:** از پنل، تبِ **«بروزرسانیِ ایجنت»** → آپلود و push (بدونِ SSH).
 
 ---
 
