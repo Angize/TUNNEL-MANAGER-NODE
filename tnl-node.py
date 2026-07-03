@@ -469,7 +469,9 @@ def health_of(cfg, thorough=False):
             try:
                 socket.create_connection((active, int(dp)), timeout=2).close()
                 reachable = True
-            except Exception:
+            except ConnectionRefusedError:
+                reachable = True   # host answered with RST -> IP is reachable, the port just isn't TCP-listening
+            except Exception:      # (normal for a UDP forward: WireGuard/OpenVPN-UDP). timeout/other -> unreachable
                 reachable = False
         return {"active": active, "rule": rule, "reachable": reachable, "up": rule}
     up = False
