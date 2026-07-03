@@ -2,157 +2,53 @@
 
 # 🛰️ tnl-node
 
-**ایجنتِ خودکفای نود برای کنترل‌پنلِ [tnl-central](https://github.com/Angize/TUNNEL-MANAGER)**
-
-روی هر سرورِ نود نصب می‌شود، خودش تونل می‌سازد (VXLAN / GRE / SIT) و پورت‌فوروارد می‌کند،
-بعد از ریبوت دوباره اعمالشان می‌کند — همه از طریقِ یک APIِ توکن‌دار که پنلِ مرکزی هدایتش می‌کند.
+**ایجنتِ خودکفای نود** برای [tnl-central](https://github.com/Angize/TUNNEL-MANAGER)
+خودش تونل و پورت‌فوروارد می‌سازد و بعد از ریبوت بازمی‌سازد.
 
 ![Python](https://img.shields.io/badge/Python-3.7%2B-3776AB?logo=python&logoColor=white)
-![Platform](https://img.shields.io/badge/Platform-Linux-333?logo=linux&logoColor=white)
-![Service](https://img.shields.io/badge/service-systemd-1793D1)
-![Self-contained](https://img.shields.io/badge/self--contained-no%20jq%2C%20no%20scripts-2ea875)
-![Auth](https://img.shields.io/badge/auth-token%20(X--Node--Token)-e67e22)
+![Linux](https://img.shields.io/badge/Linux-systemd-333?logo=linux&logoColor=white)
+![auth](https://img.shields.io/badge/auth-token-e67e22)
 
 </div>
 
 ---
 
-## ✨ این چیه؟
+## ⚡ نصبِ آسان
 
-`tnl-node` ایجنتی است که روی **هر سرورِ نود** نصب می‌شود و **کاملاً خودکفاست**: خودش تونل‌ها را می‌سازد
-(VXLAN/GRE با OpenvSwitch، SIT، و پورت‌فورواردِ iptables)، بعد از بوت بازسازی‌شان می‌کند و مقصدهای
-پورت‌فوروارد را می‌چرخاند — همه در همان پروسه. بدونِ `tnl.sh`، بدونِ `reload.sh`، بدونِ `jq` و بدونِ منو.
-
-هر عملیات از **پنلِ مرکزی** روی یک APIِ توکن‌دار هدایت می‌شود. هر درخواست باید هدرِ
-`X-Node-Token: <token>` را داشته باشد (مقایسهٔ constant-time).
-
-> 🔑 ترافیکِ تونل مستقیم بینِ همین نود و نودِ مقابل جریان دارد؛ مرکزی فقط فرمان می‌دهد.
-
----
-
-## 🚀 قابلیت‌ها
-
-| | |
-|---|---|
-| 🧩 **ساختِ تونل** | VXLAN و GRE روی OpenvSwitch، و SIT (IPv6) — نامِ تمیزِ `vxlan{id}` / `gre{id}` / `sit{id}` |
-| 🔀 **پورت‌فوروارد** | DNAT برای **TCP و UDP** (مناسبِ WireGuard/OpenVPN)، با چرخشِ زمان‌بندی‌شدهٔ چند مقصد |
-| ♻️ **پایداریِ بوت** | همهٔ تونل‌ها بعد از ریبوت خودکار بازساخته می‌شوند |
-| 🩹 **خودترمیمیِ آی‌پی** | اگر آی‌پیِ محلیِ تونل عوض شود، خودش اصلاح می‌کند |
-| 📞 **check-in** | اگر آی‌پیِ عمومیِ نود عوض شود، به مرکزی خبر می‌دهد تا دوباره پیدایش کند |
-| 📊 **آمارِ زنده** | CPU / RAM / دیسک / آپ‌تایم / شمارندهٔ ترافیکِ هر تونل |
-| 🔄 **بروزرسانیِ امن** | سورسِ جدید از پنل push می‌شود؛ validate-before-swap تضمین می‌کند نودِ خراب نشود |
-| 🔐 **احراز هویت** | توکنِ اختصاصی، مقایسهٔ constant-time |
-
----
-
-## 📦 پیش‌نیازها
-
-- یک سرورِ **Linux** با **systemd**
-- **Python 3.7+** (فقط کتابخانهٔ استاندارد)
-- `iproute2` (دستورِ `ip`) و `iptables`
-- `openvswitch-switch` — برای VXLAN/GRE (نصب‌کننده خودش تلاش می‌کند نصبش کند؛ SIT بدونِ آن هم کار می‌کند)
-
----
-
-## ⚙️ نصب
+روی هر سرورِ **نود** بزن:
 
 ```bash
-# ۱) فایل را روی سرورِ نود بگذار
-git clone https://github.com/Angize/TUNNEL-MANAGER-NODE.git
-cd TUNNEL-MANAGER-NODE
-
-# ۲) نصب: پورت را می‌پرسد، توکن می‌سازد، وابستگی‌ها را نصب و سرویس را راه می‌اندازد
-sudo python3 tnl-node.py --install
+curl -fsSL https://raw.githubusercontent.com/Angize/TUNNEL-MANAGER-NODE/main/tnl-node.py -o tnl-node.py && sudo python3 tnl-node.py --install
 ```
 
-پورتِ ایجنت پیش‌فرض `8099` است. بعد از نصب، اطلاعاتِ ثبت در پنل چاپ می‌شود.
+پورت را می‌پرسد، توکن می‌سازد و سرویس را راه می‌اندازد.
 
 ---
 
-## 🔗 ثبتِ نود در پنلِ مرکزی
-
-هر وقت خواستی host / port / token را ببینی:
+## 🔗 ثبت در پنل
 
 ```bash
 sudo python3 tnl-node.py --show
 ```
 
-```
-=== register this node in the central panel ===
-  host  : <آی‌پیِ-این-نود>
-  port  : 8099
-  token : <توکن>
-================================================
-```
-
-این سه مقدار را در تبِ **«نودها»**ی پنلِ مرکزی وارد کن. تمام — از این به بعد همه‌چیز از پنل مدیریت می‌شود.
+`host / port / token` را در تبِ **«نودها»**ی پنل وارد کن. تمام.
 
 ---
 
-## 🖥️ مدیریتِ محلی (منو)
+## ✨ قابلیت‌ها
 
-اجرای بدونِ آرگومان، منوی راه‌اندازی را باز می‌کند:
+- 🧩 VXLAN / GRE / SIT
+- 🔀 پورت‌فورواردِ TCP+UDP با چرخش
+- ♻️ بازسازیِ خودکار بعد از بوت
+- 📞 خبردادن به پنل هنگام تغییرِ آی‌پی
+- 🔐 APIِ توکن‌دار
 
-```bash
-sudo python3 tnl-node.py
-```
-
-| گزینه | کار |
-|---|---|
-| **Install / reinstall** | نصبِ وابستگی‌ها + سرویس |
-| **Show connection info** | نمایشِ host / port / token |
-| **Restart service** | ری‌استارتِ ایجنت (تونل‌ها موقعِ بوت بازساخته می‌شوند) |
-| **Change port** | تغییرِ پورتِ ایجنت |
-| **Regenerate token** | ساختِ توکنِ جدید (توکنِ قبلی از کار می‌افتد) |
-| **Status** | وضعیتِ سرویس، تعدادِ تونل‌ها و پورت‌فورواردها |
-| **Uninstall** | حذفِ سرویس (تونل‌ها و کانفیگ‌ها حفظ می‌شوند) |
+**پیش‌نیاز:** Python 3 · iproute2 · iptables · openvswitch (برای VXLAN/GRE)
 
 ---
 
-## 📡 خلاصهٔ API (همه توکن‌دار)
+<div align="center">
 
-| اندپوینت | کار |
-|---|---|
-| `GET /api/ping` | سلامت + آمار + آی‌پی‌ها + نسخهٔ ایجنت |
-| `GET /api/list` | فهرستِ کانفیگ‌ها + وضعیتِ سلامت |
-| `POST /api/tunnel` | ساختِ یک سرِ تونل |
-| `POST /api/portfw` | ساختِ پورت‌فوروارد |
-| `POST /api/portfw-edit` · `portfw-next` | ویرایش / چرخشِ دستیِ پورت‌فوروارد |
-| `POST /api/check` | پروبِ زندهٔ سلامتِ یک تونل |
-| `POST /api/delete` | حذفِ یک کانفیگ |
-| `POST /api/apply` | بازاعمالِ همهٔ کانفیگ‌ها |
-| `POST /api/update` | جایگزینیِ سورسِ ایجنت (validate-before-swap) |
+کنترل‌پنل 👉 [**tnl-central**](https://github.com/Angize/TUNNEL-MANAGER) • مجوز 👉 [LICENSE](./LICENSE)
 
----
-
-## 🔐 امنیت
-
-- روی **HTTP ساده** کار می‌کند — **پورتِ ایجنت را فقط به سرورِ مرکزی باز کن** (شبکهٔ مطمئن / VPN).
-- توکن را محرمانه نگه دار؛ اگر لو رفت، از منو **Regenerate token** بزن و در پنل به‌روزش کن.
-- سرویس با دسترسیِ root اجرا می‌شود (برای ساختِ اینترفیس و قواعدِ iptables لازم است).
-
----
-
-## 📁 مسیرِ داده‌ها
-
-همه‌چیز زیرِ `/opt/tunnel/` است:
-
-| فایل | محتوا |
-|---|---|
-| `node.conf` | پورت + توکن |
-| `<name>.json` | کانفیگِ هر تونل / پورت‌فوروارد |
-| `node-agent.log` | لاگِ ایجنت |
-
----
-
-## 🤝 ریپوی مرتبط
-
-| | |
-|---|---|
-| 🌐 **کنترل‌پنلِ مرکزی** | [Angize/TUNNEL-MANAGER](https://github.com/Angize/TUNNEL-MANAGER) |
-
----
-
-## 📄 مجوز
-
-زیرِ مجوزِ فایلِ [`LICENSE`](./LICENSE) در همین ریپو.
+</div>
