@@ -308,8 +308,9 @@ def build_vxlan(cfg):
     _modprobe("vxlan")   # `ip link add type vxlan` does not auto-load the module
     _purge_ovs(cfg)      # migrate: clear any OVS bridge/veth left by the old scheme so the name is free
     run(["ip", "link", "del", name])
+    dstport = int(cfg.get("port") or 4789)   # UDP port is now settable (default 4789) — e.g. to dodge a filter
     run(["ip", "link", "add", name, "type", "vxlan", "id", str(cfg["id"]),
-         "local", cfg["local_ip"], "remote", cfg["remote_ip"], "dstport", "4789"])
+         "local", cfg["local_ip"], "remote", cfg["remote_ip"], "dstport", str(dstport)])
     run(["ip", "addr", "add", cfg["tunnel_ip"], "dev", name])
     run(["ip", "link", "set", name, "up"])
     run(["ip", "link", "set", "dev", name, "mtu", str(base_mtu() - 50)])  # IP20+UDP8+VXLAN8+innerEth14
@@ -1100,7 +1101,7 @@ def op_ping(d):
         stats["net"] = net
     except Exception:
         pass
-    return {"ok": True, "agent": "tnl-node", "version": 17, "ready": True,
+    return {"ok": True, "agent": "tnl-node", "version": 18, "ready": True,
             "hostname": socket.gethostname(), "ips": all_ips(), "sha256": _SELF_SHA,
             "tunnels": len([c for c in cfgs if c.get("type") != "portfw"]),
             "portfw": len([c for c in cfgs if c.get("type") == "portfw"]),
@@ -1142,7 +1143,7 @@ def op_tunnel(d):
     tunnel_ip = derive_tunnel_ip(ttype, self_ip, peer_ip, subnet)
     obj = {"name": name, "type": ttype, "id": tid, "iface": iface,
            "remote_ip": peer_ip, "tunnel_ip": tunnel_ip, "local_ip": self_ip}
-    if ttype in ("l2tpv3", "fou", "engine"):   # optional UDP port (blank -> derived from id); pins both ends to the same port
+    if ttype in ("l2tpv3", "fou", "engine", "vxlan"):   # optional UDP port; l2tp/fou/engine blank->from id, vxlan blank->4789
         if d.get("port") not in (None, ""):
             port = int(d["port"])
             if not 1 <= port <= 65535:
