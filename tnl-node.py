@@ -449,6 +449,10 @@ def _pf_acct_rules(cfg):
     lp, nm = str(cfg.get("listen_port", "")), cfg.get("name", "")
     if not (lp.isdigit() and NAME_RE.match(nm)):
         return []
+    scope = []
+    iface = cfg.get("iface") or ""
+    if IFACE_RE.match(iface):   # scope to the listen iface like the DNAT does, so two same-port forwards on
+        scope = ["-i", iface]   # different ifaces don't collide (shared -j RETURN) or count each other's traffic
     ct = ["-m", "conntrack"]
     lip = cfg.get("listen_ip") or ""
     if is_ipv4(lip):
@@ -456,8 +460,8 @@ def _pf_acct_rules(cfg):
     ct += ["--ctorigdstport", lp]
     out = []
     for dirn, ctdir in (("in", "ORIGINAL"), ("out", "REPLY")):
-        out.append(ct + ["--ctdir", ctdir, "-m", "comment", "--comment",
-                         f"pfacct:{nm}:{dirn}", "-j", "RETURN"])
+        out.append(scope + ct + ["--ctdir", ctdir, "-m", "comment", "--comment",
+                                 f"pfacct:{nm}:{dirn}", "-j", "RETURN"])
     return out
 
 
@@ -784,9 +788,18 @@ def _read_net(cfgs):
         v = raw.get(iface)
         if v:
             net[nm] = v
-    pi = _default_iface_name()
-    if pi and pi in raw:
-        net["_node"] = raw[pi]
+    # whole-node throughput = sum over ALL physical NICs, not the momentary default-route iface: a
+    # default-route flap must not make the central subtract two unrelated netdev counters (phantom spike).
+    trx = ttx = 0
+    seen = False
+    for ifn in list_ifaces():
+        v = raw.get(ifn)
+        if v:
+            trx += v[0]
+            ttx += v[1]
+            seen = True
+    if seen:
+        net["_node"] = [trx, ttx]
     return net
 
 
@@ -961,7 +974,7 @@ def op_ping(d):
         stats["net"] = net
     except Exception:
         pass
-    return {"ok": True, "agent": "tnl-node", "version": 12, "ready": True,
+    return {"ok": True, "agent": "tnl-node", "version": 13, "ready": True,
             "hostname": socket.gethostname(), "ips": all_ips(), "sha256": _SELF_SHA,
             "ovs": run(["ovs-vsctl", "--version"])[0] == 0,
             "tunnels": len([c for c in cfgs if c.get("type") != "portfw"]),
@@ -1015,21 +1028,28 @@ def op_tunnel(d):
         if len(psk) < 32:
             raise ValueError("ipsec needs a psk")
         obj["psk"] = psk
+    old = read_config(name)   # in-place rebuild: fully tear the previous build down first so nothing tied to a
+    if old and old.get("type") != "portfw":   # now-overwritten field (e.g. FOU's old UDP-port decap listener) leaks
+        teardown_config(old)
     write_config(name, obj)
     try:
         apply_config(obj)
     except Exception as e:
         return {"ok": False, "msg": str(e)}
-    if ttype in ("ipip", "l2tpv3", "fou", "ipsec"):  # these `ip` builds don't raise on failure; verify the netdev is really there
+    # builds run `ip`/`ovs-vsctl` via run() which never raises on failure, so verify the netdev really exists
+    if ttype in ("vxlan", "gre"):
+        rc, _, _ = run(["ovs-vsctl", "br-exists", name])
+    else:
         rc, _, _ = run(["ip", "link", "show", name])
-        if rc != 0:
-            teardown_config(obj)
-            try:
-                os.remove(os.path.join(CONFIG_DIR, name + ".json"))
-            except OSError:
-                pass
-            need = {"ipip": "ipip", "l2tpv3": "l2tp_eth", "fou": "fou و ipip", "ipsec": "xfrm_interface"}[ttype]
-            return {"ok": False, "msg": f"اینترفیسِ {ttype} ساخته نشد — ماژولِ کرنلِ «{need}» روی این نود نصب/فعال نیست"}
+    if rc != 0:
+        teardown_config(obj)
+        try:
+            os.remove(os.path.join(CONFIG_DIR, name + ".json"))
+        except OSError:
+            pass
+        need = {"vxlan": "openvswitch", "gre": "openvswitch", "sit": "sit", "ipip": "ipip",
+                "l2tpv3": "l2tp_eth", "fou": "fou و ipip", "ipsec": "xfrm_interface"}[ttype]
+        return {"ok": False, "msg": f"اینترفیسِ {ttype} ساخته نشد — «{need}» روی این نود نصب/فعال نیست"}
     return {"ok": True, "name": name, "tunnel_ip": tunnel_ip}
 
 
