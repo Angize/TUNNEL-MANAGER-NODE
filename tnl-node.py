@@ -257,6 +257,14 @@ def base_mtu():
 
 # ----------------------------------------------------------------------------- build / teardown
 
+def _modprobe(*mods):
+    """Best-effort load of the kernel modules a tunnel type needs. The new `ip link add type ...` and
+    `ip l2tp` netlink APIs do NOT auto-load their modules (unlike the old `ip tunnel add`), so an FOU or
+    L2TPv3 build silently fails to create its netdev on any node where the module isn't already resident."""
+    for m in mods:
+        run(["modprobe", m])
+
+
 def enable_ip_forward():
     run(["sysctl", "-w", "net.ipv4.ip_forward=1"])
     try:
@@ -323,6 +331,7 @@ def build_sit(cfg):
 def build_ipip(cfg):
     """IPv4-in-IPv4 — the lightest L3 tunnel (20-byte overhead). Same shape as SIT but v4."""
     name = cfg["name"]
+    _modprobe("ipip")
     run(["ip", "link", "del", name])
     run(["ip", "tunnel", "add", name, "mode", "ipip", "remote", cfg["remote_ip"],
          "local", cfg["local_ip"], "ttl", "255"])
@@ -342,6 +351,7 @@ def build_l2tp(cfg):
     ends (same tunnel_id/session_id/port each side), so a point-to-point pair matches without coordination."""
     name = cfg["name"]
     tid, port = _l2tp_ids(cfg)
+    _modprobe("l2tp_eth", "l2tp_netlink")   # l2tp_eth pulls l2tp_core; without it the session netdev never appears
     run(["ip", "l2tp", "del", "session", "tunnel_id", str(tid), "session_id", str(tid)])
     run(["ip", "l2tp", "del", "tunnel", "tunnel_id", str(tid)])
     run(["ip", "link", "del", name])
@@ -364,7 +374,7 @@ def build_fou(cfg):
     port. The FOU listener decapsulates ipip-in-udp on our port; the ipip link encaps to the peer's port."""
     name = cfg["name"]
     port = _fou_port(cfg)
-    run(["modprobe", "fou"])
+    _modprobe("fou", "ipip")   # ipip is REQUIRED: `ip link add type ipip encap fou` won't auto-load it
     run(["ip", "link", "del", name])
     run(["ip", "fou", "add", "port", str(port), "ipproto", "4"])  # decap listener (harmless if already there)
     run(["ip", "link", "add", "name", name, "type", "ipip", "remote", cfg["remote_ip"],
@@ -406,6 +416,7 @@ def build_ipsec(cfg):
     tid, enc, auth, spi_out, spi_in = _ipsec_params(cfg)
     if not cfg.get("psk"):
         raise ValueError("ipsec needs a psk")
+    _modprobe("esp4", "xfrm_interface")   # defensive: xfrm usually auto-loads, but make the netdev creation deterministic
     _ipsec_clear(cfg)
     common = ["proto", "esp", "mode", "tunnel", "reqid", str(tid),
               "enc", "cbc(aes)", "0x" + enc, "auth", "hmac(sha256)", "0x" + auth, "if_id", str(tid)]
@@ -950,7 +961,7 @@ def op_ping(d):
         stats["net"] = net
     except Exception:
         pass
-    return {"ok": True, "agent": "tnl-node", "version": 10, "ready": True,
+    return {"ok": True, "agent": "tnl-node", "version": 11, "ready": True,
             "hostname": socket.gethostname(), "ips": all_ips(), "sha256": _SELF_SHA,
             "ovs": run(["ovs-vsctl", "--version"])[0] == 0,
             "tunnels": len([c for c in cfgs if c.get("type") != "portfw"]),
@@ -1009,6 +1020,16 @@ def op_tunnel(d):
         apply_config(obj)
     except Exception as e:
         return {"ok": False, "msg": str(e)}
+    if ttype in ("ipip", "l2tpv3", "fou", "ipsec"):  # these `ip` builds don't raise on failure; verify the netdev is really there
+        rc, _, _ = run(["ip", "link", "show", name])
+        if rc != 0:
+            teardown_config(obj)
+            try:
+                os.remove(os.path.join(CONFIG_DIR, name + ".json"))
+            except OSError:
+                pass
+            need = {"ipip": "ipip", "l2tpv3": "l2tp_eth", "fou": "fou/ipip", "ipsec": "xfrm_interface"}[ttype]
+            return {"ok": False, "msg": f"{ttype}: interface not created — kernel module '{need}' missing on this node"}
     return {"ok": True, "name": name, "tunnel_ip": tunnel_ip}
 
 
