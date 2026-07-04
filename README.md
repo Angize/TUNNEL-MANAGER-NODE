@@ -15,16 +15,18 @@
 
 ## ⚡ نصب
 
-روی هر سرورِ **نود** — تک‌خطی (با توکنِ دسترسی، چون ریپو private است):
+**ساده‌ترین راه — از پنل:** در **«افزودنِ نود» → خودکار**، فقط مشخصاتِ SSHِ سرور را بده؛ پنل خودش وارد می‌شود، ایجنت را نصب می‌کند، توکن می‌سازد و نود را وصل می‌کند.
+
+نصبِ دستی روی سرورِ نود — تک‌خطی:
 
 ```bash
-curl -fsSL -H "Authorization: token <TOKEN>" https://raw.githubusercontent.com/Angize/TUNNEL-MANAGER-NODE/main/tnl-node.py -o tnl-node.py && sudo python3 tnl-node.py --install
+curl -fsSL https://raw.githubusercontent.com/Angize/TUNNEL-MANAGER-NODE/main/tnl-node.py -o tnl-node.py && sudo python3 tnl-node.py --install
 ```
 
-> `<TOKEN>` = یک GitHub PAT با دسترسیِ **Contents: Read**.
 > جایگزینِ git: `git clone https://github.com/Angize/TUNNEL-MANAGER-NODE.git && cd TUNNEL-MANAGER-NODE && sudo python3 tnl-node.py --install`
+> نصبِ غیرتعاملی (همان چیزی که پنل اجرا می‌کند): `sudo python3 tnl-node.py --auto-install <port>`
 
-**بروزرسانی:** از پنل، تبِ **«بروزرسانیِ ایجنت»** → آپلود و push (بدونِ SSH).
+**بروزرسانی:** از پنل، تبِ **تنظیمات → بروزرسانیِ ایجنت** → آپلود و push (بدونِ SSH).
 
 ---
 
