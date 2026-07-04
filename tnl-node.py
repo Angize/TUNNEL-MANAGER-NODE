@@ -95,6 +95,8 @@ def is_ipv4(s):
 
 
 def valid_cidr(s, want6):
+    if "/" not in str(s):   # a bare IP has no prefix: ip_network() treats it as /32, but derive_tunnel_ip needs the slash
+        return False
     try:
         return ipaddress.ip_network(s, strict=False).version == (6 if want6 else 4)
     except Exception:
@@ -107,7 +109,9 @@ def ip2int(s):
 
 def derive_tunnel_ip(ttype, local_ip, remote_ip, subnet):
     """Same rule as the fleet: smaller public IP => .1, larger => .2 (never a custom host)."""
-    base, prefix = subnet.split("/")[0], subnet.split("/")[1]
+    parts = subnet.split("/")
+    base = parts[0]
+    prefix = parts[1] if len(parts) > 1 else ("64" if ttype == "sit" else "24")   # never IndexError on a prefix-less subnet
     host = "1" if ip2int(local_ip) < ip2int(remote_ip) else "2"
     if ttype == "sit":
         base = base[:-2] if base.endswith("::") else base.rstrip(":")
@@ -974,7 +978,7 @@ def op_ping(d):
         stats["net"] = net
     except Exception:
         pass
-    return {"ok": True, "agent": "tnl-node", "version": 13, "ready": True,
+    return {"ok": True, "agent": "tnl-node", "version": 14, "ready": True,
             "hostname": socket.gethostname(), "ips": all_ips(), "sha256": _SELF_SHA,
             "ovs": run(["ovs-vsctl", "--version"])[0] == 0,
             "tunnels": len([c for c in cfgs if c.get("type") != "portfw"]),
