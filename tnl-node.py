@@ -9,8 +9,9 @@
 # Node dependencies: python3, iproute2 (ip), iptables, and openvswitch-switch (for VXLAN/GRE).
 #
 # Usage:
-#   sudo python3 tnl-node.py --install     # set port + generate token, install+start the service
-#   sudo python3 tnl-node.py --show        # print host / port / token for the central panel
+#   sudo python3 tnl-node.py --install         # set port + generate token, install+start the service
+#   sudo python3 tnl-node.py --auto-install P  # non-interactive install on port P (panel SSH provisioning)
+#   sudo python3 tnl-node.py --show            # print host / port / token for the central panel
 #   sudo python3 tnl-node.py               # run (used by systemd): re-applies configs, then serves
 #
 # Auth: every request must carry header  X-Node-Token: <token>  (constant-time compared).
@@ -1117,6 +1118,34 @@ def do_install():
     do_show()
 
 
+def do_auto_install(port):
+    """Non-interactive install for the central panel's SSH auto-provisioning.
+    Prints machine-parseable markers the panel greps for (token/port)."""
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    os.chmod(CONFIG_DIR, 0o700)
+    if os.path.realpath(SELF_PATH) != INSTALLED:
+        shutil.copy2(SELF_PATH, INSTALLED)
+        os.chmod(INSTALLED, 0o755)
+    conf = load_conf() if os.path.isfile(NODE_CONF) else {}
+    try:
+        conf["port"] = int(str(port).strip())
+    except Exception:
+        conf["port"] = conf.get("port", 8099)
+    if not 1 <= conf["port"] <= 65535:
+        conf["port"] = 8099
+    if not conf.get("token"):
+        conf["token"] = secrets.token_urlsafe(32)
+    save_conf(conf)
+    install_deps()
+    write_service()
+    svc("enable")
+    svc("restart")
+    print("[✔] node agent installed and started.")
+    print("TNL_INSTALL_OK")
+    print(f"TNL_NODE_PORT={conf['port']}")
+    print(f"TNL_NODE_TOKEN={conf['token']}")
+
+
 def do_show():
     if not os.path.isfile(NODE_CONF):
         print("Not configured yet - run Install first.")
@@ -1279,6 +1308,11 @@ def main():
             print("Run as root (sudo).")
             sys.exit(1)
         do_install()
+    elif arg == "--auto-install":
+        if os.geteuid() != 0:
+            print("Run as root (sudo).")
+            sys.exit(1)
+        do_auto_install(sys.argv[2] if len(sys.argv) > 2 else "8099")
     elif arg == "--show":
         do_show()
     else:
