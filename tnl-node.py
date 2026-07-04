@@ -133,6 +133,7 @@ def public_configs():
     for c in raw_configs():
         c = dict(c)
         c.pop("remote_password", None)  # never expose secrets over the API
+        c.pop("psk", None)              # IPsec pre-shared key stays on the node
         out.append(c)
     return out
 
@@ -319,6 +320,107 @@ def build_sit(cfg):
     run(["ip", "link", "set", "dev", name, "mtu", str(base_mtu() - 28 - 20)])
 
 
+def build_ipip(cfg):
+    """IPv4-in-IPv4 — the lightest L3 tunnel (20-byte overhead). Same shape as SIT but v4."""
+    name = cfg["name"]
+    run(["ip", "link", "del", name])
+    run(["ip", "tunnel", "add", name, "mode", "ipip", "remote", cfg["remote_ip"],
+         "local", cfg["local_ip"], "ttl", "255"])
+    run(["ip", "addr", "add", cfg["tunnel_ip"], "dev", name])
+    run(["ip", "link", "set", name, "up"])
+    run(["ip", "link", "set", "dev", name, "mtu", str(base_mtu() - 20)])
+
+
+def _l2tp_ids(cfg):
+    tid = int(cfg["id"])
+    port = int(cfg.get("port") or (20000 + tid))
+    return tid, port
+
+
+def build_l2tp(cfg):
+    """L2TPv3 pseudowire over UDP — NAT-friendly, picks its own UDP port. Symmetric ids/ports on both
+    ends (same tunnel_id/session_id/port each side), so a point-to-point pair matches without coordination."""
+    name = cfg["name"]
+    tid, port = _l2tp_ids(cfg)
+    run(["ip", "l2tp", "del", "session", "tunnel_id", str(tid), "session_id", str(tid)])
+    run(["ip", "l2tp", "del", "tunnel", "tunnel_id", str(tid)])
+    run(["ip", "link", "del", name])
+    run(["ip", "l2tp", "add", "tunnel", "tunnel_id", str(tid), "peer_tunnel_id", str(tid),
+         "encap", "udp", "local", cfg["local_ip"], "remote", cfg["remote_ip"],
+         "udp_sport", str(port), "udp_dport", str(port)])
+    run(["ip", "l2tp", "add", "session", "name", name, "tunnel_id", str(tid),
+         "session_id", str(tid), "peer_session_id", str(tid)])
+    run(["ip", "addr", "add", cfg["tunnel_ip"], "dev", name])
+    run(["ip", "link", "set", name, "up"])
+    run(["ip", "link", "set", "dev", name, "mtu", str(base_mtu() - 54)])
+
+
+def _fou_port(cfg):
+    return int(cfg.get("port") or (20000 + int(cfg["id"])))
+
+
+def build_fou(cfg):
+    """IPIP wrapped in Foo-over-UDP — an L3 tunnel that rides UDP so it crosses NAT and lets you pick the
+    port. The FOU listener decapsulates ipip-in-udp on our port; the ipip link encaps to the peer's port."""
+    name = cfg["name"]
+    port = _fou_port(cfg)
+    run(["modprobe", "fou"])
+    run(["ip", "link", "del", name])
+    run(["ip", "fou", "add", "port", str(port), "ipproto", "4"])  # decap listener (harmless if already there)
+    run(["ip", "link", "add", "name", name, "type", "ipip", "remote", cfg["remote_ip"],
+         "local", cfg["local_ip"], "ttl", "255", "encap", "fou",
+         "encap-sport", "auto", "encap-dport", str(port)])
+    run(["ip", "addr", "add", cfg["tunnel_ip"], "dev", name])
+    run(["ip", "link", "set", name, "up"])
+    run(["ip", "link", "set", "dev", name, "mtu", str(base_mtu() - 28)])
+
+
+def _ipsec_params(cfg):
+    """Deterministic ESP parameters for one side. Keys come from the shared psk (distinct enc/auth keys);
+    SPIs derive from the tunnel id; direction (which SPI is outbound) is decided by comparing the two
+    public IPs so both ends agree without extra coordination. if_id binds the SAs to the xfrm interface."""
+    tid = int(cfg["id"])
+    psk = str(cfg.get("psk") or "")
+    enc = hashlib.sha256((psk + "|enc").encode()).hexdigest()          # 32 bytes -> aes-256
+    auth = hashlib.sha256((psk + "|auth").encode()).hexdigest()        # 32 bytes -> hmac(sha256)
+    spi_lo, spi_hi = 0x10000 + tid, 0x20000 + tid
+    local_smaller = ip2int(cfg["local_ip"]) < ip2int(cfg["remote_ip"])
+    spi_out, spi_in = (spi_lo, spi_hi) if local_smaller else (spi_hi, spi_lo)
+    return tid, enc, auth, spi_out, spi_in
+
+
+def _ipsec_clear(cfg):
+    name = cfg["name"]
+    tid = int(cfg["id"])
+    for spi in (0x10000 + tid, 0x20000 + tid):
+        run(["ip", "xfrm", "state", "deleteall", "proto", "esp", "spi", hex(spi)])
+    for dirn in ("out", "in", "fwd"):
+        run(["ip", "xfrm", "policy", "deleteall", "dir", dirn, "if_id", str(tid)])
+    run(["ip", "link", "del", name])
+
+
+def build_ipsec(cfg):
+    """Route-based IPsec via an xfrm interface + static-key ESP (no IKE daemon). Traffic routed into the
+    xfrm device is tagged with if_id, matched by the policies, and ESP-encapsulated to the peer."""
+    name, local, remote = cfg["name"], cfg["local_ip"], cfg["remote_ip"]
+    tid, enc, auth, spi_out, spi_in = _ipsec_params(cfg)
+    if not cfg.get("psk"):
+        raise ValueError("ipsec needs a psk")
+    _ipsec_clear(cfg)
+    common = ["proto", "esp", "mode", "tunnel", "reqid", str(tid),
+              "enc", "cbc(aes)", "0x" + enc, "auth", "hmac(sha256)", "0x" + auth, "if_id", str(tid)]
+    run(["ip", "xfrm", "state", "add", "src", local, "dst", remote, "spi", hex(spi_out)] + common)
+    run(["ip", "xfrm", "state", "add", "src", remote, "dst", local, "spi", hex(spi_in)] + common)
+    for dirn, s, dst in (("out", local, remote), ("in", remote, local), ("fwd", remote, local)):
+        run(["ip", "xfrm", "policy", "add", "dir", dirn, "if_id", str(tid),
+             "tmpl", "src", s, "dst", dst, "proto", "esp", "reqid", str(tid), "mode", "tunnel"])
+    phys = iface_for_ip(local) or default_iface()
+    run(["ip", "link", "add", name, "type", "xfrm", "dev", phys, "if_id", str(tid)])
+    run(["ip", "addr", "add", cfg["tunnel_ip"], "dev", name])
+    run(["ip", "link", "set", name, "up"])
+    run(["ip", "link", "set", "dev", name, "mtu", str(base_mtu() - 80)])
+
+
 def _pf_match(cfg, iface, proto, lp):
     """PREROUTING match args for this forward; a listen_ip pins the rule to ONE local IP (multi-IP hosts)."""
     m = ["-i", iface, "-p", proto, "--dport", lp]
@@ -431,6 +533,14 @@ def apply_config(cfg):
         build_gre(cfg)
     elif t == "sit":
         build_sit(cfg)
+    elif t == "ipip":
+        build_ipip(cfg)
+    elif t == "l2tpv3":
+        build_l2tp(cfg)
+    elif t == "fou":
+        build_fou(cfg)
+    elif t == "ipsec":
+        build_ipsec(cfg)
     elif t == "portfw":
         build_portfw(cfg)
 
@@ -444,8 +554,22 @@ def teardown_config(cfg):
             run(["ip", "link", "del", f"veth{tid}a"])
             run(["ip", "link", "del", f"veth{tid}b"])
         run(["ovs-vsctl", "--if-exists", "del-br", name])
-    elif ttype == "sit":
+    elif ttype in ("sit", "ipip"):
         run(["ip", "link", "del", name])
+    elif ttype == "l2tpv3":
+        if tid.isdigit():
+            run(["ip", "l2tp", "del", "session", "tunnel_id", tid, "session_id", tid])
+            run(["ip", "l2tp", "del", "tunnel", "tunnel_id", tid])
+        run(["ip", "link", "del", name])
+    elif ttype == "fou":
+        run(["ip", "link", "del", name])
+        port = _fou_port(cfg)
+        # drop the FOU decap listener only if no OTHER fou tunnel still needs this port (compare by name —
+        # raw_configs() reloads from disk, so identity checks fail; the config file may still exist here)
+        if not any(c.get("name") != name and c.get("type") == "fou" and _fou_port(c) == port for c in raw_configs()):
+            run(["ip", "fou", "del", "port", str(port), "ipproto", "4"])
+    elif ttype == "ipsec":
+        _ipsec_clear(cfg)
     elif ttype == "portfw":
         _pf_acct_teardown(cfg)   # drop the byte counters (keyed on name/listen_port, independent of iface)
         iface, lp, dp = cfg.get("iface", ""), str(cfg.get("listen_port", "")), str(cfg.get("dst_port", ""))
@@ -478,7 +602,7 @@ def apply_all():
     pip = primary_ip() if has_default else None  # don't self-heal to a guessed IP when routing is down
     locals_now = local_ips_flat()
     for cfg in raw_configs():
-        if cfg.get("type") in ("vxlan", "gre", "sit"):
+        if cfg.get("type") not in ("portfw", None):   # every node<->node tunnel carries a local_ip to self-heal
             li = cfg.get("local_ip")
             if li and pip and li not in locals_now:
                 cfg["local_ip"] = pip
@@ -645,7 +769,7 @@ def _read_net(cfgs):
         t, nm, tid = c.get("type"), c.get("name"), str(c.get("id"))
         if t == "portfw" or not nm:
             continue
-        iface = nm if t == "sit" else "veth" + tid + "b"
+        iface = "veth" + tid + "b" if t in ("vxlan", "gre") else nm  # vxlan/gre counters live on the veth leg; others on the netdev itself
         v = raw.get(iface)
         if v:
             net[nm] = v
@@ -826,7 +950,7 @@ def op_ping(d):
         stats["net"] = net
     except Exception:
         pass
-    return {"ok": True, "agent": "tnl-node", "version": 9, "ready": True,
+    return {"ok": True, "agent": "tnl-node", "version": 10, "ready": True,
             "hostname": socket.gethostname(), "ips": all_ips(), "sha256": _SELF_SHA,
             "ovs": run(["ovs-vsctl", "--version"])[0] == 0,
             "tunnels": len([c for c in cfgs if c.get("type") != "portfw"]),
@@ -845,7 +969,7 @@ def op_tunnel(d):
     """Create ONE side of a node<->node tunnel (central calls this on both nodes)."""
     _require(d, ["type", "self_ip", "peer_ip", "subnet"])
     ttype = d["type"]
-    if ttype not in ("vxlan", "gre", "sit"):
+    if ttype not in ("vxlan", "gre", "sit", "ipip", "l2tpv3", "fou", "ipsec"):
         raise ValueError("bad type")
     self_ip, peer_ip = d["self_ip"], d["peer_ip"]
     if not is_ipv4(self_ip) or not is_ipv4(peer_ip):
@@ -869,6 +993,17 @@ def op_tunnel(d):
     tunnel_ip = derive_tunnel_ip(ttype, self_ip, peer_ip, subnet)
     obj = {"name": name, "type": ttype, "id": tid, "iface": iface,
            "remote_ip": peer_ip, "tunnel_ip": tunnel_ip, "local_ip": self_ip}
+    if ttype in ("l2tpv3", "fou"):   # optional UDP port (blank -> derived from id); pins both ends to the same port
+        if d.get("port") not in (None, ""):
+            port = int(d["port"])
+            if not 1 <= port <= 65535:
+                raise ValueError("bad port")
+            obj["port"] = port
+    if ttype == "ipsec":
+        psk = str(d.get("psk") or "").strip()
+        if len(psk) < 32:
+            raise ValueError("ipsec needs a psk")
+        obj["psk"] = psk
     write_config(name, obj)
     try:
         apply_config(obj)
