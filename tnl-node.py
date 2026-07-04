@@ -6,7 +6,8 @@
 # and rotates port-forward destinations — all in-process. No tnl.sh, no reload.sh, no jq,
 # no menu. Every operation is driven by the central panel over a token-authenticated API.
 #
-# Node dependencies: python3, iproute2 (ip), iptables, and openvswitch-switch (for VXLAN/GRE).
+# Node dependencies: python3, iproute2 (ip), iptables. All tunnels are native kernel netdevs
+# (VXLAN/GRE/SIT/IPIP/L2TPv3/FOU/IPsec) — no OpenvSwitch required.
 #
 # Usage:
 #   sudo python3 tnl-node.py --install         # set port + generate token, install+start the service
@@ -289,43 +290,42 @@ def enable_ip_forward():
         pass
 
 
-def _ovs_veth(cfg, overhead):
-    tid, name = str(cfg["id"]), cfg["name"]
-    va, vb = f"veth{tid}a", f"veth{tid}b"
-    run(["ip", "link", "add", va, "type", "veth", "peer", "name", vb])
-    run(["ovs-vsctl", "add-port", name, va])
-    run(["ip", "addr", "add", cfg["tunnel_ip"], "dev", vb])
-    run(["ip", "link", "set", va, "up"])
-    run(["ip", "link", "set", vb, "up"])
-    mtu = str(base_mtu() - 28 - overhead)
-    run(["ip", "link", "set", "dev", va, "mtu", mtu])
-    run(["ip", "link", "set", "dev", vb, "mtu", mtu])
+def _purge_ovs(cfg):
+    """One-time migration from the old OpenvSwitch scheme: an already-provisioned node may still have an OVS
+    bridge named like the tunnel plus its veth pair, which would squat the netdev name. Best-effort removal —
+    ovs-vsctl is gone on fresh nodes (run() just returns 127), harmless on nodes that still have it."""
+    name, tid = cfg.get("name", ""), str(cfg.get("id", ""))
+    run(["ovs-vsctl", "--if-exists", "del-br", name])
+    if tid.isdigit():
+        run(["ip", "link", "del", f"veth{tid}a"])
+        run(["ip", "link", "del", f"veth{tid}b"])
 
 
 def build_vxlan(cfg):
-    tid, name = str(cfg["id"]), cfg["name"]
-    run(["ip", "link", "del", f"veth{tid}a"])
-    run(["ip", "link", "del", f"veth{tid}b"])
-    run(["ovs-vsctl", "--if-exists", "del-br", name])
-    run(["ovs-vsctl", "add-br", name])
-    port = f"vx{tid}"  # tunnel port name must differ from the bridge name (name == vxlan{tid})
-    run(["ovs-vsctl", "add-port", name, port, "--", "set", "interface", port,
-         "type=vxlan", f"options:remote_ip={cfg['remote_ip']}", f"options:local_ip={cfg['local_ip']}",
-         f"options:key={tid}", "options:dst_port=4789", "options:csum=true"])
-    _ovs_veth(cfg, 50)
+    """Native kernel VXLAN (UDP 4789) — point-to-point to the peer, tunnel IP assigned directly.
+    No OpenvSwitch/veth: one netdev per tunnel, same as ipip/sit. VNI == tunnel id (symmetric both ends)."""
+    name = cfg["name"]
+    _modprobe("vxlan")   # `ip link add type vxlan` does not auto-load the module
+    _purge_ovs(cfg)      # migrate: clear any OVS bridge/veth left by the old scheme so the name is free
+    run(["ip", "link", "del", name])
+    run(["ip", "link", "add", name, "type", "vxlan", "id", str(cfg["id"]),
+         "local", cfg["local_ip"], "remote", cfg["remote_ip"], "dstport", "4789"])
+    run(["ip", "addr", "add", cfg["tunnel_ip"], "dev", name])
+    run(["ip", "link", "set", name, "up"])
+    run(["ip", "link", "set", "dev", name, "mtu", str(base_mtu() - 50)])  # IP20+UDP8+VXLAN8+innerEth14
 
 
 def build_gre(cfg):
-    tid, name = str(cfg["id"]), cfg["name"]
-    run(["ip", "link", "del", f"veth{tid}a"])
-    run(["ip", "link", "del", f"veth{tid}b"])
-    run(["ovs-vsctl", "--if-exists", "del-br", name])
-    run(["ovs-vsctl", "add-br", name])
-    port = f"gr{tid}"  # tunnel port name must differ from the bridge name (name == gre{tid})
-    run(["ovs-vsctl", "add-port", name, port, "--", "set", "interface", port,
-         "type=gre", f"options:remote_ip={cfg['remote_ip']}", f"options:local_ip={cfg['local_ip']}",
-         f"options:key={tid}"])
-    _ovs_veth(cfg, 24)
+    """Native kernel GRE (proto 47) — point-to-point, tunnel IP assigned directly. GRE key == tunnel id."""
+    name = cfg["name"]
+    _modprobe("ip_gre")   # `ip link add type gre` does not auto-load the module
+    _purge_ovs(cfg)       # migrate: clear any OVS bridge/veth left by the old scheme so the name is free
+    run(["ip", "link", "del", name])
+    run(["ip", "link", "add", name, "type", "gre",
+         "local", cfg["local_ip"], "remote", cfg["remote_ip"], "key", str(cfg["id"])])
+    run(["ip", "addr", "add", cfg["tunnel_ip"], "dev", name])
+    run(["ip", "link", "set", name, "up"])
+    run(["ip", "link", "set", "dev", name, "mtu", str(base_mtu() - 28)])  # IP20+GRE4+key4
 
 
 def build_sit(cfg):
@@ -696,13 +696,10 @@ def teardown_config(cfg):
     ttype, name, tid = cfg.get("type"), cfg.get("name", ""), str(cfg.get("id", ""))
     if not NAME_RE.match(name):
         return
-    if ttype in ("vxlan", "gre"):
-        if tid.isdigit():
-            run(["ip", "link", "del", f"veth{tid}a"])
-            run(["ip", "link", "del", f"veth{tid}b"])
-        run(["ovs-vsctl", "--if-exists", "del-br", name])
-    elif ttype in ("sit", "ipip"):
+    if ttype in ("vxlan", "gre", "sit", "ipip"):
         run(["ip", "link", "del", name])
+        if ttype in ("vxlan", "gre"):
+            _purge_ovs(cfg)   # also clear a pre-migration OVS bridge/veth, if this node still has one
     elif ttype == "l2tpv3":
         if tid.isdigit():
             run(["ip", "l2tp", "del", "session", "tunnel_id", tid, "session_id", tid])
@@ -831,13 +828,9 @@ def health_of(cfg, thorough=False):
                 reachable = False
         return {"active": active, "rule": rule, "reachable": reachable, "up": rule}
     up = False
-    rc, _, _ = run(["ip", "link", "show", name])
+    rc, _, _ = run(["ip", "link", "show", name])   # every type is now a plain kernel netdev
     if rc == 0:
-        if ttype in ("vxlan", "gre"):
-            rc2, out2, _ = run(["ovs-vsctl", "list-br"])
-            up = name in out2.split()
-        else:
-            up = True
+        up = True
     ping = None
     peer = rtt = loss = None
     tip = cfg.get("tunnel_ip", "")
@@ -918,8 +911,7 @@ def _read_net(cfgs):
         t, nm, tid = c.get("type"), c.get("name"), str(c.get("id"))
         if t == "portfw" or not nm:
             continue
-        iface = "veth" + tid + "b" if t in ("vxlan", "gre") else nm  # vxlan/gre counters live on the veth leg; others on the netdev itself
-        v = raw.get(iface)
+        v = raw.get(nm)   # every tunnel is now its own netdev (named after the config); counters live there
         if v:
             net[nm] = v
     # whole-node throughput = sum over ALL physical NICs, not the momentary default-route iface: a
@@ -1108,9 +1100,8 @@ def op_ping(d):
         stats["net"] = net
     except Exception:
         pass
-    return {"ok": True, "agent": "tnl-node", "version": 16, "ready": True,
+    return {"ok": True, "agent": "tnl-node", "version": 17, "ready": True,
             "hostname": socket.gethostname(), "ips": all_ips(), "sha256": _SELF_SHA,
-            "ovs": run(["ovs-vsctl", "--version"])[0] == 0,
             "tunnels": len([c for c in cfgs if c.get("type") != "portfw"]),
             "portfw": len([c for c in cfgs if c.get("type") == "portfw"]),
             "stats": stats}
@@ -1184,18 +1175,15 @@ def op_tunnel(d):
         apply_config(obj)
     except Exception as e:
         return {"ok": False, "msg": str(e)}
-    # builds run `ip`/`ovs-vsctl` via run() which never raises on failure, so verify the netdev really exists
-    if ttype in ("vxlan", "gre"):
-        rc, _, _ = run(["ovs-vsctl", "br-exists", name])
-    else:
-        rc, _, _ = run(["ip", "link", "show", name])
+    # builds run `ip` via run() which never raises on failure, so verify the netdev really exists
+    rc, _, _ = run(["ip", "link", "show", name])   # every type is a plain kernel netdev now
     if rc != 0:
         teardown_config(obj)
         try:
             os.remove(os.path.join(CONFIG_DIR, name + ".json"))
         except OSError:
             pass
-        need = {"vxlan": "openvswitch", "gre": "openvswitch", "sit": "sit", "ipip": "ipip",
+        need = {"vxlan": "vxlan", "gre": "ip_gre", "sit": "sit", "ipip": "ipip",
                 "l2tpv3": "l2tp_eth", "fou": "fou و ipip", "ipsec": "xfrm_interface",
                 "engine": "موتورِ tnl-engine"}[ttype]
         return {"ok": False, "msg": f"اینترفیسِ {ttype} ساخته نشد — «{need}» روی این نود نصب/فعال نیست"}
@@ -1516,22 +1504,23 @@ def service_active():
 
 
 def install_deps():
-    print("[*] Installing dependencies (openvswitch-switch, iptables)...")
+    # Native tunnels only need iproute2 (already present) + iptables for port-forwards. VXLAN/GRE/… are
+    # kernel modules loaded on demand; OpenvSwitch is no longer required.
+    print("[*] Installing dependencies (iptables)...")
     env = dict(os.environ, DEBIAN_FRONTEND="noninteractive")
     try:
         subprocess.run(["apt-get", "update", "-qq"], env=env, timeout=300)
-        subprocess.run(["apt-get", "install", "-yqq", "openvswitch-switch", "iptables"], env=env, timeout=600)
+        subprocess.run(["apt-get", "install", "-yqq", "iptables"], env=env, timeout=600)
     except Exception as e:
         print(f"[!] apt failed: {e}")
-    print("[✔] openvswitch ready." if run(["ovs-vsctl", "--version"])[0] == 0
-          else "[!] openvswitch not available - VXLAN/GRE need it (SIT still works).")
+    print("[✔] dependencies ready (native tunnels — no OpenvSwitch needed).")
 
 
 def write_service():
     with open(SERVICE_FILE, "w") as f:
         f.write(f"""[Unit]
 Description=tnl node agent
-After=network-online.target openvswitch-switch.service
+After=network-online.target
 Wants=network-online.target
 
 [Service]
