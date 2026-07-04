@@ -757,7 +757,7 @@ def op_ping(d):
         stats["net"] = _read_net(cfgs)   # per-tunnel + node byte counters (skipped if unreadable — never fails ping)
     except Exception:
         pass
-    return {"ok": True, "agent": "tnl-node", "version": 7, "ready": True,
+    return {"ok": True, "agent": "tnl-node", "version": 8, "ready": True,
             "hostname": socket.gethostname(), "ips": all_ips(), "sha256": _SELF_SHA,
             "ovs": run(["ovs-vsctl", "--version"])[0] == 0,
             "tunnels": len([c for c in cfgs if c.get("type") != "portfw"]),
@@ -850,7 +850,7 @@ def op_portfw(d):
 
 
 def op_portfw_edit(d):
-    """Edit an existing port-forward IN PLACE (keeps its name): ports, dst IPs, rotation on/off."""
+    """Edit an existing port-forward IN PLACE (keeps its name): ports, dst IPs, rotation on/off, listen IP."""
     _require(d, ["name"])
     old = read_config(d["name"])
     if not old or old.get("type") != "portfw":
@@ -877,7 +877,18 @@ def op_portfw_edit(d):
         interval = int(d.get("interval_min", 5)) * 60 if rot else 0
     if len(ips) < 2:
         interval = 0  # rotation only means something with >=2 destinations
-    listen_ip = str(old.get("listen_ip") or "")  # the listen-IP pin survives edits
+    if "listen_ip" in d:  # a new listen-IP pin was sent (multi-IP host): validate and re-derive the iface
+        listen_ip = str(d.get("listen_ip") or "").strip()
+        if listen_ip:
+            if not is_ipv4(listen_ip):
+                raise ValueError("bad listen IP")
+            if listen_ip not in local_ips_flat():
+                raise ValueError(f"{listen_ip} is not a local IP on this node")
+            liface = iface_for_ip(listen_ip)  # bind to the iface that actually carries the new IP
+            if liface and IFACE_RE.match(liface):
+                iface = liface
+    else:
+        listen_ip = str(old.get("listen_ip") or "")  # no new pin sent: the old pin survives the edit
     for c in raw_configs():  # a DIFFERENT forward must not already own this iface+listen_port+listen_ip
         if (c.get("name") != old["name"] and c.get("type") == "portfw"
                 and c.get("iface") == iface and str(c.get("listen_port")) == lp
