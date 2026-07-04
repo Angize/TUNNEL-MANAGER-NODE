@@ -328,6 +328,70 @@ def _pf_match(cfg, iface, proto, lp):
     return m
 
 
+def _pf_acct_rules(cfg):
+    """Two per-forward byte-accounting rules for the PFACCT mangle chain: one for each conntrack
+    direction, keyed on the connection's ORIGINAL destination (listen_ip:listen_port). Keying on the
+    original tuple — not the rotating DNAT target — is what lets the counters survive rotation. The
+    'in' rule counts client->listen bytes (rx/down), 'out' counts the reply back to the client (tx/up)."""
+    lp, nm = str(cfg.get("listen_port", "")), cfg.get("name", "")
+    if not (lp.isdigit() and NAME_RE.match(nm)):
+        return []
+    ct = ["-m", "conntrack"]
+    lip = cfg.get("listen_ip") or ""
+    if is_ipv4(lip):
+        ct += ["--ctorigdst", lip]
+    ct += ["--ctorigdstport", lp]
+    out = []
+    for dirn, ctdir in (("in", "ORIGINAL"), ("out", "REPLY")):
+        out.append(ct + ["--ctdir", ctdir, "-m", "comment", "--comment",
+                         f"pfacct:{nm}:{dirn}", "-j", "RETURN"])
+    return out
+
+
+def _pf_acct_build(cfg):
+    """(Re)ensure this forward's accounting rules exist — idempotent, so the per-rotation build_portfw
+    call never resets the counters. Rules live in a dedicated PFACCT chain hung off mangle PREROUTING."""
+    run(["iptables", "-t", "mangle", "-N", "PFACCT"])  # create once; errors harmlessly if it exists
+    rc, _, _ = run(["iptables", "-t", "mangle", "-C", "PREROUTING", "-j", "PFACCT"])
+    if rc != 0:
+        run(["iptables", "-t", "mangle", "-A", "PREROUTING", "-j", "PFACCT"])
+    for r in _pf_acct_rules(cfg):
+        rc, _, _ = run(["iptables", "-t", "mangle", "-C", "PFACCT"] + r)
+        if rc != 0:
+            run(["iptables", "-t", "mangle", "-A", "PFACCT"] + r)
+
+
+def _pf_acct_teardown(cfg):
+    for r in _pf_acct_rules(cfg):
+        for _ in range(64):
+            rc, _, _ = run(["iptables", "-t", "mangle", "-C", "PFACCT"] + r)
+            if rc != 0:
+                break
+            run(["iptables", "-t", "mangle", "-D", "PFACCT"] + r)
+
+
+def _read_pf_net(cfgs):
+    """{portfw_name: [rx_bytes, tx_bytes]} from the PFACCT chain's rule counters (cumulative, both
+    directions). Parsed from `iptables-save -c` output: each rule is prefixed with [packets:bytes]."""
+    names = {c.get("name") for c in cfgs if c.get("type") == "portfw" and c.get("name")}
+    if not names:
+        return {}
+    rc, out, _ = run(["iptables-save", "-c", "-t", "mangle"])
+    if rc != 0:
+        return {}
+    res = {}
+    for line in out.splitlines():
+        if "pfacct:" not in line:
+            continue
+        mb = re.match(r"\[(\d+):(\d+)\]", line)
+        mc = re.search(r"pfacct:([A-Za-z0-9_.-]+):(in|out)", line)
+        if not (mb and mc) or mc.group(1) not in names:
+            continue
+        e = res.setdefault(mc.group(1), [0, 0])
+        e[0 if mc.group(2) == "in" else 1] += int(mb.group(2))
+    return res
+
+
 def build_portfw(cfg):
     iface = cfg["iface"]
     lp, dp = str(cfg["listen_port"]), str(cfg["dst_port"])
@@ -356,6 +420,7 @@ def build_portfw(cfg):
     rc, _, _ = run(["iptables", "-t", "nat", "-C", "POSTROUTING", "-o", iface, "-j", "MASQUERADE"])
     if rc != 0:
         run(["iptables", "-t", "nat", "-A", "POSTROUTING", "-o", iface, "-j", "MASQUERADE"])
+    _pf_acct_build(cfg)   # idempotent byte counters (rx/tx) that survive rotation
 
 
 def apply_config(cfg):
@@ -382,6 +447,7 @@ def teardown_config(cfg):
     elif ttype == "sit":
         run(["ip", "link", "del", name])
     elif ttype == "portfw":
+        _pf_acct_teardown(cfg)   # drop the byte counters (keyed on name/listen_port, independent of iface)
         iface, lp, dp = cfg.get("iface", ""), str(cfg.get("listen_port", "")), str(cfg.get("dst_port", ""))
         if IFACE_RE.match(iface) and lp.isdigit() and dp.isdigit():
             for proto in ("tcp", "udp"):
@@ -754,10 +820,13 @@ def op_ping(d):
     cfgs = public_configs()
     stats = read_stats()
     try:
-        stats["net"] = _read_net(cfgs)   # per-tunnel + node byte counters (skipped if unreadable — never fails ping)
+        net = _read_net(cfgs)   # per-tunnel + node byte counters (skipped if unreadable — never fails ping)
+        for k, v in _read_pf_net(cfgs).items():   # per-portfw counters, namespaced so they never collide
+            net["pf:" + k] = v
+        stats["net"] = net
     except Exception:
         pass
-    return {"ok": True, "agent": "tnl-node", "version": 8, "ready": True,
+    return {"ok": True, "agent": "tnl-node", "version": 9, "ready": True,
             "hostname": socket.gethostname(), "ips": all_ips(), "sha256": _SELF_SHA,
             "ovs": run(["ovs-vsctl", "--version"])[0] == 0,
             "tunnels": len([c for c in cfgs if c.get("type") != "portfw"]),
