@@ -746,7 +746,7 @@ def op_ping(d):
         stats["net"] = _read_net(cfgs)   # per-tunnel + node byte counters (skipped if unreadable — never fails ping)
     except Exception:
         pass
-    return {"ok": True, "agent": "tnl-node", "version": 5, "ready": True,
+    return {"ok": True, "agent": "tnl-node", "version": 6, "ready": True,
             "hostname": socket.gethostname(), "ips": all_ips(), "sha256": _SELF_SHA,
             "ovs": run(["ovs-vsctl", "--version"])[0] == 0,
             "tunnels": len([c for c in cfgs if c.get("type") != "portfw"]),
@@ -904,6 +904,25 @@ def op_delete(d):
     return {"ok": True}
 
 
+def op_wipe(d):
+    """Full self-destruct requested by the panel. Tear down every tunnel/portfw in-process, then
+    (detached, after this 200 flushes) stop+remove the service and delete /opt/tunnel entirely —
+    configs, node.conf/token and the installed binary. Nothing of this node remains."""
+    for c in raw_configs():
+        try:
+            teardown_config(c)
+            os.remove(os.path.join(CONFIG_DIR, c["name"] + ".json"))
+        except Exception:
+            pass
+    _restart_pending.set()  # reject any new mutating op during the shutdown window
+    script = ("sleep 1; systemctl stop tnl-node 2>/dev/null; systemctl disable tnl-node 2>/dev/null; "
+              "rm -f " + SERVICE_FILE + "; systemctl daemon-reload 2>/dev/null; rm -rf " + CONFIG_DIR)
+    subprocess.Popen(["sh", "-c", script], start_new_session=True, stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    logline("node wiped by panel request")
+    return {"ok": True, "wiped": True}
+
+
 def op_check(d):
     """On-demand health probe for ONE config — a thorough live peer-ping over the tunnel."""
     _require(d, ["name"])
@@ -973,7 +992,7 @@ def op_update(d):
 
 OPS = {"ping": op_ping, "list": op_list, "check": op_check, "tunnel": op_tunnel,
        "portfw": op_portfw, "portfw-edit": op_portfw_edit, "portfw-next": op_portfw_next,
-       "delete": op_delete, "apply": op_apply, "update": op_update}
+       "delete": op_delete, "apply": op_apply, "update": op_update, "wipe": op_wipe}
 READ_ONLY = {"ping", "list", "check"}
 
 # ----------------------------------------------------------------------------- HTTP
