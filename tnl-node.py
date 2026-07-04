@@ -42,6 +42,12 @@ SERVICE_FILE = "/etc/systemd/system/tnl-node.service"
 SELF_PATH = os.path.realpath(__file__)
 INSTALLED = os.path.join(CONFIG_DIR, "tnl-node.py")  # stable path the systemd unit points at
 
+# The custom Go data-plane engine (packet/bip): a static binary the node fetches from the engine
+# repo (raw, like the agent's own git update), verifies by sha256, and supervises via systemd-run.
+ENGINE_BIN = os.path.join(CONFIG_DIR, "tnl-engine")
+ENGINE_BASE = "https://raw.githubusercontent.com/Angize/TUNNEL-MANAGER-ENGINE/main/dist"
+_engine_lock = threading.Lock()  # serialize download/replace of the shared engine binary
+
 NAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
 IFACE_RE = re.compile(r"^[A-Za-z0-9_.@-]+$")
 
@@ -436,6 +442,122 @@ def build_ipsec(cfg):
     run(["ip", "link", "set", "dev", name, "mtu", str(base_mtu() - 80)])
 
 
+def _engine_arch():
+    m = os.uname().machine
+    return {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64"}.get(m, "amd64")
+
+
+def _http_get(url, timeout=30):
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            return r.read()
+    except Exception:
+        return None
+
+
+def _ensure_engine():
+    """Make sure /opt/tunnel/tnl-engine is present and matches the published sha256. Downloads from the
+    engine repo (raw) on first use or when the checksum changes. If the sha file is unreachable we keep
+    whatever copy we already have (offline-tolerant); we only ever replace after a verified download."""
+    with _engine_lock:
+        arch = _engine_arch()
+        url = f"{ENGINE_BASE}/tnl-engine-linux-{arch}"
+        sha_raw = _http_get(url + ".sha256")
+        want = sha_raw.decode().split()[0].strip() if sha_raw else ""
+        have = os.path.isfile(ENGINE_BIN)
+        if have:
+            with open(ENGINE_BIN, "rb") as f:
+                cur = hashlib.sha256(f.read()).hexdigest()
+            if want and cur == want:
+                return               # already the published build
+            if not want:
+                return               # can't verify right now, keep the working copy
+        data = _http_get(url, timeout=120)
+        if not data:
+            if have:
+                return               # download failed but we have a copy -> use it
+            raise RuntimeError("could not download engine binary")
+        if want and hashlib.sha256(data).hexdigest() != want:
+            raise RuntimeError("engine binary checksum mismatch")
+        tmp = ENGINE_BIN + ".new"
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.chmod(tmp, 0o755)
+        os.replace(tmp, ENGINE_BIN)
+
+
+def _engine_port(cfg):
+    return int(cfg.get("port") or (20000 + int(cfg["id"])))
+
+
+def _engine_config(cfg):
+    """Pure: build the JSON the engine binary consumes from a stored tunnel config. The tun device is
+    named after the config so /proc/net/dev accounting and `ip link show <name>` health work unchanged.
+    Crypto is on whenever a psk is present; the psk never leaves the node (public_configs pops it)."""
+    name = cfg["name"]
+    port = _engine_port(cfg)
+    crypto_on = bool(cfg.get("psk"))
+    overhead = 58 if crypto_on else 30  # outer IP20+UDP8+bip2 (+ nonce12+tag16 when sealed)
+    mtu = max(1280, base_mtu() - overhead)
+    ecfg = {
+        "role": cfg.get("role"),
+        "mode": "packet",
+        "profile": "bip",
+        "tun_name": name,
+        "tun_addr": cfg["tunnel_ip"],
+        "tun_peer": peer_of(cfg["tunnel_ip"], "engine"),
+        "mtu": mtu,
+        "keepalive": 15,
+        "crypto": {"enabled": crypto_on, "psk": cfg.get("psk", ""), "cipher": "aes-256-gcm"},
+    }
+    if cfg.get("role") == "server":
+        ecfg["listen"] = f"0.0.0.0:{port}"
+    else:
+        ecfg["peer"] = f"{cfg['remote_ip']}:{port}"
+    return ecfg
+
+
+def _engine_unit(name):
+    return "tnl-eng-" + name
+
+
+def build_engine(cfg):
+    """Fetch/verify the engine binary, write its per-tunnel config, and (re)launch it under a transient
+    systemd unit with Restart=always. Then wait for the TUN to appear so op_tunnel's verify sees it."""
+    name = cfg["name"]
+    _ensure_engine()
+    ecfg = _engine_config(cfg)
+    path = os.path.join(CONFIG_DIR, "engine-" + name + ".json")
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(ecfg, f, indent=2)
+    os.chmod(tmp, 0o600)          # holds the psk -> keep it private like node.conf
+    os.replace(tmp, path)
+    unit = _engine_unit(name)
+    run(["systemctl", "stop", unit])
+    run(["systemctl", "reset-failed", unit])
+    run(["systemd-run", "--unit", unit, "--collect",
+         "-p", "Restart=always", "-p", "RestartSec=3",
+         ENGINE_BIN, "--config", path])
+    for _ in range(30):          # engine opens the TUN a beat after systemd-run returns
+        if run(["ip", "link", "show", name])[0] == 0:
+            break
+        time.sleep(0.1)
+
+
+def _engine_teardown(cfg):
+    name = cfg.get("name", "")
+    if not NAME_RE.match(name):
+        return
+    unit = _engine_unit(name)
+    run(["systemctl", "stop", unit])       # kills the engine -> its non-persistent TUN disappears
+    run(["systemctl", "reset-failed", unit])
+    try:
+        os.remove(os.path.join(CONFIG_DIR, "engine-" + name + ".json"))
+    except OSError:
+        pass
+
+
 def _pf_match(cfg, iface, proto, lp):
     """PREROUTING match args for this forward; a listen_ip pins the rule to ONE local IP (multi-IP hosts)."""
     m = ["-i", iface, "-p", proto, "--dport", lp]
@@ -560,6 +682,8 @@ def apply_config(cfg):
         build_fou(cfg)
     elif t == "ipsec":
         build_ipsec(cfg)
+    elif t == "engine":
+        build_engine(cfg)
     elif t == "portfw":
         build_portfw(cfg)
 
@@ -589,6 +713,8 @@ def teardown_config(cfg):
             run(["ip", "fou", "del", "port", str(port), "ipproto", "4"])
     elif ttype == "ipsec":
         _ipsec_clear(cfg)
+    elif ttype == "engine":
+        _engine_teardown(cfg)
     elif ttype == "portfw":
         _pf_acct_teardown(cfg)   # drop the byte counters (keyed on name/listen_port, independent of iface)
         iface, lp, dp = cfg.get("iface", ""), str(cfg.get("listen_port", "")), str(cfg.get("dst_port", ""))
@@ -978,7 +1104,7 @@ def op_ping(d):
         stats["net"] = net
     except Exception:
         pass
-    return {"ok": True, "agent": "tnl-node", "version": 14, "ready": True,
+    return {"ok": True, "agent": "tnl-node", "version": 15, "ready": True,
             "hostname": socket.gethostname(), "ips": all_ips(), "sha256": _SELF_SHA,
             "ovs": run(["ovs-vsctl", "--version"])[0] == 0,
             "tunnels": len([c for c in cfgs if c.get("type") != "portfw"]),
@@ -997,7 +1123,7 @@ def op_tunnel(d):
     """Create ONE side of a node<->node tunnel (central calls this on both nodes)."""
     _require(d, ["type", "self_ip", "peer_ip", "subnet"])
     ttype = d["type"]
-    if ttype not in ("vxlan", "gre", "sit", "ipip", "l2tpv3", "fou", "ipsec"):
+    if ttype not in ("vxlan", "gre", "sit", "ipip", "l2tpv3", "fou", "ipsec", "engine"):
         raise ValueError("bad type")
     self_ip, peer_ip = d["self_ip"], d["peer_ip"]
     if not is_ipv4(self_ip) or not is_ipv4(peer_ip):
@@ -1021,7 +1147,7 @@ def op_tunnel(d):
     tunnel_ip = derive_tunnel_ip(ttype, self_ip, peer_ip, subnet)
     obj = {"name": name, "type": ttype, "id": tid, "iface": iface,
            "remote_ip": peer_ip, "tunnel_ip": tunnel_ip, "local_ip": self_ip}
-    if ttype in ("l2tpv3", "fou"):   # optional UDP port (blank -> derived from id); pins both ends to the same port
+    if ttype in ("l2tpv3", "fou", "engine"):   # optional UDP port (blank -> derived from id); pins both ends to the same port
         if d.get("port") not in (None, ""):
             port = int(d["port"])
             if not 1 <= port <= 65535:
@@ -1032,6 +1158,16 @@ def op_tunnel(d):
         if len(psk) < 32:
             raise ValueError("ipsec needs a psk")
         obj["psk"] = psk
+    if ttype == "engine":
+        role = d.get("role")
+        if role not in ("server", "client"):
+            raise ValueError("engine needs role server|client")
+        obj["role"] = role
+        psk = str(d.get("psk") or "").strip()
+        if psk:                       # crypto is optional but recommended; when set it must be strong enough
+            if len(psk) < 16:
+                raise ValueError("engine psk too short (>=16)")
+            obj["psk"] = psk          # popped from public_configs, so it never leaves the node
     old = read_config(name)   # in-place rebuild: fully tear the previous build down first so nothing tied to a
     if old and old.get("type") != "portfw":   # now-overwritten field (e.g. FOU's old UDP-port decap listener) leaks
         teardown_config(old)
@@ -1052,7 +1188,8 @@ def op_tunnel(d):
         except OSError:
             pass
         need = {"vxlan": "openvswitch", "gre": "openvswitch", "sit": "sit", "ipip": "ipip",
-                "l2tpv3": "l2tp_eth", "fou": "fou و ipip", "ipsec": "xfrm_interface"}[ttype]
+                "l2tpv3": "l2tp_eth", "fou": "fou و ipip", "ipsec": "xfrm_interface",
+                "engine": "موتورِ tnl-engine"}[ttype]
         return {"ok": False, "msg": f"اینترفیسِ {ttype} ساخته نشد — «{need}» روی این نود نصب/فعال نیست"}
     return {"ok": True, "name": name, "tunnel_ip": tunnel_ip}
 
