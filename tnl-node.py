@@ -961,7 +961,7 @@ def op_ping(d):
         stats["net"] = net
     except Exception:
         pass
-    return {"ok": True, "agent": "tnl-node", "version": 11, "ready": True,
+    return {"ok": True, "agent": "tnl-node", "version": 12, "ready": True,
             "hostname": socket.gethostname(), "ips": all_ips(), "sha256": _SELF_SHA,
             "ovs": run(["ovs-vsctl", "--version"])[0] == 0,
             "tunnels": len([c for c in cfgs if c.get("type") != "portfw"]),
@@ -1028,8 +1028,8 @@ def op_tunnel(d):
                 os.remove(os.path.join(CONFIG_DIR, name + ".json"))
             except OSError:
                 pass
-            need = {"ipip": "ipip", "l2tpv3": "l2tp_eth", "fou": "fou/ipip", "ipsec": "xfrm_interface"}[ttype]
-            return {"ok": False, "msg": f"{ttype}: interface not created — kernel module '{need}' missing on this node"}
+            need = {"ipip": "ipip", "l2tpv3": "l2tp_eth", "fou": "fou و ipip", "ipsec": "xfrm_interface"}[ttype]
+            return {"ok": False, "msg": f"اینترفیسِ {ttype} ساخته نشد — ماژولِ کرنلِ «{need}» روی این نود نصب/فعال نیست"}
     return {"ok": True, "name": name, "tunnel_ip": tunnel_ip}
 
 
