@@ -497,7 +497,11 @@ def _engine_config(cfg):
     name = cfg["name"]
     port = _engine_port(cfg)
     crypto_on = bool(cfg.get("psk"))
-    overhead = 58 if crypto_on else 30  # outer IP20+UDP8+bip2 (+ nonce12+tag16 when sealed)
+    cipher = str(cfg.get("cipher") or "aes-256-gcm")
+    # outer IP20 + UDP8 + bip2 = 30; sealing adds nonce+tag (28 for gcm/chacha, 40 for xchacha's 24B nonce)
+    overhead = 30
+    if crypto_on:
+        overhead += 40 if cipher == "xchacha20-poly1305" else 28
     mtu = max(1280, base_mtu() - overhead)
     ecfg = {
         "role": cfg.get("role"),
@@ -508,7 +512,7 @@ def _engine_config(cfg):
         "tun_peer": peer_of(cfg["tunnel_ip"], "engine"),
         "mtu": mtu,
         "keepalive": 15,
-        "crypto": {"enabled": crypto_on, "psk": cfg.get("psk", ""), "cipher": "aes-256-gcm"},
+        "crypto": {"enabled": crypto_on, "psk": cfg.get("psk", ""), "cipher": cipher},
     }
     if cfg.get("role") == "server":
         ecfg["listen"] = f"0.0.0.0:{port}"
@@ -1104,7 +1108,7 @@ def op_ping(d):
         stats["net"] = net
     except Exception:
         pass
-    return {"ok": True, "agent": "tnl-node", "version": 15, "ready": True,
+    return {"ok": True, "agent": "tnl-node", "version": 16, "ready": True,
             "hostname": socket.gethostname(), "ips": all_ips(), "sha256": _SELF_SHA,
             "ovs": run(["ovs-vsctl", "--version"])[0] == 0,
             "tunnels": len([c for c in cfgs if c.get("type") != "portfw"]),
@@ -1163,6 +1167,10 @@ def op_tunnel(d):
         if role not in ("server", "client"):
             raise ValueError("engine needs role server|client")
         obj["role"] = role
+        cipher = str(d.get("cipher") or "auto").strip().lower()
+        if cipher not in ("auto", "aes-256-gcm", "aes-128-gcm", "chacha20-poly1305", "xchacha20-poly1305", "none"):
+            raise ValueError("bad engine cipher")
+        obj["cipher"] = cipher
         psk = str(d.get("psk") or "").strip()
         if psk:                       # crypto is optional but recommended; when set it must be strong enough
             if len(psk) < 16:
