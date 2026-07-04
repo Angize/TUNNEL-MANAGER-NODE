@@ -319,6 +319,15 @@ def build_sit(cfg):
     run(["ip", "link", "set", "dev", name, "mtu", str(base_mtu() - 28 - 20)])
 
 
+def _pf_match(cfg, iface, proto, lp):
+    """PREROUTING match args for this forward; a listen_ip pins the rule to ONE local IP (multi-IP hosts)."""
+    m = ["-i", iface, "-p", proto, "--dport", lp]
+    lip = cfg.get("listen_ip") or ""
+    if is_ipv4(lip):
+        m += ["-d", lip]
+    return m
+
+
 def build_portfw(cfg):
     iface = cfg["iface"]
     lp, dp = str(cfg["listen_port"]), str(cfg["dst_port"])
@@ -333,16 +342,17 @@ def build_portfw(cfg):
         idx = 0
     active = ips[idx]
     for proto in ("tcp", "udp"):   # forward BOTH protocols — VPN endpoints (WireGuard/OpenVPN-UDP) are UDP
+        match = _pf_match(cfg, iface, proto, lp)
         for ip in ips:  # flush every candidate rule first
             for _ in range(64):
-                rc, _, _ = run(["iptables", "-t", "nat", "-C", "PREROUTING", "-i", iface, "-p", proto,
-                                "--dport", lp, "-j", "DNAT", "--to-destination", f"{ip}:{dp}"])
+                rc, _, _ = run(["iptables", "-t", "nat", "-C", "PREROUTING"] + match
+                               + ["-j", "DNAT", "--to-destination", f"{ip}:{dp}"])
                 if rc != 0:
                     break
-                run(["iptables", "-t", "nat", "-D", "PREROUTING", "-i", iface, "-p", proto,
-                     "--dport", lp, "-j", "DNAT", "--to-destination", f"{ip}:{dp}"])
-        run(["iptables", "-t", "nat", "-A", "PREROUTING", "-i", iface, "-p", proto,
-             "--dport", lp, "-j", "DNAT", "--to-destination", f"{active}:{dp}"])
+                run(["iptables", "-t", "nat", "-D", "PREROUTING"] + match
+                    + ["-j", "DNAT", "--to-destination", f"{ip}:{dp}"])
+        run(["iptables", "-t", "nat", "-A", "PREROUTING"] + match
+            + ["-j", "DNAT", "--to-destination", f"{active}:{dp}"])
     rc, _, _ = run(["iptables", "-t", "nat", "-C", "POSTROUTING", "-o", iface, "-j", "MASQUERADE"])
     if rc != 0:
         run(["iptables", "-t", "nat", "-A", "POSTROUTING", "-o", iface, "-j", "MASQUERADE"])
@@ -375,16 +385,17 @@ def teardown_config(cfg):
         iface, lp, dp = cfg.get("iface", ""), str(cfg.get("listen_port", "")), str(cfg.get("dst_port", ""))
         if IFACE_RE.match(iface) and lp.isdigit() and dp.isdigit():
             for proto in ("tcp", "udp"):
+                match = _pf_match(cfg, iface, proto, lp)  # same match the rule was built with (incl. listen_ip)
                 for ip in cfg.get("dst_ips", []):
                     if not is_ipv4(ip):
                         continue
                     for _ in range(64):
-                        rc, _, _ = run(["iptables", "-t", "nat", "-C", "PREROUTING", "-i", iface, "-p", proto,
-                                        "--dport", lp, "-j", "DNAT", "--to-destination", f"{ip}:{dp}"])
+                        rc, _, _ = run(["iptables", "-t", "nat", "-C", "PREROUTING"] + match
+                                       + ["-j", "DNAT", "--to-destination", f"{ip}:{dp}"])
                         if rc != 0:
                             break
-                        run(["iptables", "-t", "nat", "-D", "PREROUTING", "-i", iface, "-p", proto,
-                             "--dport", lp, "-j", "DNAT", "--to-destination", f"{ip}:{dp}"])
+                        run(["iptables", "-t", "nat", "-D", "PREROUTING"] + match
+                            + ["-j", "DNAT", "--to-destination", f"{ip}:{dp}"])
             rc, out, _ = run(["iptables", "-t", "nat", "-S", "PREROUTING"])
             if not [l for l in out.splitlines() if re.search(rf"-i {re.escape(iface)} -p (?:tcp|udp) .*-j DNAT", l)]:
                 for _ in range(16):
@@ -746,7 +757,7 @@ def op_ping(d):
         stats["net"] = _read_net(cfgs)   # per-tunnel + node byte counters (skipped if unreadable — never fails ping)
     except Exception:
         pass
-    return {"ok": True, "agent": "tnl-node", "version": 6, "ready": True,
+    return {"ok": True, "agent": "tnl-node", "version": 7, "ready": True,
             "hostname": socket.gethostname(), "ips": all_ips(), "sha256": _SELF_SHA,
             "ovs": run(["ovs-vsctl", "--version"])[0] == 0,
             "tunnels": len([c for c in cfgs if c.get("type") != "portfw"]),
@@ -809,16 +820,26 @@ def op_portfw(d):
     ips = [x.strip() for x in ips if x.strip()]
     if not ips or not all(is_ipv4(x) for x in ips):
         raise ValueError("bad destination IP")
+    listen_ip = str(d.get("listen_ip") or "").strip()  # optional: pin to ONE local IP (multi-IP hosts)
+    if listen_ip:
+        if not is_ipv4(listen_ip):
+            raise ValueError("bad listen IP")
+        if listen_ip not in local_ips_flat():
+            raise ValueError(f"{listen_ip} is not a local IP on this node")
+        liface = iface_for_ip(listen_ip)  # bind the rule to the iface that actually carries this IP
+        if liface and IFACE_RE.match(liface):
+            iface = liface
     interval = 0 if len(ips) == 1 else int(d.get("interval_min", 5)) * 60
     for c in raw_configs():
-        if c.get("type") == "portfw" and c.get("iface") == iface and str(c.get("listen_port")) == lp:
-            raise ValueError(f"port {lp} on {iface} is already forwarded (delete it first)")
+        if (c.get("type") == "portfw" and c.get("iface") == iface and str(c.get("listen_port")) == lp
+                and str(c.get("listen_ip") or "") == listen_ip):  # same port on a DIFFERENT local IP is fine
+            raise ValueError(f"port {lp} on {iface}{' (' + listen_ip + ')' if listen_ip else ''} is already forwarded (delete it first)")
     tid = int(d.get("id") or 0) or (max(used_ids(), default=41) + 1)
     name = f"portfw{tid}"
     if os.path.exists(os.path.join(CONFIG_DIR, name + ".json")):
         raise ValueError("no free name")
     obj = {"name": name, "type": "portfw", "id": tid, "iface": iface, "listen_port": lp,
-           "dst_ips": ips, "dst_port": dp, "switch_interval": interval,
+           "listen_ip": listen_ip, "dst_ips": ips, "dst_port": dp, "switch_interval": interval,
            "current_index": 0, "last_switch": int(time.time())}
     write_config(name, obj)
     try:
@@ -856,17 +877,19 @@ def op_portfw_edit(d):
         interval = int(d.get("interval_min", 5)) * 60 if rot else 0
     if len(ips) < 2:
         interval = 0  # rotation only means something with >=2 destinations
-    for c in raw_configs():  # a DIFFERENT forward must not already own this iface+listen_port
+    listen_ip = str(old.get("listen_ip") or "")  # the listen-IP pin survives edits
+    for c in raw_configs():  # a DIFFERENT forward must not already own this iface+listen_port+listen_ip
         if (c.get("name") != old["name"] and c.get("type") == "portfw"
-                and c.get("iface") == iface and str(c.get("listen_port")) == lp):
+                and c.get("iface") == iface and str(c.get("listen_port")) == lp
+                and str(c.get("listen_ip") or "") == listen_ip):
             raise ValueError(f"port {lp} on {iface} is already forwarded")
     teardown_config(old)  # clear the OLD iptables rules (old iface/port/ips) before writing the new set
     idx = int(old.get("current_index", 0) or 0)
     if idx >= len(ips):
         idx = 0
     obj = {"name": old["name"], "type": "portfw", "id": old.get("id"), "iface": iface,
-           "listen_port": lp, "dst_ips": ips, "dst_port": dp, "switch_interval": interval,
-           "current_index": idx, "last_switch": int(time.time())}
+           "listen_port": lp, "listen_ip": listen_ip, "dst_ips": ips, "dst_port": dp,
+           "switch_interval": interval, "current_index": idx, "last_switch": int(time.time())}
     write_config(old["name"], obj)
     try:
         build_portfw(obj)
