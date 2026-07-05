@@ -554,9 +554,14 @@ def _engine_config(cfg):
     cipher = str(cfg.get("cipher") or "auto")   # match the panel's default so the MTU/crypto sizing agrees
     crypto_on = bool(cfg.get("psk")) and cipher != "none"  # a psk with cipher=none is NOT encryption
     transport = str(cfg.get("transport") or "udp").lower()
+    raw_profile = str(cfg.get("raw_profile") or "bip").lower()
     obfs = bool(cfg.get("obfs")) and crypto_on   # obfs is meaningless without the AEAD key
     # MTU budget = outer headers + bip framing + obfs padding + AEAD (nonce+tag) + wire mask salt.
-    outer = 40 if transport == "tcp" else 28            # IP20 + TCP20 | IP20 + UDP8
+    if transport == "raw":
+        # IP20 + the profile's carrier header (bip/ipip add none; gre 4; icmp/udp 8; tcp 20).
+        outer = 20 + {"bip": 0, "ipip": 0, "gre": 4, "icmp": 8, "udp": 8, "tcp": 20}.get(raw_profile, 0)
+    else:
+        outer = 40 if transport == "tcp" else 28        # IP20 + TCP20 | IP20 + UDP8
     if obfs:
         framing = (2 if transport == "tcp" else 0) + 3 + OBFS_DATA_PAD_MAX  # masked-len + [type,len] + max pad
     else:
@@ -585,6 +590,10 @@ def _engine_config(cfg):
         sni = str(cfg.get("cover_sni") or "").strip()
         if sni:
             ecfg["cover_sni"] = sni
+    if transport == "raw":
+        ecfg["raw_profile"] = raw_profile
+    if bool(cfg.get("gso")):     # TUN segmentation offload — local throughput optimization
+        ecfg["gso"] = True
     if cfg.get("role") == "server":
         ecfg["listen"] = f"0.0.0.0:{port}"
     else:
@@ -1235,9 +1244,14 @@ def op_tunnel(d):
             raise ValueError("bad engine cipher")
         obj["cipher"] = cipher
         transport = str(d.get("transport") or "udp").strip().lower()
-        if transport not in ("udp", "tcp"):
+        if transport not in ("udp", "tcp", "raw"):
             raise ValueError("bad engine transport")
         obj["transport"] = transport
+        if transport == "raw":        # raw-IP carrier: which protocol the sealed frame is wrapped in
+            profile = str(d.get("raw_profile") or "bip").strip().lower()
+            if profile not in ("bip", "ipip", "gre", "icmp", "udp", "tcp"):
+                raise ValueError("bad raw_profile")
+            obj["raw_profile"] = profile
         psk = str(d.get("psk") or "").strip()
         if psk:                       # crypto is optional but recommended; when set it must be strong enough
             if len(psk) < 16:
@@ -1247,6 +1261,14 @@ def op_tunnel(d):
         if obfs and (not psk or cipher == "none"):
             raise ValueError("obfs requires a psk and encryption")
         obj["obfs"] = obfs
+        # TLS cover (HTTPS camouflage) — persist it so _engine_config can forward it to the engine.
+        if bool(d.get("cover")) and transport == "tcp":
+            obj["cover"] = True
+            sni = str(d.get("cover_sni") or "").strip()
+            if sni:
+                obj["cover_sni"] = sni
+        if bool(d.get("gso")):        # TUN segmentation offload (throughput); Linux only, harmless if unsupported
+            obj["gso"] = True
     old = read_config(name)   # in-place rebuild: fully tear the previous build down first so nothing tied to a
     if old and old.get("type") != "portfw":   # now-overwritten field (e.g. FOU's old UDP-port decap listener) leaks
         teardown_config(old)
