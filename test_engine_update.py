@@ -60,6 +60,37 @@ tnl._ensure_engine(force=False)   # routine rebuild path
 check("rebuild (force=False) makes no network call when a binary exists", net["n"] == 0)
 check("rebuild (force=False) leaves the binary unchanged", open(tnl.ENGINE_BIN, "rb").read() == b"EXISTING-BINARY")
 
+# ---- engine-install: custom binary pushed from the panel (base64 + sha verify) ----
+import base64
+import hashlib
+tnl.raw_configs = lambda: []           # no engine tunnels to rebuild in the test
+tnl.logline = lambda *a, **k: None
+_conf = {}
+tnl.load_conf = lambda: dict(_conf)
+tnl.save_conf = lambda c: _conf.update(c)
+blob = b"\x7fELF" + b"x" * 100000       # >100KB so it clears the size gate
+b64 = base64.b64encode(blob).decode()
+good = hashlib.sha256(blob).hexdigest()
+
+r = tnl.op_engine_install({"data": b64, "sha256": "0" * 64})
+check("engine-install rejects a checksum mismatch", r.get("ok") is False)
+
+small = b"tiny"
+r = tnl.op_engine_install({"data": base64.b64encode(small).decode(), "sha256": hashlib.sha256(small).hexdigest()})
+check("engine-install rejects a too-small binary", r.get("ok") is False)
+
+try:
+    tnl.op_engine_install({"data": b64, "sha256": "nothex"})
+    check("engine-install rejects a malformed sha", False)
+except ValueError:
+    check("engine-install rejects a malformed sha", True)
+
+r = tnl.op_engine_install({"data": b64, "sha256": good, "version": "custom"})
+check("engine-install ok on a verified binary", r.get("ok") is True and r.get("engine_sha") == good[:12])
+check("engine-install wrote the exact bytes", open(tnl.ENGINE_BIN, "rb").read() == blob)
+check("engine-install pins the node to the label", _conf.get("engine_version") == "custom")
+check("engine-install is a mutation (not read-only)", "engine-install" in tnl.OPS and "engine-install" not in tnl.READ_ONLY)
+
 print()
 if FAILS:
     print("%d FAILED: %s" % (len(FAILS), ", ".join(FAILS)))
