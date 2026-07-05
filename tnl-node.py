@@ -1116,7 +1116,7 @@ def op_ping(d):
         stats["net"] = net
     except Exception:
         pass
-    return {"ok": True, "agent": "tnl-node", "version": 19, "ready": True,
+    return {"ok": True, "agent": "tnl-node", "version": 20, "ready": True,
             "hostname": socket.gethostname(), "ips": all_ips(), "sha256": _SELF_SHA,
             "tunnels": len([c for c in cfgs if c.get("type") != "portfw"]),
             "portfw": len([c for c in cfgs if c.get("type") == "portfw"]),
@@ -1381,6 +1381,73 @@ def op_check(d):
     return {"ok": True, "health": health_of(cfg, thorough=True)}
 
 
+def _ss_proc(line):
+    """Pull the occupying process name out of an `ss -p` line: users:(("nginx",pid=..))."""
+    m = re.search(r'users:\(\("([^"]+)"', line)
+    return m.group(1) if m else ""
+
+
+def _port_busy_proc(port, proto):
+    """Fallback when `ss` is unavailable: scan /proc/net/{tcp,tcp6}|{udp,udp6}. No process name.
+    TCP listeners have st==0A; a bound UDP socket has a non-zero local port. Returns bool."""
+    files = ("/proc/net/tcp", "/proc/net/tcp6") if proto == "tcp" else ("/proc/net/udp", "/proc/net/udp6")
+    for path in files:
+        try:
+            with open(path) as f:
+                next(f, None)  # header
+                for row in f:
+                    parts = row.split()
+                    if len(parts) < 4:
+                        continue
+                    local, st = parts[1], parts[3]
+                    if proto == "tcp" and st != "0A":   # only LISTEN sockets conflict for TCP
+                        continue
+                    hexport = local.rsplit(":", 1)[-1]
+                    try:
+                        if int(hexport, 16) == int(port):
+                            return True
+                    except ValueError:
+                        continue
+        except (OSError, StopIteration):
+            continue
+    return False
+
+
+def _port_busy(port, proto):
+    """Is `port` already listening on this node for the given proto? Sees ALL processes
+    (Xray/nginx/x-ui/…), not just our tunnels. Returns (busy, who)."""
+    proto = "tcp" if str(proto).lower() == "tcp" else "udp"
+    flag = "-t" if proto == "tcp" else "-u"
+    rc, out, _ = run(["ss", "-H", "-l", "-n", "-p", flag])
+    if rc == 0:
+        for line in out.splitlines():
+            f = line.split()
+            if len(f) < 4:
+                continue
+            local = f[3]   # State Recv-Q Send-Q Local:Port Peer:Port [users:(...)]
+            if ":" not in local:
+                continue
+            if local.rsplit(":", 1)[-1] == str(port):
+                return True, _ss_proc(line)
+        return False, ""
+    return _port_busy_proc(port, proto), ""
+
+
+def op_portcheck(d):
+    """READ_ONLY: report whether {port, proto} is already in use on this node so the panel
+    can block a create/edit that would collide with an existing service or tunnel."""
+    _require(d, ["port"])
+    try:
+        port = int(d["port"])
+    except (TypeError, ValueError):
+        raise ValueError("bad port")
+    if not 1 <= port <= 65535:
+        raise ValueError("port out of range")
+    proto = "tcp" if str(d.get("proto", "udp")).lower() == "tcp" else "udp"
+    busy, who = _port_busy(port, proto)
+    return {"ok": True, "busy": busy, "who": who, "port": port, "proto": proto}
+
+
 def op_apply(d):
     apply_all()
     return {"ok": True}
@@ -1441,8 +1508,9 @@ def op_update(d):
 
 OPS = {"ping": op_ping, "list": op_list, "check": op_check, "tunnel": op_tunnel,
        "portfw": op_portfw, "portfw-edit": op_portfw_edit, "portfw-next": op_portfw_next,
-       "delete": op_delete, "apply": op_apply, "update": op_update, "wipe": op_wipe}
-READ_ONLY = {"ping", "list", "check"}
+       "delete": op_delete, "apply": op_apply, "update": op_update, "wipe": op_wipe,
+       "portcheck": op_portcheck}
+READ_ONLY = {"ping", "list", "check", "portcheck"}
 
 # ----------------------------------------------------------------------------- HTTP
 
