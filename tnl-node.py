@@ -579,6 +579,12 @@ def _engine_config(cfg):
         "keepalive": 15,
         "crypto": {"enabled": crypto_on, "psk": cfg.get("psk", ""), "cipher": cipher},
     }
+    # TLS cover (HTTPS camouflage) — TCP only; carries an optional SNI to present.
+    if bool(cfg.get("cover")) and transport == "tcp" and crypto_on:
+        ecfg["cover"] = True
+        sni = str(cfg.get("cover_sni") or "").strip()
+        if sni:
+            ecfg["cover_sni"] = sni
     if cfg.get("role") == "server":
         ecfg["listen"] = f"0.0.0.0:{port}"
     else:
