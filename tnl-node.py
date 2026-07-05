@@ -18,6 +18,7 @@
 # Auth: every request must carry header  X-Node-Token: <token>  (constant-time compared).
 # Plain HTTP — expose the agent port to the central server only (trusted network / VPN).
 
+import base64
 import hashlib
 import hmac
 import ipaddress
@@ -1161,7 +1162,7 @@ def op_ping(d):
         stats["net"] = net
     except Exception:
         pass
-    return {"ok": True, "agent": "tnl-node", "version": 21, "ready": True,
+    return {"ok": True, "agent": "tnl-node", "version": 22, "ready": True,
             "hostname": socket.gethostname(), "ips": all_ips(), "sha256": _SELF_SHA,
             "tunnels": len([c for c in cfgs if c.get("type") != "portfw"]),
             "portfw": len([c for c in cfgs if c.get("type") == "portfw"]),
@@ -1495,6 +1496,7 @@ def op_portcheck(d):
 
 
 ENGINE_VER_RE = re.compile(r"^[A-Za-z0-9._-]{1,40}$")
+ENGINE_SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 def op_engine_update(d):
@@ -1519,6 +1521,47 @@ def op_engine_update(d):
     logline(f"engine pinned to {version}; rebuilt {restarted} engine tunnel(s)")
     return {"ok": True, "version": version, "engine_sha": _installed_engine_sha()[:12],
             "restarted": restarted, "errors": errs}
+
+
+def op_engine_install(d):
+    """Install a raw engine binary pushed from the panel (base64), not a published release. Verify its
+    sha256, swap it in atomically, pin the node to a custom label, then rebuild the engine tunnels so they
+    relaunch on it. NEVER install a binary whose checksum does not verify (it runs as root)."""
+    _require(d, ["data", "sha256"])
+    want = str(d.get("sha256") or "").strip().lower()
+    if not ENGINE_SHA_RE.match(want):
+        raise ValueError("bad sha256")
+    try:
+        raw = base64.b64decode(d["data"], validate=True)
+    except Exception:
+        raise ValueError("bad base64 payload")
+    if len(raw) < 100000:                         # an engine binary is ~3 MB; anything tiny is a mistake, never install it
+        return {"ok": False, "msg": "binary too small"}
+    got = hashlib.sha256(raw).hexdigest()
+    if got != want:
+        return {"ok": False, "msg": "checksum mismatch"}   # transport truncation guard — never install unverified bytes
+    label = str(d.get("version") or "custom").strip() or "custom"
+    if not ENGINE_VER_RE.match(label):
+        label = "custom"
+    with _engine_lock:
+        tmp = ENGINE_BIN + ".new"
+        with open(tmp, "wb") as f:
+            f.write(raw)
+        os.chmod(tmp, 0o755)
+        os.replace(tmp, ENGINE_BIN)               # atomic swap on the same fs — no half-written window
+    conf = load_conf()
+    conf["engine_version"] = label
+    save_conf(conf)
+    restarted, errs = 0, []
+    for c in raw_configs():                        # relaunch every engine tunnel on the freshly-installed binary
+        if c.get("type") == "engine":
+            try:
+                build_engine(c)
+                restarted += 1
+            except Exception as e:
+                errs.append(f"{c.get('name')}: {e}")
+    logline(f"engine installed from upload ({label}, sha {got[:12]}); rebuilt {restarted} engine tunnel(s)")
+    return {"ok": True, "version": label, "engine_sha": got[:12], "restarted": restarted, "errors": errs}
 
 
 def op_apply(d):
@@ -1582,7 +1625,8 @@ def op_update(d):
 OPS = {"ping": op_ping, "list": op_list, "check": op_check, "tunnel": op_tunnel,
        "portfw": op_portfw, "portfw-edit": op_portfw_edit, "portfw-next": op_portfw_next,
        "delete": op_delete, "apply": op_apply, "update": op_update, "wipe": op_wipe,
-       "portcheck": op_portcheck, "engine-update": op_engine_update}
+       "portcheck": op_portcheck, "engine-update": op_engine_update,
+       "engine-install": op_engine_install}
 READ_ONLY = {"ping", "list", "check", "portcheck"}
 
 # ----------------------------------------------------------------------------- HTTP
