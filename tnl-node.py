@@ -46,8 +46,14 @@ INSTALLED = os.path.join(CONFIG_DIR, "tnl-node.py")  # stable path the systemd u
 # The custom Go data-plane engine (packet/bip): a static binary the node fetches from the engine
 # repo (raw, like the agent's own git update), verifies by sha256, and supervises via systemd-run.
 ENGINE_BIN = os.path.join(CONFIG_DIR, "tnl-engine")
-ENGINE_BASE = "https://raw.githubusercontent.com/Angize/TUNNEL-MANAGER-ENGINE/main/dist"
+# The engine binary is published as a GitHub Release ASSET, one release per version
+# (tag v1, v2, …). A node can pin a specific version (stored as conf["engine_version"])
+# or track "latest"; downgrade is just pinning an older tag. The panel drives the pin
+# via the "engine-update" op.
+ENGINE_RELEASES = "https://github.com/Angize/TUNNEL-MANAGER-ENGINE/releases"
+ENGINE_RAW = "https://raw.githubusercontent.com/Angize/TUNNEL-MANAGER-ENGINE"  # raw-from-tag fallback
 _engine_lock = threading.Lock()  # serialize download/replace of the shared engine binary
+_engine_sha_cache = {"mtime": None, "sha": ""}  # avoid re-hashing the 3 MB binary on every ping
 OBFS_DATA_PAD_MAX = 64   # must match the engine's obfsDataPadMax so the MTU budget covers worst-case padding
 
 NAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
@@ -457,40 +463,78 @@ def _http_get(url, timeout=30):
         return None
 
 
-def _ensure_engine():
-    """Make sure /opt/tunnel/tnl-engine is present and matches the published sha256. Downloads from the
-    engine repo (raw) on first use or when the checksum changes. If the sha file is unreachable we keep
-    whatever copy we already have (offline-tolerant); we only ever replace after a verified download."""
+def _engine_ref():
+    """The engine version this node is pinned to: a release tag (e.g. "v2") or "latest"."""
+    try:
+        return str(load_conf().get("engine_version") or "latest").strip() or "latest"
+    except Exception:
+        return "latest"
+
+
+def _engine_urls(ref, arch):
+    """Candidate download URLs for the engine binary at `ref`, in priority order: the GitHub Release
+    ASSET first (what the panel publishes), then raw-from-tag (the binary committed in the repo at that
+    tag) as a fallback — so it works whether a release attaches the asset or just tags a commit."""
+    asset = f"tnl-engine-linux-{arch}"
+    if ref in ("", "latest", None):
+        return [f"{ENGINE_RELEASES}/latest/download/{asset}", f"{ENGINE_RAW}/main/dist/{asset}"]
+    return [f"{ENGINE_RELEASES}/download/{ref}/{asset}", f"{ENGINE_RAW}/{ref}/dist/{asset}"]
+
+
+def _installed_engine_sha():
+    """sha256 of the installed binary, cached by mtime so ping doesn't re-hash 3 MB each time."""
+    try:
+        st = os.stat(ENGINE_BIN)
+        if _engine_sha_cache["mtime"] != st.st_mtime:
+            with open(ENGINE_BIN, "rb") as f:
+                _engine_sha_cache["sha"] = hashlib.sha256(f.read()).hexdigest()
+            _engine_sha_cache["mtime"] = st.st_mtime
+        return _engine_sha_cache["sha"]
+    except Exception:
+        return ""
+
+
+def _ensure_engine(ref=None):
+    """Make sure /opt/tunnel/tnl-engine is the binary for the pinned version and matches its published
+    sha256. Downloads the release asset for `ref` (defaults to the node's pinned version) on first use
+    or when the checksum changes. If the sha file is unreachable we keep whatever copy we already have
+    (offline-tolerant); we only ever replace after a verified download. Pinning to a tag means routine
+    tunnel rebuilds never silently change the engine — only an explicit engine-update does."""
     with _engine_lock:
+        if ref is None:
+            ref = _engine_ref()
         arch = _engine_arch()
-        url = f"{ENGINE_BASE}/tnl-engine-linux-{arch}"
-        sha_raw = _http_get(url + ".sha256")
-        want = sha_raw.decode().split()[0].strip() if sha_raw else ""
         have = os.path.isfile(ENGINE_BIN)
+        cur = None
         if have:
             with open(ENGINE_BIN, "rb") as f:
                 cur = hashlib.sha256(f.read()).hexdigest()
-            if want and cur == want:
-                return               # already the published build
-            if not want:
-                return               # can't verify right now, keep the working copy
-        data = _http_get(url, timeout=120)
-        if not data:
-            if have:
-                return               # download failed but we have a copy -> use it
-            raise RuntimeError("could not download engine binary")
-        if not want:
-            # No published checksum to verify against. Keeping an already-present
-            # copy is fine (handled above), but installing a FRESH, unverified
-            # binary that then runs as root is a supply-chain hole — refuse it.
-            raise RuntimeError("engine checksum unavailable; refusing to install an unverified binary")
-        if hashlib.sha256(data).hexdigest() != want:
-            raise RuntimeError("engine binary checksum mismatch")
-        tmp = ENGINE_BIN + ".new"
-        with open(tmp, "wb") as f:
-            f.write(data)
-        os.chmod(tmp, 0o755)
-        os.replace(tmp, ENGINE_BIN)
+        last = "no source reachable"
+        for url in _engine_urls(ref, arch):
+            sha_raw = _http_get(url + ".sha256")
+            want = sha_raw.decode().split()[0].strip() if sha_raw else ""
+            if not want:                # can't verify this source -> try the next
+                last = "checksum unavailable"
+                continue
+            if have and cur == want:
+                return                  # already the pinned build; nothing to do
+            data = _http_get(url, timeout=120)
+            if not data:
+                last = "download failed"
+                continue
+            if hashlib.sha256(data).hexdigest() != want:
+                last = "checksum mismatch"    # NEVER install an unverified binary (runs as root)
+                continue
+            tmp = ENGINE_BIN + ".new"
+            with open(tmp, "wb") as f:
+                f.write(data)
+            os.chmod(tmp, 0o755)
+            os.replace(tmp, ENGINE_BIN)
+            return
+        # no source produced a verified binary
+        if have:
+            return                      # offline-tolerant: keep the working copy we already have
+        raise RuntimeError(f"could not install engine {ref}: {last}")
 
 
 def _engine_port(cfg):
@@ -1116,10 +1160,11 @@ def op_ping(d):
         stats["net"] = net
     except Exception:
         pass
-    return {"ok": True, "agent": "tnl-node", "version": 20, "ready": True,
+    return {"ok": True, "agent": "tnl-node", "version": 21, "ready": True,
             "hostname": socket.gethostname(), "ips": all_ips(), "sha256": _SELF_SHA,
             "tunnels": len([c for c in cfgs if c.get("type") != "portfw"]),
             "portfw": len([c for c in cfgs if c.get("type") == "portfw"]),
+            "engine_ver": _engine_ref(), "engine_sha": _installed_engine_sha()[:12],
             "stats": stats}
 
 
@@ -1448,6 +1493,33 @@ def op_portcheck(d):
     return {"ok": True, "busy": busy, "who": who, "port": port, "proto": proto}
 
 
+ENGINE_VER_RE = re.compile(r"^[A-Za-z0-9._-]{1,40}$")
+
+
+def op_engine_update(d):
+    """Pin this node to a specific engine version (a release tag, or "latest") and install it, then
+    rebuild the running engine tunnels so they restart on the new binary. Downgrade = pass an older tag.
+    Pinning stops routine tunnel rebuilds from silently changing the engine."""
+    version = str(d.get("version") or "latest").strip()
+    if version != "latest" and not ENGINE_VER_RE.match(version):
+        raise ValueError("bad engine version")
+    conf = load_conf()
+    conf["engine_version"] = version
+    save_conf(conf)
+    _ensure_engine(version)           # download + verify + install the pinned version (raises on failure)
+    restarted, errs = 0, []
+    for c in raw_configs():           # relaunch every engine tunnel on the freshly-installed binary
+        if c.get("type") == "engine":
+            try:
+                build_engine(c)
+                restarted += 1
+            except Exception as e:
+                errs.append(f"{c.get('name')}: {e}")
+    logline(f"engine pinned to {version}; rebuilt {restarted} engine tunnel(s)")
+    return {"ok": True, "version": version, "engine_sha": _installed_engine_sha()[:12],
+            "restarted": restarted, "errors": errs}
+
+
 def op_apply(d):
     apply_all()
     return {"ok": True}
@@ -1509,7 +1581,7 @@ def op_update(d):
 OPS = {"ping": op_ping, "list": op_list, "check": op_check, "tunnel": op_tunnel,
        "portfw": op_portfw, "portfw-edit": op_portfw_edit, "portfw-next": op_portfw_next,
        "delete": op_delete, "apply": op_apply, "update": op_update, "wipe": op_wipe,
-       "portcheck": op_portcheck}
+       "portcheck": op_portcheck, "engine-update": op_engine_update}
 READ_ONLY = {"ping", "list", "check", "portcheck"}
 
 # ----------------------------------------------------------------------------- HTTP
