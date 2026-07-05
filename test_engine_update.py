@@ -19,15 +19,13 @@ def check(name, cond):
         FAILS.append(name)
 
 
-# ---- download URL priority: Release asset first, raw-from-tag fallback ----
+# ---- download source: the GitHub Release ASSET only (no repo-tree fallback) ----
 u = tnl._engine_urls("v2", "amd64")
-check("pinned: release asset URL first",
-      u[0] == "https://github.com/Angize/TUNNEL-MANAGER-ENGINE/releases/download/v2/tnl-engine-linux-amd64")
-check("pinned: raw-from-tag fallback second",
-      u[1] == "https://raw.githubusercontent.com/Angize/TUNNEL-MANAGER-ENGINE/v2/dist/tnl-engine-linux-amd64")
+check("pinned: single release-asset URL",
+      u == ["https://github.com/Angize/TUNNEL-MANAGER-ENGINE/releases/download/v2/tnl-engine-linux-amd64"])
 u = tnl._engine_urls("latest", "amd64")
-check("latest: releases/latest asset first", "/releases/latest/download/" in u[0])
-check("latest: raw main/dist fallback second", u[1].endswith("/main/dist/tnl-engine-linux-amd64"))
+check("latest: single releases/latest asset URL",
+      len(u) == 1 and "/releases/latest/download/" in u[0])
 check("arch flows into the asset name", "arm64" in tnl._engine_urls("v1", "arm64")[0])
 
 # ---- version-string validation (op_engine_update) ----
@@ -50,6 +48,17 @@ tnl.load_conf = lambda: {}
 check("_engine_ref defaults to latest", tnl._engine_ref() == "latest")
 tnl.load_conf = lambda: {"engine_version": "v1"}
 check("_engine_ref reads the pin", tnl._engine_ref() == "v1")
+
+# ---- no auto-update: with a binary present, force=False touches nothing ----
+import tempfile
+d = tempfile.mkdtemp()
+tnl.ENGINE_BIN = os.path.join(d, "tnl-engine")
+open(tnl.ENGINE_BIN, "wb").write(b"EXISTING-BINARY")
+net = {"n": 0}
+tnl._http_get = lambda *a, **k: (net.__setitem__("n", net["n"] + 1) or None)
+tnl._ensure_engine(force=False)   # routine rebuild path
+check("rebuild (force=False) makes no network call when a binary exists", net["n"] == 0)
+check("rebuild (force=False) leaves the binary unchanged", open(tnl.ENGINE_BIN, "rb").read() == b"EXISTING-BINARY")
 
 print()
 if FAILS:

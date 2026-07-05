@@ -51,7 +51,6 @@ ENGINE_BIN = os.path.join(CONFIG_DIR, "tnl-engine")
 # or track "latest"; downgrade is just pinning an older tag. The panel drives the pin
 # via the "engine-update" op.
 ENGINE_RELEASES = "https://github.com/Angize/TUNNEL-MANAGER-ENGINE/releases"
-ENGINE_RAW = "https://raw.githubusercontent.com/Angize/TUNNEL-MANAGER-ENGINE"  # raw-from-tag fallback
 _engine_lock = threading.Lock()  # serialize download/replace of the shared engine binary
 _engine_sha_cache = {"mtime": None, "sha": ""}  # avoid re-hashing the 3 MB binary on every ping
 OBFS_DATA_PAD_MAX = 64   # must match the engine's obfsDataPadMax so the MTU budget covers worst-case padding
@@ -472,13 +471,13 @@ def _engine_ref():
 
 
 def _engine_urls(ref, arch):
-    """Candidate download URLs for the engine binary at `ref`, in priority order: the GitHub Release
-    ASSET first (what the panel publishes), then raw-from-tag (the binary committed in the repo at that
-    tag) as a fallback — so it works whether a release attaches the asset or just tags a commit."""
+    """Download URL for the engine binary at `ref`: the GitHub Release ASSET, and only that. The panel
+    publishes each version as a release asset (tnl-engine-linux-<arch> + .sha256); there is no repo-tree
+    fallback, so a version exists exactly when its release asset does."""
     asset = f"tnl-engine-linux-{arch}"
     if ref in ("", "latest", None):
-        return [f"{ENGINE_RELEASES}/latest/download/{asset}", f"{ENGINE_RAW}/main/dist/{asset}"]
-    return [f"{ENGINE_RELEASES}/download/{ref}/{asset}", f"{ENGINE_RAW}/{ref}/dist/{asset}"]
+        return [f"{ENGINE_RELEASES}/latest/download/{asset}"]
+    return [f"{ENGINE_RELEASES}/download/{ref}/{asset}"]
 
 
 def _installed_engine_sha():
@@ -494,17 +493,19 @@ def _installed_engine_sha():
         return ""
 
 
-def _ensure_engine(ref=None):
-    """Make sure /opt/tunnel/tnl-engine is the binary for the pinned version and matches its published
-    sha256. Downloads the release asset for `ref` (defaults to the node's pinned version) on first use
-    or when the checksum changes. If the sha file is unreachable we keep whatever copy we already have
-    (offline-tolerant); we only ever replace after a verified download. Pinning to a tag means routine
-    tunnel rebuilds never silently change the engine — only an explicit engine-update does."""
+def _ensure_engine(ref=None, force=False):
+    """Make sure /opt/tunnel/tnl-engine exists. Routine callers (a tunnel build/rebuild) pass force=False:
+    if a binary is ALREADY present it is left completely untouched — no network call, no version check —
+    so builds, rebuilds and reconciles never change the engine. Only an explicit engine-update passes
+    force=True, which downloads the release asset for `ref`, verifies its sha256, and installs it. We
+    never install a binary whose checksum does not verify (it runs as root)."""
     with _engine_lock:
+        have = os.path.isfile(ENGINE_BIN)
+        if have and not force:
+            return                       # a binary is present; only engine-update (force) ever replaces it
         if ref is None:
             ref = _engine_ref()
         arch = _engine_arch()
-        have = os.path.isfile(ENGINE_BIN)
         cur = None
         if have:
             with open(ENGINE_BIN, "rb") as f:
@@ -1506,7 +1507,7 @@ def op_engine_update(d):
     conf = load_conf()
     conf["engine_version"] = version
     save_conf(conf)
-    _ensure_engine(version)           # download + verify + install the pinned version (raises on failure)
+    _ensure_engine(version, force=True)   # explicit update: download + verify + install even if a binary exists
     restarted, errs = 0, []
     for c in raw_configs():           # relaunch every engine tunnel on the freshly-installed binary
         if c.get("type") == "engine":
