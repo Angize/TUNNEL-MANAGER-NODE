@@ -479,7 +479,12 @@ def _ensure_engine():
             if have:
                 return               # download failed but we have a copy -> use it
             raise RuntimeError("could not download engine binary")
-        if want and hashlib.sha256(data).hexdigest() != want:
+        if not want:
+            # No published checksum to verify against. Keeping an already-present
+            # copy is fine (handled above), but installing a FRESH, unverified
+            # binary that then runs as root is a supply-chain hole — refuse it.
+            raise RuntimeError("engine checksum unavailable; refusing to install an unverified binary")
+        if hashlib.sha256(data).hexdigest() != want:
             raise RuntimeError("engine binary checksum mismatch")
         tmp = ENGINE_BIN + ".new"
         with open(tmp, "wb") as f:
@@ -498,8 +503,8 @@ def _engine_config(cfg):
     Crypto is on whenever a psk is present; the psk never leaves the node (public_configs pops it)."""
     name = cfg["name"]
     port = _engine_port(cfg)
-    crypto_on = bool(cfg.get("psk"))
-    cipher = str(cfg.get("cipher") or "aes-256-gcm")
+    cipher = str(cfg.get("cipher") or "auto")   # match the panel's default so the MTU/crypto sizing agrees
+    crypto_on = bool(cfg.get("psk")) and cipher != "none"  # a psk with cipher=none is NOT encryption
     transport = str(cfg.get("transport") or "udp").lower()
     obfs = bool(cfg.get("obfs")) and crypto_on   # obfs is meaningless without the AEAD key
     # MTU budget = outer headers + bip framing + obfs padding + AEAD (nonce+tag).
@@ -1193,6 +1198,15 @@ def op_tunnel(d):
     try:
         apply_config(obj)
     except Exception as e:
+        # apply blew up (e.g. engine download/checksum failure): the old build is
+        # already gone and this config was just written, so undo the partial build
+        # and drop the file — otherwise it lingers, inflates op_ping/op_list counts,
+        # and gets retried on every boot via apply_all. Mirrors the rc!=0 cleanup.
+        teardown_config(obj)
+        try:
+            os.remove(os.path.join(CONFIG_DIR, name + ".json"))
+        except OSError:
+            pass
         return {"ok": False, "msg": str(e)}
     # builds run `ip` via run() which never raises on failure, so verify the netdev really exists
     rc, _, _ = run(["ip", "link", "show", name])   # every type is a plain kernel netdev now
