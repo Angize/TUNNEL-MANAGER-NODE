@@ -555,7 +555,7 @@ def _engine_config(cfg):
     crypto_on = bool(cfg.get("psk")) and cipher != "none"  # a psk with cipher=none is NOT encryption
     transport = str(cfg.get("transport") or "udp").lower()
     obfs = bool(cfg.get("obfs")) and crypto_on   # obfs is meaningless without the AEAD key
-    # MTU budget = outer headers + bip framing + obfs padding + AEAD (nonce+tag).
+    # MTU budget = outer headers + bip framing + obfs padding + AEAD (nonce+tag) + wire mask salt.
     outer = 40 if transport == "tcp" else 28            # IP20 + TCP20 | IP20 + UDP8
     if obfs:
         framing = (2 if transport == "tcp" else 0) + 3 + OBFS_DATA_PAD_MAX  # masked-len + [type,len] + max pad
@@ -563,7 +563,8 @@ def _engine_config(cfg):
         framing = 4 if transport == "tcp" else 2        # (len)+magic+type | magic+type
     overhead = outer + framing
     if crypto_on:
-        overhead += 40 if cipher == "xchacha20-poly1305" else 28
+        # AEAD nonce+tag, plus the 12-byte per-frame mask salt the engine prepends (v2 wire).
+        overhead += (40 if cipher == "xchacha20-poly1305" else 28) + 12
     mtu = max(1280, base_mtu() - overhead)
     ecfg = {
         "role": cfg.get("role"),
