@@ -62,6 +62,24 @@ plain = cfg(psk="0123456789abcdef", cipher="auto")["mtu"]
 obfsx = cfg(psk="0123456789abcdef", cipher="xchacha20-poly1305", obfs=True)["mtu"]
 check("obfs+xchacha MTU < plain MTU", obfsx < plain)
 
+# raw transport: profile forwarded, defaults to bip, and its carrier header sizes the MTU.
+e = cfg(psk="0123456789abcdef", transport="raw", raw_profile="gre")
+check("raw transport passes through", e["transport"] == "raw")
+check("raw_profile forwarded", e["raw_profile"] == "gre")
+check("raw defaults profile to bip", cfg(psk="0123456789abcdef", transport="raw")["raw_profile"] == "bip")
+bip_mtu = cfg(psk="0123456789abcdef", transport="raw", raw_profile="bip")["mtu"]
+tcp_mtu = cfg(psk="0123456789abcdef", transport="raw", raw_profile="tcp")["mtu"]
+check("raw tcp-profile MTU < bip-profile MTU (bigger carrier header)", tcp_mtu < bip_mtu)
+
+# GSO flag forwarded when set, omitted otherwise.
+check("gso forwarded when set", cfg(psk="0123456789abcdef", gso=True).get("gso") is True)
+check("gso omitted by default", "gso" not in cfg(psk="0123456789abcdef"))
+
+# TLS cover forwarded on tcp; ignored on the raw carrier.
+e = cfg(psk="0123456789abcdef", transport="tcp", cover=True, cover_sni="www.site.com")
+check("cover forwarded on tcp", e.get("cover") is True and e.get("cover_sni") == "www.site.com")
+check("cover ignored on raw", "cover" not in cfg(psk="0123456789abcdef", transport="raw", cover=True, cover_sni="x.com"))
+
 print()
 if FAILS:
     print("%d FAILED: %s" % (len(FAILS), ", ".join(FAILS)))
