@@ -48,6 +48,7 @@ INSTALLED = os.path.join(CONFIG_DIR, "tnl-node.py")  # stable path the systemd u
 ENGINE_BIN = os.path.join(CONFIG_DIR, "tnl-engine")
 ENGINE_BASE = "https://raw.githubusercontent.com/Angize/TUNNEL-MANAGER-ENGINE/main/dist"
 _engine_lock = threading.Lock()  # serialize download/replace of the shared engine binary
+OBFS_DATA_PAD_MAX = 64   # must match the engine's obfsDataPadMax so the MTU budget covers worst-case padding
 
 NAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
 IFACE_RE = re.compile(r"^[A-Za-z0-9_.@-]+$")
@@ -499,8 +500,15 @@ def _engine_config(cfg):
     port = _engine_port(cfg)
     crypto_on = bool(cfg.get("psk"))
     cipher = str(cfg.get("cipher") or "aes-256-gcm")
-    # outer IP20 + UDP8 + bip2 = 30; sealing adds nonce+tag (28 for gcm/chacha, 40 for xchacha's 24B nonce)
-    overhead = 30
+    transport = str(cfg.get("transport") or "udp").lower()
+    obfs = bool(cfg.get("obfs")) and crypto_on   # obfs is meaningless without the AEAD key
+    # MTU budget = outer headers + bip framing + obfs padding + AEAD (nonce+tag).
+    outer = 40 if transport == "tcp" else 28            # IP20 + TCP20 | IP20 + UDP8
+    if obfs:
+        framing = (2 if transport == "tcp" else 0) + 3 + OBFS_DATA_PAD_MAX  # masked-len + [type,len] + max pad
+    else:
+        framing = 4 if transport == "tcp" else 2        # (len)+magic+type | magic+type
+    overhead = outer + framing
     if crypto_on:
         overhead += 40 if cipher == "xchacha20-poly1305" else 28
     mtu = max(1280, base_mtu() - overhead)
@@ -508,6 +516,8 @@ def _engine_config(cfg):
         "role": cfg.get("role"),
         "mode": "packet",
         "profile": "bip",
+        "transport": transport,
+        "obfs": obfs,
         "tun_name": name,
         "tun_addr": cfg["tunnel_ip"],
         "tun_peer": peer_of(cfg["tunnel_ip"], "engine"),
@@ -1101,7 +1111,7 @@ def op_ping(d):
         stats["net"] = net
     except Exception:
         pass
-    return {"ok": True, "agent": "tnl-node", "version": 18, "ready": True,
+    return {"ok": True, "agent": "tnl-node", "version": 19, "ready": True,
             "hostname": socket.gethostname(), "ips": all_ips(), "sha256": _SELF_SHA,
             "tunnels": len([c for c in cfgs if c.get("type") != "portfw"]),
             "portfw": len([c for c in cfgs if c.get("type") == "portfw"]),
@@ -1163,11 +1173,19 @@ def op_tunnel(d):
         if cipher not in ("auto", "aes-256-gcm", "aes-128-gcm", "chacha20-poly1305", "xchacha20-poly1305", "none"):
             raise ValueError("bad engine cipher")
         obj["cipher"] = cipher
+        transport = str(d.get("transport") or "udp").strip().lower()
+        if transport not in ("udp", "tcp"):
+            raise ValueError("bad engine transport")
+        obj["transport"] = transport
         psk = str(d.get("psk") or "").strip()
         if psk:                       # crypto is optional but recommended; when set it must be strong enough
             if len(psk) < 16:
                 raise ValueError("engine psk too short (>=16)")
             obj["psk"] = psk          # popped from public_configs, so it never leaves the node
+        obfs = bool(d.get("obfs"))    # anti-DPI: needs the AEAD key, so a psk (and a real cipher) is required
+        if obfs and (not psk or cipher == "none"):
+            raise ValueError("obfs requires a psk and encryption")
+        obj["obfs"] = obfs
     old = read_config(name)   # in-place rebuild: fully tear the previous build down first so nothing tied to a
     if old and old.get("type") != "portfw":   # now-overwritten field (e.g. FOU's old UDP-port decap listener) leaks
         teardown_config(old)
