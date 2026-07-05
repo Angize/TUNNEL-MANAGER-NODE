@@ -57,8 +57,10 @@ _engine_sha_cache = {"mtime": None, "sha": ""}  # avoid re-hashing the 3 MB bina
 OBFS_DATA_PAD_MAX = 64   # must match the engine's obfsDataPadMax so the MTU budget covers worst-case padding
 
 NAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
-IFACE_RE = re.compile(r"^[A-Za-z0-9_.@-]+$")
+IFACE_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.@-]*$")  # no leading '-' → can't be mistaken for a CLI flag (arg-injection guard)
 
+MAX_CONNS = 64                  # cap concurrent request handlers so an unauth slowloris can't exhaust root threads
+_conn_sem = threading.BoundedSemaphore(MAX_CONNS)
 _apply_lock = threading.Lock()  # serialize all state mutations (API writes + rotation thread)
 _restart_pending = threading.Event()  # set once op_update swaps the binary → reject NEW mutating ops until the bounce
 _central_cb = None              # (ip, port) the panel last reached us from → where we call back /api/checkin
@@ -1495,7 +1497,7 @@ def op_portcheck(d):
     return {"ok": True, "busy": busy, "who": who, "port": port, "proto": proto}
 
 
-ENGINE_VER_RE = re.compile(r"^[A-Za-z0-9._-]{1,40}$")
+ENGINE_VER_RE = re.compile(r"^(?!.*\.\.)[A-Za-z0-9._-]{1,40}$")  # negative-lookahead rejects any '..' → no path traversal in the release URL
 ENGINE_SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -1504,8 +1506,8 @@ def op_engine_update(d):
     rebuild the running engine tunnels so they restart on the new binary. Downgrade = pass an older tag.
     Pinning stops routine tunnel rebuilds from silently changing the engine."""
     version = str(d.get("version") or "latest").strip()
-    if version != "latest" and not ENGINE_VER_RE.match(version):
-        raise ValueError("bad engine version")
+    if version != "latest" and (".." in version or not ENGINE_VER_RE.match(version)):
+        raise ValueError("bad engine version")   # reject '..' explicitly → never let a tag traverse out of the release URL
     conf = load_conf()
     conf["engine_version"] = version
     save_conf(conf)
@@ -1633,6 +1635,7 @@ READ_ONLY = {"ping", "list", "check", "portcheck"}
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "tnl-node"
+    timeout = 30   # socket timeout on slow header/body reads → a pre-auth slowloris can't pin a root thread forever
 
     def log_message(self, *a):
         pass
@@ -1640,7 +1643,14 @@ class Handler(BaseHTTPRequestHandler):
     def _authed(self):
         tok = self.headers.get("X-Node-Token", "")
         want = self.server.conf.get("token", "")
-        return bool(tok) and bool(want) and hmac.compare_digest(tok, want)
+        if not tok or not want:
+            return False
+        try:
+            # compare on bytes: a non-ASCII X-Node-Token would make compare_digest(str, str) raise
+            # TypeError (→ connection reset). Encoding first keeps it constant-time and fail-closed.
+            return hmac.compare_digest(tok.encode("utf-8"), want.encode("utf-8"))
+        except Exception:
+            return False
 
     def _send(self, code, body):
         data = json.dumps(body).encode()
@@ -1651,12 +1661,12 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def _body(self):
+    def _body(self, cap=1048576):
         try:
             n = int(self.headers.get("Content-Length", "0"))
         except ValueError:
             n = 0
-        n = min(max(n, 0), 1048576)   # 1MB — headroom for a pushed agent source (JSON-escaped)
+        n = min(max(n, 0), cap)   # default 1MB — headroom for a pushed agent source (JSON-escaped); raised for engine uploads
         raw = self.rfile.read(n) if n > 0 else b""
         try:
             obj = json.loads(raw.decode()) if raw else {}
@@ -1665,6 +1675,18 @@ class Handler(BaseHTTPRequestHandler):
         return obj if isinstance(obj, dict) else {}   # a top-level array/string/number must not reach ops as non-dict
 
     def _handle(self, method):
+        if not _conn_sem.acquire(blocking=False):   # too many in-flight handlers → shed load instead of spawning unbounded root threads
+            try:
+                self._send(503, {"error": "server busy, retry shortly"})
+            except Exception:
+                pass
+            return
+        try:
+            self._handle_locked(method)
+        finally:
+            _conn_sem.release()
+
+    def _handle_locked(self, method):
         path = self.path.split("?", 1)[0]
         if not path.startswith("/api/"):
             self._send(404, {"error": "not found"})
@@ -1682,7 +1704,10 @@ class Handler(BaseHTTPRequestHandler):
         if cmd not in READ_ONLY and method != "POST":
             self._send(405, {"error": "use POST"})
             return
-        d = self._body() if method == "POST" else {}
+        # engine-install carries a base64-encoded engine binary (~3MB raw → ~4MB base64); a 1MB cap
+        # would truncate it and fail the JSON parse, so raise the cap for that op only.
+        cap = 20971520 if cmd == "engine-install" else 1048576
+        d = self._body(cap) if method == "POST" else {}
         try:
             if cmd in READ_ONLY:
                 res = OPS[cmd](d)

@@ -35,6 +35,16 @@ check("accepts a dotted version", bool(tnl.ENGINE_VER_RE.match("1.2.3")))
 check("rejects spaces", not tnl.ENGINE_VER_RE.match("v2 rm -rf"))
 check("rejects path traversal", not tnl.ENGINE_VER_RE.match("../etc"))
 check("rejects slashes", not tnl.ENGINE_VER_RE.match("a/b"))
+check("rejects bare '..'", not tnl.ENGINE_VER_RE.match(".."))
+check("rejects embedded '..'", not tnl.ENGINE_VER_RE.match("v1..v2"))
+check("still accepts single-dot dotted tag", bool(tnl.ENGINE_VER_RE.match("v1.2")))
+
+# ---- op_engine_update rejects a traversal tag before any I/O (#L2) ----
+try:
+    tnl.op_engine_update({"version": ".."})
+    check("op_engine_update rejects '..'", False)
+except ValueError:
+    check("op_engine_update rejects '..'", True)
 
 # ---- op_engine_update validation path (bad version rejected before any I/O) ----
 try:
