@@ -109,6 +109,27 @@ check("spoof ignored on non-bip profile",
 check("spoof ignored without crypto",
       "spoof_dst_ip" not in cfg(cipher="none", transport="raw", raw_profile="bip", role="client", spoof_dst="203.0.113.7"))
 
+# op_tunnel must PERSIST spoof_src/spoof_dst into the stored config. Regression: the node's
+# key whitelist dropped them, so _core_config never saw them and spoofing was a silent no-op
+# through the real panel->node->core path (only hand-written configs worked).
+_saved = {}
+tnl.local_ips_flat = lambda: ["10.0.0.2"]
+tnl.iface_for_ip = lambda ip: "eth0"
+tnl.read_config = lambda name: None
+tnl.write_config = lambda name, obj: _saved.__setitem__(name, obj)
+tnl.apply_config = lambda obj: None
+tnl.run = lambda args, timeout=60: (0, "", "")
+tnl.op_tunnel({"type": "core", "self_ip": "10.0.0.2", "peer_ip": "203.0.113.9",
+               "subnet": "192.168.9.0/24", "id": 9, "name": "core9", "role": "client",
+               "cipher": "auto", "transport": "raw", "raw_profile": "bip", "psk": "0123456789abcdef",
+               "spoof_src": "198.51.100.9", "spoof_dst": "203.0.113.7"})
+_o = _saved.get("core9", {})
+check("op_tunnel persists spoof_src", _o.get("spoof_src") == "198.51.100.9")
+check("op_tunnel persists spoof_dst", _o.get("spoof_dst") == "203.0.113.7")
+_ec = tnl._core_config(_o)   # end-to-end: stored cfg -> core config carries the forged addresses (client role)
+check("end-to-end spoof_src_ip reaches core config", _ec.get("spoof_src_ip") == "198.51.100.9")
+check("end-to-end spoof_dst_ip reaches core config", _ec.get("spoof_dst_ip") == "203.0.113.7")
+
 print()
 if FAILS:
     print("%d FAILED: %s" % (len(FAILS), ", ".join(FAILS)))

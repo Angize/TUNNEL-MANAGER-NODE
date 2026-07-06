@@ -1292,6 +1292,19 @@ def op_tunnel(d):
                 obj["cover_sni"] = sni
         if bool(d.get("gso")):        # TUN segmentation offload (throughput); Linux only, harmless if unsupported
             obj["gso"] = True
+        # IP spoofing (raw bip only): persist the forged source and/or decoy destination so _core_config
+        # can wire them per role. Without this the fields never reach the stored cfg and spoofing is a no-op.
+        if transport == "raw" and obj.get("raw_profile") == "bip":
+            ss = str(d.get("spoof_src") or "").strip()
+            sd = str(d.get("spoof_dst") or "").strip()
+            if ss:
+                if not is_ipv4(ss):
+                    raise ValueError("bad spoof_src")
+                obj["spoof_src"] = ss
+            if sd:
+                if not is_ipv4(sd):
+                    raise ValueError("bad spoof_dst")
+                obj["spoof_dst"] = sd
     old = read_config(name)   # in-place rebuild: fully tear the previous build down first so nothing tied to a
     if old and old.get("type") != "portfw":   # now-overwritten field (e.g. FOU's old UDP-port decap listener) leaks
         teardown_config(old)
