@@ -138,6 +138,17 @@ check("flux carries no raw_profile", "raw_profile" not in e)
 e = cfg(psk="0123456789abcdef", transport="flux", flux_carrier="raw", flux_rotate_secs=300)
 check("flux forwards carrier raw", e.get("flux_carrier") == "raw")
 check("flux forwards rotate 300", e.get("flux_rotate_secs") == 300)
+# stun carrier + shape + epoch offset
+e = cfg(psk="k"*16, transport="flux", flux_carrier="stun", flux_shape="webrtc", flux_epoch_offset=3)
+check("flux forwards carrier stun", e.get("flux_carrier") == "stun")
+check("flux forwards shape webrtc", e.get("flux_shape") == "webrtc")
+check("flux forwards epoch offset", e.get("flux_epoch_offset") == 3)
+check("flux defaults shape random", cfg(psk="k"*16, transport="flux").get("flux_shape") == "random")
+check("flux omits zero epoch offset", "flux_epoch_offset" not in cfg(psk="k"*16, transport="flux"))
+# MTU: stun (IP+UDP+STUN=48) has 20 bytes less headroom than udp (IP+UDP=28).
+check("flux stun MTU < udp MTU by the STUN header",
+      cfg(psk="k"*16, transport="flux", flux_carrier="udp")["mtu"]
+      - cfg(psk="k"*16, transport="flux", flux_carrier="stun")["mtu"] == 20)
 # MTU: the udp carrier (IP+UDP) has 8 bytes less headroom than the raw carrier (IP only).
 check("flux udp MTU < raw MTU by the UDP header",
       cfg(psk="k"*16, transport="flux", flux_carrier="raw")["mtu"]

@@ -562,8 +562,9 @@ def _core_config(cfg):
         # IP20 + the profile's carrier header (bip/ipip add none; gre 4; icmp/udp 8; tcp 20).
         outer = 20 + {"bip": 0, "ipip": 0, "gre": 4, "icmp": 8, "udp": 8, "tcp": 20}.get(raw_profile, 0)
     elif transport == "flux":
-        # IP20 + the carrier header: the udp carrier adds an 8-byte UDP header, the raw carrier none.
-        outer = 20 + (8 if flux_carrier == "udp" else 0)
+        # IP20 + the carrier header: udp adds an 8-byte UDP header; stun adds UDP + a
+        # 20-byte STUN header; the raw carrier adds none.
+        outer = 20 + {"udp": 8, "stun": 28}.get(flux_carrier, 0)
     else:
         outer = 40 if transport == "tcp" else 28        # IP20 + TCP20 | IP20 + UDP8
     if obfs:
@@ -597,10 +598,15 @@ def _core_config(cfg):
     if transport == "raw":
         ecfg["raw_profile"] = raw_profile
     if transport == "flux":
-        # flux is a distinct transport (not a raw_profile): the carrier and the epoch
-        # length are all it needs — both ends derive the rotating shape from the PSK+clock.
+        # flux is a distinct transport (not a raw_profile): carrier, shape profile,
+        # epoch length and a manual epoch offset are all it needs — both ends derive
+        # the rotating shape from the PSK + clock (+ offset), no on-wire negotiation.
         ecfg["flux_carrier"] = flux_carrier
         ecfg["flux_rotate_secs"] = int(cfg.get("flux_rotate_secs") or 600)
+        ecfg["flux_shape"] = str(cfg.get("flux_shape") or "random").lower()
+        off = int(cfg.get("flux_epoch_offset") or 0)
+        if off:
+            ecfg["flux_epoch_offset"] = off
     if bool(cfg.get("gso")):     # TUN segmentation offload — local throughput optimization
         ecfg["gso"] = True
     # IP spoofing (raw bip + crypto only): forge the outer source and/or the destination (a decoy).
@@ -1308,15 +1314,20 @@ def op_tunnel(d):
             if profile not in ("bip", "ipip", "gre", "icmp", "udp", "tcp"):
                 raise ValueError("bad raw_profile")
             obj["raw_profile"] = profile
-        if transport == "flux":       # polymorphic moving-target carrier: persist carrier + epoch length
+        if transport == "flux":       # polymorphic moving-target carrier: persist carrier/shape/epoch
             carrier = str(d.get("flux_carrier") or "udp").strip().lower()
-            if carrier not in ("udp", "raw"):
+            if carrier not in ("udp", "raw", "stun"):
                 raise ValueError("bad flux_carrier")
             obj["flux_carrier"] = carrier
             rot = int(d.get("flux_rotate_secs") or 600)
             if rot < 10 or rot > 86400:
                 raise ValueError("flux_rotate_secs out of range (10..86400)")
             obj["flux_rotate_secs"] = rot
+            shape = str(d.get("flux_shape") or "random").strip().lower()
+            if shape not in ("random", "quic", "video", "webrtc"):
+                raise ValueError("bad flux_shape")
+            obj["flux_shape"] = shape
+            obj["flux_epoch_offset"] = int(d.get("flux_epoch_offset") or 0)  # manual "rotate now" bump
         psk = str(d.get("psk") or "").strip()
         if psk:                       # crypto is optional but recommended; when set it must be strong enough
             if len(psk) < 16:
