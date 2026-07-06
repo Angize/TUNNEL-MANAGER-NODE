@@ -521,6 +521,10 @@ def _core_config(cfg):
     if crypto_on:
         # AEAD nonce+tag, plus the 12-byte per-frame mask salt the core prepends (v2 wire).
         overhead += (40 if cipher == "xchacha20-poly1305" else 28) + 12
+    # FEC (flux datagram carriers) prepends an 11-byte block header + a 2-byte shard-len
+    # to every data shard, so it costs 13 bytes of usable payload per carrier packet.
+    if transport == "flux" and bool(cfg.get("fec")):
+        overhead += 13
     mtu = max(1280, base_mtu() - overhead)
     ecfg = {
         "role": cfg.get("role"),
@@ -553,6 +557,12 @@ def _core_config(cfg):
         off = int(cfg.get("flux_epoch_offset") or 0)
         if off:
             ecfg["flux_epoch_offset"] = off
+        # FEC (forward error correction): reconstructs lost carrier datagrams from
+        # parity so a throttled/high-loss link stays usable. Datagram carriers only.
+        if bool(cfg.get("fec")):
+            ecfg["fec"] = True
+            ecfg["fec_data"] = int(cfg.get("fec_data") or 10)
+            ecfg["fec_parity"] = int(cfg.get("fec_parity") or 3)
     if transport == "ws":
         # WebSocket carrier (CDN-frontable): Host/SNI, path, and whether the client
         # speaks wss (TLS to the CDN edge). The server stays plain — the CDN terminates TLS.
@@ -1312,6 +1322,17 @@ def op_tunnel(d):
                 raise ValueError("bad flux_shape")
             obj["flux_shape"] = shape
             obj["flux_epoch_offset"] = int(d.get("flux_epoch_offset") or 0)  # manual "rotate now" bump
+            # FEC (forward error correction) — repairs lost carrier datagrams from parity.
+            # Persisting these in the whitelist is mandatory: an un-whitelisted key is
+            # silently dropped from the stored config and the feature never reaches the core.
+            if bool(d.get("fec")):
+                obj["fec"] = True
+                fd = int(d.get("fec_data") or 10)
+                fp = int(d.get("fec_parity") or 3)
+                if fd < 1 or fp < 1 or fd + fp > 255:
+                    raise ValueError("fec_data/fec_parity out of range (>=1, sum<=255)")
+                obj["fec_data"] = fd
+                obj["fec_parity"] = fp
         psk = str(d.get("psk") or "").strip()
         if psk:                       # crypto is optional but recommended; when set it must be strong enough
             if len(psk) < 16:
