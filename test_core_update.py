@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# Tests for the core version pin / update logic (no root, no live install).
-# Run: python3 test_core_update.py
+# Tests for the core binary delivery. The node NEVER downloads the core itself — the panel pushes
+# verified bytes via op core-install. Run: python3 test_core_update.py
 import importlib.util
 import os
 import sys
@@ -19,58 +19,36 @@ def check(name, cond):
         FAILS.append(name)
 
 
-# ---- download source: the GitHub Release ASSET only (no repo-tree fallback) ----
-u = tnl._core_urls("v2", "amd64")
-check("pinned: single release-asset URL",
-      u == ["https://github.com/Angize/TUNNEL-MANAGER-CORE/releases/download/v2/tnl-core-linux-amd64"])
-u = tnl._core_urls("latest", "amd64")
-check("latest: single releases/latest asset URL",
-      len(u) == 1 and "/releases/latest/download/" in u[0])
-check("arch flows into the asset name", "arm64" in tnl._core_urls("v1", "arm64")[0])
+# ---- the node no longer has any self-download machinery ----
+check("no _core_urls (self-download removed)", not hasattr(tnl, "_core_urls"))
+check("no _http_get (self-download removed)", not hasattr(tnl, "_http_get"))
+check("no op_core_update (node never downloads)", not hasattr(tnl, "op_core_update"))
+check("no core-update op route", "core-update" not in tnl.OPS)
 
-# ---- version-string validation (op_core_update) ----
-check("accepts a tag", bool(tnl.CORE_VER_RE.match("v2")))
-check("accepts v10", bool(tnl.CORE_VER_RE.match("v10")))
-check("accepts a dotted version", bool(tnl.CORE_VER_RE.match("1.2.3")))
-check("rejects spaces", not tnl.CORE_VER_RE.match("v2 rm -rf"))
-check("rejects path traversal", not tnl.CORE_VER_RE.match("../etc"))
-check("rejects slashes", not tnl.CORE_VER_RE.match("a/b"))
-check("rejects bare '..'", not tnl.CORE_VER_RE.match(".."))
-check("rejects embedded '..'", not tnl.CORE_VER_RE.match("v1..v2"))
-check("still accepts single-dot dotted tag", bool(tnl.CORE_VER_RE.match("v1.2")))
-
-# ---- op_core_update rejects a traversal tag before any I/O (#L2) ----
-try:
-    tnl.op_core_update({"version": ".."})
-    check("op_core_update rejects '..'", False)
-except ValueError:
-    check("op_core_update rejects '..'", True)
-
-# ---- op_core_update validation path (bad version rejected before any I/O) ----
-try:
-    tnl.op_core_update({"version": "bad; version"})
-    check("op_core_update rejects a bad version", False)
-except ValueError:
-    check("op_core_update rejects a bad version", True)
-
-# ---- pin default is "latest" when conf has no pin ----
+# ---- pin label reflects what was installed; empty when nothing installed ----
 tnl.load_conf = lambda: {}
-check("_core_ref defaults to latest", tnl._core_ref() == "latest")
-tnl.load_conf = lambda: {"core_version": "v1"}
-check("_core_ref reads the pin", tnl._core_ref() == "v1")
+check("_core_ref empty when nothing installed", tnl._core_ref() == "")
+tnl.load_conf = lambda: {"core_version": "v2.2.2"}
+check("_core_ref reads the installed label", tnl._core_ref() == "v2.2.2")
 
-# ---- no auto-update: with a binary present, force=False touches nothing ----
+# ---- _ensure_core: present -> ok; absent -> a clear, panel-detectable error (no network) ----
 import tempfile
 d = tempfile.mkdtemp()
 tnl.CORE_BIN = os.path.join(d, "tnl-core")
+try:
+    tnl._ensure_core()
+    check("_ensure_core raises when the binary is missing", False)
+except RuntimeError as e:
+    check("_ensure_core raises when the binary is missing", "not installed" in str(e))
 open(tnl.CORE_BIN, "wb").write(b"EXISTING-BINARY")
-net = {"n": 0}
-tnl._http_get = lambda *a, **k: (net.__setitem__("n", net["n"] + 1) or None)
-tnl._ensure_core(force=False)   # routine rebuild path
-check("rebuild (force=False) makes no network call when a binary exists", net["n"] == 0)
-check("rebuild (force=False) leaves the binary unchanged", open(tnl.CORE_BIN, "rb").read() == b"EXISTING-BINARY")
+try:
+    tnl._ensure_core()
+    check("_ensure_core is a no-op when a binary exists", True)
+except Exception:
+    check("_ensure_core is a no-op when a binary exists", False)
+check("_ensure_core leaves the binary untouched", open(tnl.CORE_BIN, "rb").read() == b"EXISTING-BINARY")
 
-# ---- core-install: custom binary pushed from the panel (base64 + sha verify) ----
+# ---- core-install: verified bytes pushed from the panel (base64 + sha verify) ----
 import base64
 import hashlib
 tnl.raw_configs = lambda: []           # no core tunnels to rebuild in the test
@@ -95,11 +73,14 @@ try:
 except ValueError:
     check("core-install rejects a malformed sha", True)
 
-r = tnl.op_core_install({"data": b64, "sha256": good, "version": "custom"})
+r = tnl.op_core_install({"data": b64, "sha256": good, "version": "v2.2.2"})
 check("core-install ok on a verified binary", r.get("ok") is True and r.get("core_sha") == good[:12])
 check("core-install wrote the exact bytes", open(tnl.CORE_BIN, "rb").read() == blob)
-check("core-install pins the node to the label", _conf.get("core_version") == "custom")
+check("core-install pins the node to the pushed label", _conf.get("core_version") == "v2.2.2")
 check("core-install is a mutation (not read-only)", "core-install" in tnl.OPS and "core-install" not in tnl.READ_ONLY)
+
+# ---- ping advertises arch + installed sha so the panel can relay/label ----
+check("ping reports arch", tnl._core_arch() in ("amd64", "arm64"))
 
 print()
 if FAILS:

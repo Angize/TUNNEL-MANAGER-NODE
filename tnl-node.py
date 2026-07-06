@@ -44,15 +44,12 @@ SERVICE_FILE = "/etc/systemd/system/tnl-node.service"
 SELF_PATH = os.path.realpath(__file__)
 INSTALLED = os.path.join(CONFIG_DIR, "tnl-node.py")  # stable path the systemd unit points at
 
-# The custom Go data-plane core (packet/bip): a static binary the node fetches from the core
-# repo (raw, like the agent's own git update), verifies by sha256, and supervises via systemd-run.
+# The custom Go data-plane core (packet/bip): a static binary the PANEL delivers by pushing verified
+# bytes to the node (op core-install). The node never downloads it itself — nodes may have no internet
+# (e.g. an Iran node), so the panel is the single source and stages/relays the binary. The node only
+# verifies the pushed sha256 and supervises the binary via systemd-run.
 CORE_BIN = os.path.join(CONFIG_DIR, "tnl-core")
-# The core binary is published as a GitHub Release ASSET, one release per version
-# (tag v1, v2, …). A node can pin a specific version (stored as conf["core_version"])
-# or track "latest"; downgrade is just pinning an older tag. The panel drives the pin
-# via the "core-update" op.
-CORE_RELEASES = "https://github.com/Angize/TUNNEL-MANAGER-CORE/releases"
-_core_lock = threading.Lock()  # serialize download/replace of the shared core binary
+_core_lock = threading.Lock()  # serialize replace of the shared core binary
 _core_sha_cache = {"mtime": None, "sha": ""}  # avoid re-hashing the 3 MB binary on every ping
 OBFS_DATA_PAD_MAX = 64   # must match the core's obfsDataPadMax so the MTU budget covers worst-case padding
 
@@ -457,30 +454,13 @@ def _core_arch():
     return {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64"}.get(m, "amd64")
 
 
-def _http_get(url, timeout=30):
-    try:
-        with urllib.request.urlopen(url, timeout=timeout) as r:
-            return r.read()
-    except Exception:
-        return None
-
-
 def _core_ref():
-    """The core version this node is pinned to: a release tag (e.g. "v2") or "latest"."""
+    """The core version installed on this node — the label the panel stamped when it pushed the binary
+    (a release tag or "custom"), or "" when no binary has been installed yet."""
     try:
-        return str(load_conf().get("core_version") or "latest").strip() or "latest"
+        return str(load_conf().get("core_version") or "").strip()
     except Exception:
-        return "latest"
-
-
-def _core_urls(ref, arch):
-    """Download URL for the core binary at `ref`: the GitHub Release ASSET, and only that. The panel
-    publishes each version as a release asset (tnl-core-linux-<arch> + .sha256); there is no repo-tree
-    fallback, so a version exists exactly when its release asset does."""
-    asset = f"tnl-core-linux-{arch}"
-    if ref in ("", "latest", None):
-        return [f"{CORE_RELEASES}/latest/download/{asset}"]
-    return [f"{CORE_RELEASES}/download/{ref}/{asset}"]
+        return ""
 
 
 def _installed_core_sha():
@@ -496,49 +476,13 @@ def _installed_core_sha():
         return ""
 
 
-def _ensure_core(ref=None, force=False):
-    """Make sure /opt/tunnel/tnl-core exists. Routine callers (a tunnel build/rebuild) pass force=False:
-    if a binary is ALREADY present it is left completely untouched — no network call, no version check —
-    so builds, rebuilds and reconciles never change the core. Only an explicit core-update passes
-    force=True, which downloads the release asset for `ref`, verifies its sha256, and installs it. We
-    never install a binary whose checksum does not verify (it runs as root)."""
-    with _core_lock:
-        have = os.path.isfile(CORE_BIN)
-        if have and not force:
-            return                       # a binary is present; only core-update (force) ever replaces it
-        if ref is None:
-            ref = _core_ref()
-        arch = _core_arch()
-        cur = None
-        if have:
-            with open(CORE_BIN, "rb") as f:
-                cur = hashlib.sha256(f.read()).hexdigest()
-        last = "no source reachable"
-        for url in _core_urls(ref, arch):
-            sha_raw = _http_get(url + ".sha256")
-            want = sha_raw.decode().split()[0].strip() if sha_raw else ""
-            if not want:                # can't verify this source -> try the next
-                last = "checksum unavailable"
-                continue
-            if have and cur == want:
-                return                  # already the pinned build; nothing to do
-            data = _http_get(url, timeout=120)
-            if not data:
-                last = "download failed"
-                continue
-            if hashlib.sha256(data).hexdigest() != want:
-                last = "checksum mismatch"    # NEVER install an unverified binary (runs as root)
-                continue
-            tmp = CORE_BIN + ".new"
-            with open(tmp, "wb") as f:
-                f.write(data)
-            os.chmod(tmp, 0o755)
-            os.replace(tmp, CORE_BIN)
-            return
-        # no source produced a verified binary
-        if have:
-            return                      # offline-tolerant: keep the working copy we already have
-        raise RuntimeError(f"could not install core {ref}: {last}")
+def _ensure_core():
+    """The core binary is delivered ONLY by the panel, which pushes verified bytes via the core-install
+    op. The node NEVER downloads it itself (nodes may have no internet — e.g. an Iran node). If the
+    binary is missing, raise a clear, panel-detectable error so the panel's tunnel-build path relays the
+    staged binary and retries; if the panel has nothing staged, the operator sees "core not installed"."""
+    if not os.path.isfile(CORE_BIN):
+        raise RuntimeError("core not installed on this node (push it from the panel)")
 
 
 def _core_port(cfg):
@@ -1267,7 +1211,7 @@ def op_ping(d):
             "hostname": socket.gethostname(), "ips": all_ips(), "sha256": _SELF_SHA,
             "tunnels": len([c for c in cfgs if c.get("type") != "portfw"]),
             "portfw": len([c for c in cfgs if c.get("type") == "portfw"]),
-            "core_ver": _core_ref(), "core_sha": _installed_core_sha()[:12],
+            "core_ver": _core_ref(), "core_sha": _installed_core_sha()[:12], "arch": _core_arch(),
             "stats": stats}
 
 
@@ -1680,30 +1624,6 @@ CORE_VER_RE = re.compile(r"^(?!.*\.\.)[A-Za-z0-9._-]{1,40}$")  # negative-lookah
 CORE_SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
-def op_core_update(d):
-    """Pin this node to a specific core version (a release tag, or "latest") and install it, then
-    rebuild the running core tunnels so they restart on the new binary. Downgrade = pass an older tag.
-    Pinning stops routine tunnel rebuilds from silently changing the core."""
-    version = str(d.get("version") or "latest").strip()
-    if version != "latest" and (".." in version or not CORE_VER_RE.match(version)):
-        raise ValueError("bad core version")   # reject '..' explicitly → never let a tag traverse out of the release URL
-    conf = load_conf()
-    conf["core_version"] = version
-    save_conf(conf)
-    _ensure_core(version, force=True)   # explicit update: download + verify + install even if a binary exists
-    restarted, errs = 0, []
-    for c in raw_configs():           # relaunch every core tunnel on the freshly-installed binary
-        if c.get("type") == "core":
-            try:
-                build_core(c)
-                restarted += 1
-            except Exception as e:
-                errs.append(f"{c.get('name')}: {e}")
-    logline(f"core pinned to {version}; rebuilt {restarted} core tunnel(s)")
-    return {"ok": True, "version": version, "core_sha": _installed_core_sha()[:12],
-            "restarted": restarted, "errors": errs}
-
-
 def op_core_install(d):
     """Install a raw core binary pushed from the panel (base64), not a published release. Verify its
     sha256, swap it in atomically, pin the node to a custom label, then rebuild the core tunnels so they
@@ -1826,7 +1746,7 @@ def op_spoof_probe(d):
 OPS = {"ping": op_ping, "list": op_list, "check": op_check, "tunnel": op_tunnel,
        "portfw": op_portfw, "portfw-edit": op_portfw_edit, "portfw-next": op_portfw_next,
        "delete": op_delete, "apply": op_apply, "update": op_update, "wipe": op_wipe,
-       "portcheck": op_portcheck, "core-update": op_core_update,
+       "portcheck": op_portcheck,
        "core-install": op_core_install, "spoof-probe": op_spoof_probe,
        "link-enable": op_link_enable}
 READ_ONLY = {"ping", "list", "check", "portcheck", "spoof-probe"}
