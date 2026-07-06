@@ -85,6 +85,30 @@ e = cfg(psk="0123456789abcdef", transport="tcp", cover=True, cover_sni="www.site
 check("cover forwarded on tcp", e.get("cover") is True and e.get("cover_sni") == "www.site.com")
 check("cover ignored on raw", "cover" not in cfg(psk="0123456789abcdef", transport="raw", cover=True, cover_sni="x.com"))
 
+# IP spoofing (raw bip + crypto): decoy destination + optional source, wired per role.
+# Client end: forges the header src/dst; the real server is still the peer.
+e = cfg(psk="k"*16, transport="raw", raw_profile="bip", role="client",
+        spoof_src="198.51.100.9", spoof_dst="203.0.113.7")
+check("client forwards spoof_src_ip", e.get("spoof_src_ip") == "198.51.100.9")
+check("client forwards spoof_dst_ip", e.get("spoof_dst_ip") == "203.0.113.7")
+check("client never sets spoof_peer", "spoof_peer" not in e)
+# Server end: receives the decoy (AF_PACKET) and must know the client's real IP (remote_ip).
+e = cfg(psk="k"*16, transport="raw", raw_profile="bip", role="server",
+        spoof_dst="203.0.113.7", remote_ip="203.0.113.9")
+check("server forwards spoof_dst_ip", e.get("spoof_dst_ip") == "203.0.113.7")
+check("server sets spoof_peer to the client's real IP", e.get("spoof_peer") == "203.0.113.9")
+check("server does not forge its own source field", "spoof_src_ip" not in e)
+# Source spoofing alone (no decoy) still needs the server to know the real peer.
+e = cfg(psk="k"*16, transport="raw", raw_profile="bip", role="server",
+        spoof_src="198.51.100.9", remote_ip="203.0.113.9")
+check("server sets spoof_peer for source-only spoofing", e.get("spoof_peer") == "203.0.113.9")
+check("server without decoy sets no spoof_dst_ip", "spoof_dst_ip" not in e)
+# Spoofing is bip-only and needs crypto: ignored otherwise.
+check("spoof ignored on non-bip profile",
+      "spoof_dst_ip" not in cfg(psk="k"*16, transport="raw", raw_profile="gre", role="client", spoof_dst="203.0.113.7"))
+check("spoof ignored without crypto",
+      "spoof_dst_ip" not in cfg(cipher="none", transport="raw", raw_profile="bip", role="client", spoof_dst="203.0.113.7"))
+
 print()
 if FAILS:
     print("%d FAILED: %s" % (len(FAILS), ", ".join(FAILS)))
