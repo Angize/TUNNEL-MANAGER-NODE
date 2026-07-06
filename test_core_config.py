@@ -154,6 +154,27 @@ check("flux udp MTU < raw MTU by the UDP header",
       cfg(psk="k"*16, transport="flux", flux_carrier="raw")["mtu"]
       - cfg(psk="k"*16, transport="flux", flux_carrier="udp")["mtu"] == 8)
 
+# ws (CDN-frontable WebSocket carrier): forward Host/path/TLS; server uses ports (has listen).
+e = cfg(psk="k"*16, transport="ws", ws_host="cdn.example.com", ws_path="/live", ws_tls=True, role="client")
+check("ws forwards ws_host", e.get("ws_host") == "cdn.example.com")
+check("ws forwards ws_path", e.get("ws_path") == "/live")
+check("ws forwards ws_tls", e.get("ws_tls") is True)
+check("ws omits ws_tls when false", "ws_tls" not in cfg(psk="k"*16, transport="ws", role="client"))
+_saved.clear()
+tnl.op_tunnel({"type": "core", "self_ip": "10.0.0.2", "peer_ip": "203.0.113.9",
+               "subnet": "192.168.9.0/24", "id": 7, "name": "core7", "role": "client",
+               "cipher": "auto", "transport": "ws", "ws_host": "cdn.example.com", "ws_tls": True,
+               "psk": "0123456789abcdef"})
+_ow = _saved.get("core7", {})
+check("op_tunnel persists ws_host", _ow.get("ws_host") == "cdn.example.com")
+check("op_tunnel persists ws_tls", _ow.get("ws_tls") is True)
+try:
+    tnl.op_tunnel({"type": "core", "self_ip": "10.0.0.2", "peer_ip": "203.0.113.9", "subnet": "192.168.9.0/24",
+                   "id": 6, "name": "core6", "role": "client", "transport": "ws", "ws_host": "bad host!", "psk": "0123456789abcdef"})
+    check("op_tunnel rejects bad ws_host", False)
+except ValueError:
+    check("op_tunnel rejects bad ws_host", True)
+
 # op_tunnel must PERSIST flux_carrier/flux_rotate_secs (same whitelist trap that dropped spoofing).
 _saved.clear()
 tnl.op_tunnel({"type": "core", "self_ip": "10.0.0.2", "peer_ip": "203.0.113.9",

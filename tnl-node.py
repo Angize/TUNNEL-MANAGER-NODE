@@ -565,6 +565,8 @@ def _core_config(cfg):
         # IP20 + the carrier header: udp adds an 8-byte UDP header; stun adds UDP + a
         # 20-byte STUN header; the raw carrier adds none.
         outer = 20 + {"udp": 8, "stun": 28}.get(flux_carrier, 0)
+    elif transport == "ws":
+        outer = 40 + 14        # IP20 + TCP20 + up to a 14-byte WebSocket frame header
     else:
         outer = 40 if transport == "tcp" else 28        # IP20 + TCP20 | IP20 + UDP8
     if obfs:
@@ -607,6 +609,15 @@ def _core_config(cfg):
         off = int(cfg.get("flux_epoch_offset") or 0)
         if off:
             ecfg["flux_epoch_offset"] = off
+    if transport == "ws":
+        # WebSocket carrier (CDN-frontable): Host/SNI, path, and whether the client
+        # speaks wss (TLS to the CDN edge). The server stays plain — the CDN terminates TLS.
+        if cfg.get("ws_host"):
+            ecfg["ws_host"] = str(cfg["ws_host"])
+        if cfg.get("ws_path"):
+            ecfg["ws_path"] = str(cfg["ws_path"])
+        if bool(cfg.get("ws_tls")):
+            ecfg["ws_tls"] = True
     if bool(cfg.get("gso")):     # TUN segmentation offload — local throughput optimization
         ecfg["gso"] = True
     # IP spoofing (raw bip + crypto only): forge the outer source and/or the destination (a decoy).
@@ -1306,9 +1317,20 @@ def op_tunnel(d):
             raise ValueError("bad core cipher")
         obj["cipher"] = cipher
         transport = str(d.get("transport") or "udp").strip().lower()
-        if transport not in ("udp", "tcp", "raw", "flux"):
+        if transport not in ("udp", "tcp", "raw", "flux", "ws"):
             raise ValueError("bad core transport")
         obj["transport"] = transport
+        if transport == "ws":         # WebSocket carrier (CDN-frontable): persist Host/path/TLS
+            wh = str(d.get("ws_host") or "").strip()
+            if wh:
+                if not re.match(r"^[A-Za-z0-9.-]{1,253}$", wh):
+                    raise ValueError("bad ws_host")
+                obj["ws_host"] = wh
+            wp = str(d.get("ws_path") or "").strip()
+            if wp:
+                obj["ws_path"] = wp
+            if bool(d.get("ws_tls")):
+                obj["ws_tls"] = True
         if transport == "raw":        # raw-IP carrier: which protocol the sealed frame is wrapped in
             profile = str(d.get("raw_profile") or "bip").strip().lower()
             if profile not in ("bip", "ipip", "gre", "icmp", "udp", "tcp"):
