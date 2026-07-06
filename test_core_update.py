@@ -22,7 +22,7 @@ def check(name, cond):
 # ---- download source: the GitHub Release ASSET only (no repo-tree fallback) ----
 u = tnl._core_urls("v2", "amd64")
 check("pinned: single release-asset URL",
-      u == ["https://github.com/Angize/TUNNEL-MANAGER-ENGINE/releases/download/v2/tnl-core-linux-amd64"])
+      u == ["https://github.com/Angize/TUNNEL-MANAGER-CORE/releases/download/v2/tnl-core-linux-amd64"])
 u = tnl._core_urls("latest", "amd64")
 check("latest: single releases/latest asset URL",
       len(u) == 1 and "/releases/latest/download/" in u[0])

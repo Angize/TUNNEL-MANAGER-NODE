@@ -51,7 +51,7 @@ CORE_BIN = os.path.join(CONFIG_DIR, "tnl-core")
 # (tag v1, v2, …). A node can pin a specific version (stored as conf["core_version"])
 # or track "latest"; downgrade is just pinning an older tag. The panel drives the pin
 # via the "core-update" op.
-CORE_RELEASES = "https://github.com/Angize/TUNNEL-MANAGER-ENGINE/releases"
+CORE_RELEASES = "https://github.com/Angize/TUNNEL-MANAGER-CORE/releases"
 _core_lock = threading.Lock()  # serialize download/replace of the shared core binary
 _core_sha_cache = {"mtime": None, "sha": ""}  # avoid re-hashing the 3 MB binary on every ping
 OBFS_DATA_PAD_MAX = 64   # must match the core's obfsDataPadMax so the MTU budget covers worst-case padding
@@ -602,7 +602,7 @@ def _core_config(cfg):
 
 
 def _core_unit(name):
-    return "tnl-eng-" + name
+    return "tnl-cor-" + name
 
 
 def build_core(cfg):
