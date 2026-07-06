@@ -2,7 +2,7 @@
 # Tests for the request-handler robustness/security hardening (no root, no live socket):
 #   - IFACE_RE rejects a leading '-' (arg-injection guard)
 #   - _authed() is fail-closed and constant-time on a non-ASCII token (no TypeError → no conn reset)
-#   - _body() cap is endpoint-aware (1MB default, 20MB for engine-install)
+#   - _body() cap is endpoint-aware (1MB default, 20MB for core-install)
 #   - a bounded connection semaphore sheds load with 503 instead of spawning unbounded root threads
 # Run: python3 test_hardening.py
 import importlib.util
@@ -104,8 +104,8 @@ def drive(path, cmd_stub_name):
     return captured
 
 
-cap = drive("/api/engine-install", "engine-install")
-check("engine-install gets the 20MB body cap", cap == [20971520])
+cap = drive("/api/core-install", "core-install")
+check("core-install gets the 20MB body cap", cap == [20971520])
 cap = drive("/api/ping", "ping")   # read-only op, ordinary cap
 check("ordinary op gets the 1MB body cap", cap == [1048576])
 
