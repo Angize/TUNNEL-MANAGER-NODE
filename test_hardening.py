@@ -36,7 +36,7 @@ def new_handler():
 # ---- #3 IFACE_RE: no leading dash, but legitimate names still match ----------
 check("iface: leading '-' rejected (arg-injection)", not tnl.IFACE_RE.match("-X"))
 check("iface: leading '--' rejected", not tnl.IFACE_RE.match("--net"))
-check("iface: tnl-* still valid", bool(tnl.IFACE_RE.match("tnl-eng-5")))
+check("iface: tnl-* still valid", bool(tnl.IFACE_RE.match("tnl-cor-5")))
 check("iface: dotted vlan still valid", bool(tnl.IFACE_RE.match("eth0.100")))
 check("iface: '@' name still valid", bool(tnl.IFACE_RE.match("wg0@if1")))
 check("iface: underscore-leading still valid", bool(tnl.IFACE_RE.match("_x")))

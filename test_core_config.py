@@ -21,7 +21,7 @@ def check(name, cond):
 
 
 def cfg(**kw):
-    base = {"name": "eng-1", "id": 5, "role": "server",
+    base = {"name": "cor-1", "id": 5, "role": "server",
             "tunnel_ip": "10.200.0.1/24", "remote_ip": "203.0.113.9"}
     base.update(kw)
     return tnl._core_config(base)
