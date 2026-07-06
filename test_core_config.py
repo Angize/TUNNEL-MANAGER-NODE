@@ -21,7 +21,7 @@ def check(name, cond):
 
 
 def cfg(**kw):
-    base = {"name": "cor-1", "id": 5, "role": "server",
+    base = {"name": "cor-1", "id": 5, "role": "server", "local_ip": "198.51.100.7",
             "tunnel_ip": "10.200.0.1/24", "remote_ip": "203.0.113.9"}
     base.update(kw)
     return tnl._core_config(base)
@@ -54,6 +54,11 @@ check("no psk -> crypto disabled", e["crypto"]["enabled"] is False)
 e = cfg(psk="0123456789abcdef", transport="tcp", role="server")
 check("transport tcp passes through", e["transport"] == "tcp")
 check("server role -> listen set", e.get("listen", "").endswith(":20005"))
+# server must bind to THIS node's physical IP, not 0.0.0.0 — otherwise a raw (portless) tunnel on a
+# secondary IP replies from the primary IP and the client drops every packet. Regression guard.
+check("server listen binds the local IP (not 0.0.0.0)", e.get("listen") == "198.51.100.7:20005")
+check("raw server also binds the local IP",
+      cfg(psk="0123456789abcdef", transport="raw", role="server").get("listen") == "198.51.100.7:20005")
 e = cfg(psk="0123456789abcdef", transport="udp", role="client")
 check("client role -> peer set", e.get("peer") == "203.0.113.9:20005")
 
