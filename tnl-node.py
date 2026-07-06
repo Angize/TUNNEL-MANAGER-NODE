@@ -574,7 +574,7 @@ def _engine_config(cfg):
     ecfg = {
         "role": cfg.get("role"),
         "mode": "packet",
-        "profile": "bip",
+        "profile": "core",
         "transport": transport,
         "obfs": obfs,
         "tun_name": name,
