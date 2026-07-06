@@ -130,6 +130,75 @@ _ec = tnl._core_config(_o)   # end-to-end: stored cfg -> core config carries the
 check("end-to-end spoof_src_ip reaches core config", _ec.get("spoof_src_ip") == "198.51.100.9")
 check("end-to-end spoof_dst_ip reaches core config", _ec.get("spoof_dst_ip") == "203.0.113.7")
 
+# flux: _core_config forwards the carrier + epoch length; the udp carrier is the default.
+e = cfg(psk="0123456789abcdef", transport="flux")
+check("flux defaults carrier to udp", e.get("flux_carrier") == "udp")
+check("flux defaults rotate to 600", e.get("flux_rotate_secs") == 600)
+check("flux carries no raw_profile", "raw_profile" not in e)
+e = cfg(psk="0123456789abcdef", transport="flux", flux_carrier="raw", flux_rotate_secs=300)
+check("flux forwards carrier raw", e.get("flux_carrier") == "raw")
+check("flux forwards rotate 300", e.get("flux_rotate_secs") == 300)
+# stun carrier + shape + epoch offset
+e = cfg(psk="k"*16, transport="flux", flux_carrier="stun", flux_shape="webrtc", flux_epoch_offset=3)
+check("flux forwards carrier stun", e.get("flux_carrier") == "stun")
+check("flux forwards shape webrtc", e.get("flux_shape") == "webrtc")
+check("flux forwards epoch offset", e.get("flux_epoch_offset") == 3)
+check("flux defaults shape random", cfg(psk="k"*16, transport="flux").get("flux_shape") == "random")
+check("flux omits zero epoch offset", "flux_epoch_offset" not in cfg(psk="k"*16, transport="flux"))
+# MTU: stun (IP+UDP+STUN=48) has 20 bytes less headroom than udp (IP+UDP=28).
+check("flux stun MTU < udp MTU by the STUN header",
+      cfg(psk="k"*16, transport="flux", flux_carrier="udp")["mtu"]
+      - cfg(psk="k"*16, transport="flux", flux_carrier="stun")["mtu"] == 20)
+# MTU: the udp carrier (IP+UDP) has 8 bytes less headroom than the raw carrier (IP only).
+check("flux udp MTU < raw MTU by the UDP header",
+      cfg(psk="k"*16, transport="flux", flux_carrier="raw")["mtu"]
+      - cfg(psk="k"*16, transport="flux", flux_carrier="udp")["mtu"] == 8)
+
+# ws (CDN-frontable WebSocket carrier): forward Host/path/TLS; server uses ports (has listen).
+e = cfg(psk="k"*16, transport="ws", ws_host="cdn.example.com", ws_path="/live", ws_tls=True, role="client")
+check("ws forwards ws_host", e.get("ws_host") == "cdn.example.com")
+check("ws forwards ws_path", e.get("ws_path") == "/live")
+check("ws forwards ws_tls", e.get("ws_tls") is True)
+check("ws omits ws_tls when false", "ws_tls" not in cfg(psk="k"*16, transport="ws", role="client"))
+# edge_ip: the client dials the CDN edge instead of the origin; ws_host stays the domain.
+e = cfg(psk="k"*16, transport="ws", role="client", remote_ip="203.0.113.9",
+        ws_host="cdn.example.com", ws_tls=True, edge_ip="104.16.0.1:443")
+check("edge_ip overrides client dial target", e.get("peer") == "104.16.0.1:443")
+check("edge_ip keeps ws_host as the domain", e.get("ws_host") == "cdn.example.com")
+e = cfg(psk="k"*16, transport="ws", role="client", remote_ip="203.0.113.9", edge_ip="104.16.0.1")
+check("edge_ip without port uses the link port", e.get("peer", "").startswith("104.16.0.1:"))
+check("no edge_ip dials the origin",
+      cfg(psk="k"*16, transport="ws", role="client", remote_ip="203.0.113.9")["peer"].startswith("203.0.113.9:"))
+check("edge_ip ignored on the server (listens)",
+      cfg(psk="k"*16, transport="ws", role="server", edge_ip="104.16.0.1").get("peer") is None)
+_saved.clear()
+tnl.op_tunnel({"type": "core", "self_ip": "10.0.0.2", "peer_ip": "203.0.113.9",
+               "subnet": "192.168.9.0/24", "id": 7, "name": "core7", "role": "client",
+               "cipher": "auto", "transport": "ws", "ws_host": "cdn.example.com", "ws_tls": True,
+               "psk": "0123456789abcdef"})
+_ow = _saved.get("core7", {})
+check("op_tunnel persists ws_host", _ow.get("ws_host") == "cdn.example.com")
+check("op_tunnel persists ws_tls", _ow.get("ws_tls") is True)
+try:
+    tnl.op_tunnel({"type": "core", "self_ip": "10.0.0.2", "peer_ip": "203.0.113.9", "subnet": "192.168.9.0/24",
+                   "id": 6, "name": "core6", "role": "client", "transport": "ws", "ws_host": "bad host!", "psk": "0123456789abcdef"})
+    check("op_tunnel rejects bad ws_host", False)
+except ValueError:
+    check("op_tunnel rejects bad ws_host", True)
+
+# op_tunnel must PERSIST flux_carrier/flux_rotate_secs (same whitelist trap that dropped spoofing).
+_saved.clear()
+tnl.op_tunnel({"type": "core", "self_ip": "10.0.0.2", "peer_ip": "203.0.113.9",
+               "subnet": "192.168.9.0/24", "id": 8, "name": "core8", "role": "client",
+               "cipher": "auto", "transport": "flux", "flux_carrier": "udp",
+               "flux_rotate_secs": 300, "psk": "0123456789abcdef"})
+_of = _saved.get("core8", {})
+check("op_tunnel persists flux_carrier", _of.get("flux_carrier") == "udp")
+check("op_tunnel persists flux_rotate_secs", _of.get("flux_rotate_secs") == 300)
+_ecf = tnl._core_config(_of)   # end-to-end: stored cfg -> core config carries the flux carrier
+check("end-to-end flux_carrier reaches core config", _ecf.get("flux_carrier") == "udp")
+check("end-to-end flux_rotate_secs reaches core config", _ecf.get("flux_rotate_secs") == 300)
+
 # on/off: op_tunnel defaults enabled True and persists a disabled tunnel.
 check("op_tunnel defaults enabled True", _o.get("enabled") is True)
 _saved.clear()

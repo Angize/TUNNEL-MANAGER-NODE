@@ -557,9 +557,16 @@ def _core_config(cfg):
     raw_profile = str(cfg.get("raw_profile") or "bip").lower()
     obfs = bool(cfg.get("obfs")) and crypto_on   # obfs is meaningless without the AEAD key
     # MTU budget = outer headers + bip framing + obfs padding + AEAD (nonce+tag) + wire mask salt.
+    flux_carrier = str(cfg.get("flux_carrier") or "udp").lower()
     if transport == "raw":
         # IP20 + the profile's carrier header (bip/ipip add none; gre 4; icmp/udp 8; tcp 20).
         outer = 20 + {"bip": 0, "ipip": 0, "gre": 4, "icmp": 8, "udp": 8, "tcp": 20}.get(raw_profile, 0)
+    elif transport == "flux":
+        # IP20 + the carrier header: udp adds an 8-byte UDP header; stun adds UDP + a
+        # 20-byte STUN header; the raw carrier adds none.
+        outer = 20 + {"udp": 8, "stun": 28}.get(flux_carrier, 0)
+    elif transport == "ws":
+        outer = 40 + 14        # IP20 + TCP20 + up to a 14-byte WebSocket frame header
     else:
         outer = 40 if transport == "tcp" else 28        # IP20 + TCP20 | IP20 + UDP8
     if obfs:
@@ -592,6 +599,25 @@ def _core_config(cfg):
             ecfg["cover_sni"] = sni
     if transport == "raw":
         ecfg["raw_profile"] = raw_profile
+    if transport == "flux":
+        # flux is a distinct transport (not a raw_profile): carrier, shape profile,
+        # epoch length and a manual epoch offset are all it needs — both ends derive
+        # the rotating shape from the PSK + clock (+ offset), no on-wire negotiation.
+        ecfg["flux_carrier"] = flux_carrier
+        ecfg["flux_rotate_secs"] = int(cfg.get("flux_rotate_secs") or 600)
+        ecfg["flux_shape"] = str(cfg.get("flux_shape") or "random").lower()
+        off = int(cfg.get("flux_epoch_offset") or 0)
+        if off:
+            ecfg["flux_epoch_offset"] = off
+    if transport == "ws":
+        # WebSocket carrier (CDN-frontable): Host/SNI, path, and whether the client
+        # speaks wss (TLS to the CDN edge). The server stays plain — the CDN terminates TLS.
+        if cfg.get("ws_host"):
+            ecfg["ws_host"] = str(cfg["ws_host"])
+        if cfg.get("ws_path"):
+            ecfg["ws_path"] = str(cfg["ws_path"])
+        if bool(cfg.get("ws_tls")):
+            ecfg["ws_tls"] = True
     if bool(cfg.get("gso")):     # TUN segmentation offload — local throughput optimization
         ecfg["gso"] = True
     # IP spoofing (raw bip + crypto only): forge the outer source and/or the destination (a decoy).
@@ -620,7 +646,19 @@ def _core_config(cfg):
         lip = cfg.get("local_ip") or "0.0.0.0"
         ecfg["listen"] = f"{lip}:{port}"
     else:
-        ecfg["peer"] = f"{cfg['remote_ip']}:{port}"
+        # The client dials the peer. For a ws link fronted through a CDN, edge_ip
+        # overrides the dial target to the CDN edge (host or host:port) while ws_host
+        # stays the fronting domain; the CDN routes on to the real origin. The core is
+        # unaware — it just dials whatever peer it is given.
+        dial, dport = cfg["remote_ip"], port
+        edge = str(cfg.get("edge_ip") or "").strip()
+        if transport == "ws" and edge:
+            h, sep, p = edge.rpartition(":")
+            if sep and p.isdigit():
+                dial, dport = h, int(p)
+            else:
+                dial = edge
+        ecfg["peer"] = f"{dial}:{dport}"
     return ecfg
 
 
@@ -1291,14 +1329,45 @@ def op_tunnel(d):
             raise ValueError("bad core cipher")
         obj["cipher"] = cipher
         transport = str(d.get("transport") or "udp").strip().lower()
-        if transport not in ("udp", "tcp", "raw"):
+        if transport not in ("udp", "tcp", "raw", "flux", "ws"):
             raise ValueError("bad core transport")
         obj["transport"] = transport
+        if transport == "ws":         # WebSocket carrier (CDN-frontable): persist Host/path/TLS
+            wh = str(d.get("ws_host") or "").strip()
+            if wh:
+                if not re.match(r"^[A-Za-z0-9.-]{1,253}$", wh):
+                    raise ValueError("bad ws_host")
+                obj["ws_host"] = wh
+            wp = str(d.get("ws_path") or "").strip()
+            if wp:
+                obj["ws_path"] = wp
+            if bool(d.get("ws_tls")):
+                obj["ws_tls"] = True
+            edge = str(d.get("edge_ip") or "").strip()   # CDN edge the client dials instead of the origin
+            if edge:
+                host = edge.rpartition(":")[0] or edge
+                if not re.match(r"^[A-Za-z0-9.\-]{1,253}$", host):
+                    raise ValueError("bad edge_ip")
+                obj["edge_ip"] = edge
         if transport == "raw":        # raw-IP carrier: which protocol the sealed frame is wrapped in
             profile = str(d.get("raw_profile") or "bip").strip().lower()
             if profile not in ("bip", "ipip", "gre", "icmp", "udp", "tcp"):
                 raise ValueError("bad raw_profile")
             obj["raw_profile"] = profile
+        if transport == "flux":       # polymorphic moving-target carrier: persist carrier/shape/epoch
+            carrier = str(d.get("flux_carrier") or "udp").strip().lower()
+            if carrier not in ("udp", "raw", "stun"):
+                raise ValueError("bad flux_carrier")
+            obj["flux_carrier"] = carrier
+            rot = int(d.get("flux_rotate_secs") or 600)
+            if rot < 10 or rot > 86400:
+                raise ValueError("flux_rotate_secs out of range (10..86400)")
+            obj["flux_rotate_secs"] = rot
+            shape = str(d.get("flux_shape") or "random").strip().lower()
+            if shape not in ("random", "quic", "video", "webrtc"):
+                raise ValueError("bad flux_shape")
+            obj["flux_shape"] = shape
+            obj["flux_epoch_offset"] = int(d.get("flux_epoch_offset") or 0)  # manual "rotate now" bump
         psk = str(d.get("psk") or "").strip()
         if psk:                       # crypto is optional but recommended; when set it must be strong enough
             if len(psk) < 16:
@@ -1308,6 +1377,10 @@ def op_tunnel(d):
         if obfs and (not psk or cipher == "none"):
             raise ValueError("obfs requires a psk and encryption")
         obj["obfs"] = obfs
+        # flux derives its rotating shape from the PSK and authenticates the shape-independent
+        # decode with the AEAD, so crypto is mandatory — reject early rather than let the core fail.
+        if transport == "flux" and (not psk or cipher == "none"):
+            raise ValueError("flux requires a psk and encryption")
         # TLS cover (HTTPS camouflage) — persist it so _core_config can forward it to the core.
         if bool(d.get("cover")) and transport == "tcp":
             obj["cover"] = True
