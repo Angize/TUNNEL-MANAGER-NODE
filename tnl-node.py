@@ -594,6 +594,23 @@ def _core_config(cfg):
         ecfg["raw_profile"] = raw_profile
     if bool(cfg.get("gso")):     # TUN segmentation offload — local throughput optimization
         ecfg["gso"] = True
+    # IP spoofing (raw bip + crypto only): forge the outer source and/or the destination (a decoy).
+    # The client puts the decoy in the header dst while still routing to the real server; the server
+    # then receives those frames via AF_PACKET and answers AS the decoy, so it must be told the
+    # client's real IP (remote_ip) to reply to — the forged source hides it from the wire.
+    if transport == "raw" and raw_profile == "bip" and crypto_on:
+        spoof_src = str(cfg.get("spoof_src") or "").strip()
+        spoof_dst = str(cfg.get("spoof_dst") or "").strip()
+        if cfg.get("role") == "client":
+            if spoof_src:
+                ecfg["spoof_src_ip"] = spoof_src
+            if spoof_dst:
+                ecfg["spoof_dst_ip"] = spoof_dst
+        else:  # server
+            if spoof_dst:
+                ecfg["spoof_dst_ip"] = spoof_dst
+            if spoof_src or spoof_dst:
+                ecfg["spoof_peer"] = cfg["remote_ip"]
     if cfg.get("role") == "server":
         # Bind to THIS node's physical IP for the tunnel, not 0.0.0.0. With multiple IPs on the
         # host this is required for the raw transport: a raw (portless) socket bound to 0.0.0.0
@@ -1659,12 +1676,32 @@ def op_update(d):
     return {"ok": True, "version": int(m.group(1)) if m else None, "sha256": h, "restarting": True}
 
 
+def op_spoof_probe(d):
+    """Ask the core binary whether IP spoofing (decoy) can run on THIS node. Reports local
+    capability only (CAP_NET_RAW + AF_PACKET) — it cannot prove the upstream datacenter will
+    forward a forged source, which only shows up if a real tunnel fails to establish. The panel
+    uses {ok, reason} to enable/disable the spoofing controls and show why."""
+    try:
+        _ensure_core()
+    except Exception as e:
+        return {"ok": False, "reason": "core binary unavailable on this node: %s" % e}
+    rc, out, err = run([CORE_BIN, "--probe-spoof"], timeout=15)
+    if rc != 0:
+        return {"ok": False, "reason": (err or out or "probe failed").strip()}
+    try:
+        p = json.loads(out.strip())
+    except Exception:
+        return {"ok": False, "reason": "unreadable probe output"}
+    p.setdefault("ok", False)
+    return p
+
+
 OPS = {"ping": op_ping, "list": op_list, "check": op_check, "tunnel": op_tunnel,
        "portfw": op_portfw, "portfw-edit": op_portfw_edit, "portfw-next": op_portfw_next,
        "delete": op_delete, "apply": op_apply, "update": op_update, "wipe": op_wipe,
        "portcheck": op_portcheck, "core-update": op_core_update,
-       "core-install": op_core_install}
-READ_ONLY = {"ping", "list", "check", "portcheck"}
+       "core-install": op_core_install, "spoof-probe": op_spoof_probe}
+READ_ONLY = {"ping", "list", "check", "portcheck", "spoof-probe"}
 
 # ----------------------------------------------------------------------------- HTTP
 
