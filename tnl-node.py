@@ -595,7 +595,13 @@ def _core_config(cfg):
     if bool(cfg.get("gso")):     # TUN segmentation offload — local throughput optimization
         ecfg["gso"] = True
     if cfg.get("role") == "server":
-        ecfg["listen"] = f"0.0.0.0:{port}"
+        # Bind to THIS node's physical IP for the tunnel, not 0.0.0.0. With multiple IPs on the
+        # host this is required for the raw transport: a raw (portless) socket bound to 0.0.0.0
+        # replies from the primary IP, so a second tunnel on a secondary IP would send from the
+        # wrong source and the client (which filters by peer IP) drops every reply. Binding to the
+        # exact listen IP makes the reply source correct and also cleanly demuxes by destination IP.
+        lip = cfg.get("local_ip") or "0.0.0.0"
+        ecfg["listen"] = f"{lip}:{port}"
     else:
         ecfg["peer"] = f"{cfg['remote_ip']}:{port}"
     return ecfg
