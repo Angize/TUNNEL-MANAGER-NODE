@@ -557,9 +557,13 @@ def _core_config(cfg):
     raw_profile = str(cfg.get("raw_profile") or "bip").lower()
     obfs = bool(cfg.get("obfs")) and crypto_on   # obfs is meaningless without the AEAD key
     # MTU budget = outer headers + bip framing + obfs padding + AEAD (nonce+tag) + wire mask salt.
+    flux_carrier = str(cfg.get("flux_carrier") or "udp").lower()
     if transport == "raw":
         # IP20 + the profile's carrier header (bip/ipip add none; gre 4; icmp/udp 8; tcp 20).
         outer = 20 + {"bip": 0, "ipip": 0, "gre": 4, "icmp": 8, "udp": 8, "tcp": 20}.get(raw_profile, 0)
+    elif transport == "flux":
+        # IP20 + the carrier header: the udp carrier adds an 8-byte UDP header, the raw carrier none.
+        outer = 20 + (8 if flux_carrier == "udp" else 0)
     else:
         outer = 40 if transport == "tcp" else 28        # IP20 + TCP20 | IP20 + UDP8
     if obfs:
@@ -592,6 +596,11 @@ def _core_config(cfg):
             ecfg["cover_sni"] = sni
     if transport == "raw":
         ecfg["raw_profile"] = raw_profile
+    if transport == "flux":
+        # flux is a distinct transport (not a raw_profile): the carrier and the epoch
+        # length are all it needs — both ends derive the rotating shape from the PSK+clock.
+        ecfg["flux_carrier"] = flux_carrier
+        ecfg["flux_rotate_secs"] = int(cfg.get("flux_rotate_secs") or 600)
     if bool(cfg.get("gso")):     # TUN segmentation offload — local throughput optimization
         ecfg["gso"] = True
     # IP spoofing (raw bip + crypto only): forge the outer source and/or the destination (a decoy).
@@ -1291,7 +1300,7 @@ def op_tunnel(d):
             raise ValueError("bad core cipher")
         obj["cipher"] = cipher
         transport = str(d.get("transport") or "udp").strip().lower()
-        if transport not in ("udp", "tcp", "raw"):
+        if transport not in ("udp", "tcp", "raw", "flux"):
             raise ValueError("bad core transport")
         obj["transport"] = transport
         if transport == "raw":        # raw-IP carrier: which protocol the sealed frame is wrapped in
@@ -1299,6 +1308,15 @@ def op_tunnel(d):
             if profile not in ("bip", "ipip", "gre", "icmp", "udp", "tcp"):
                 raise ValueError("bad raw_profile")
             obj["raw_profile"] = profile
+        if transport == "flux":       # polymorphic moving-target carrier: persist carrier + epoch length
+            carrier = str(d.get("flux_carrier") or "udp").strip().lower()
+            if carrier not in ("udp", "raw"):
+                raise ValueError("bad flux_carrier")
+            obj["flux_carrier"] = carrier
+            rot = int(d.get("flux_rotate_secs") or 600)
+            if rot < 10 or rot > 86400:
+                raise ValueError("flux_rotate_secs out of range (10..86400)")
+            obj["flux_rotate_secs"] = rot
         psk = str(d.get("psk") or "").strip()
         if psk:                       # crypto is optional but recommended; when set it must be strong enough
             if len(psk) < 16:
@@ -1308,6 +1326,10 @@ def op_tunnel(d):
         if obfs and (not psk or cipher == "none"):
             raise ValueError("obfs requires a psk and encryption")
         obj["obfs"] = obfs
+        # flux derives its rotating shape from the PSK and authenticates the shape-independent
+        # decode with the AEAD, so crypto is mandatory — reject early rather than let the core fail.
+        if transport == "flux" and (not psk or cipher == "none"):
+            raise ValueError("flux requires a psk and encryption")
         # TLS cover (HTTPS camouflage) — persist it so _core_config can forward it to the core.
         if bool(d.get("cover")) and transport == "tcp":
             obj["cover"] = True

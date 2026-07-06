@@ -130,6 +130,32 @@ _ec = tnl._core_config(_o)   # end-to-end: stored cfg -> core config carries the
 check("end-to-end spoof_src_ip reaches core config", _ec.get("spoof_src_ip") == "198.51.100.9")
 check("end-to-end spoof_dst_ip reaches core config", _ec.get("spoof_dst_ip") == "203.0.113.7")
 
+# flux: _core_config forwards the carrier + epoch length; the udp carrier is the default.
+e = cfg(psk="0123456789abcdef", transport="flux")
+check("flux defaults carrier to udp", e.get("flux_carrier") == "udp")
+check("flux defaults rotate to 600", e.get("flux_rotate_secs") == 600)
+check("flux carries no raw_profile", "raw_profile" not in e)
+e = cfg(psk="0123456789abcdef", transport="flux", flux_carrier="raw", flux_rotate_secs=300)
+check("flux forwards carrier raw", e.get("flux_carrier") == "raw")
+check("flux forwards rotate 300", e.get("flux_rotate_secs") == 300)
+# MTU: the udp carrier (IP+UDP) has 8 bytes less headroom than the raw carrier (IP only).
+check("flux udp MTU < raw MTU by the UDP header",
+      cfg(psk="k"*16, transport="flux", flux_carrier="raw")["mtu"]
+      - cfg(psk="k"*16, transport="flux", flux_carrier="udp")["mtu"] == 8)
+
+# op_tunnel must PERSIST flux_carrier/flux_rotate_secs (same whitelist trap that dropped spoofing).
+_saved.clear()
+tnl.op_tunnel({"type": "core", "self_ip": "10.0.0.2", "peer_ip": "203.0.113.9",
+               "subnet": "192.168.9.0/24", "id": 8, "name": "core8", "role": "client",
+               "cipher": "auto", "transport": "flux", "flux_carrier": "udp",
+               "flux_rotate_secs": 300, "psk": "0123456789abcdef"})
+_of = _saved.get("core8", {})
+check("op_tunnel persists flux_carrier", _of.get("flux_carrier") == "udp")
+check("op_tunnel persists flux_rotate_secs", _of.get("flux_rotate_secs") == 300)
+_ecf = tnl._core_config(_of)   # end-to-end: stored cfg -> core config carries the flux carrier
+check("end-to-end flux_carrier reaches core config", _ecf.get("flux_carrier") == "udp")
+check("end-to-end flux_rotate_secs reaches core config", _ecf.get("flux_rotate_secs") == 300)
+
 # on/off: op_tunnel defaults enabled True and persists a disabled tunnel.
 check("op_tunnel defaults enabled True", _o.get("enabled") is True)
 _saved.clear()
