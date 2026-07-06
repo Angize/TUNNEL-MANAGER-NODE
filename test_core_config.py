@@ -130,6 +130,13 @@ _ec = tnl._core_config(_o)   # end-to-end: stored cfg -> core config carries the
 check("end-to-end spoof_src_ip reaches core config", _ec.get("spoof_src_ip") == "198.51.100.9")
 check("end-to-end spoof_dst_ip reaches core config", _ec.get("spoof_dst_ip") == "203.0.113.7")
 
+# on/off: op_tunnel defaults enabled True and persists a disabled tunnel.
+check("op_tunnel defaults enabled True", _o.get("enabled") is True)
+_saved.clear()
+tnl.op_tunnel({"type": "vxlan", "self_ip": "10.0.0.2", "peer_ip": "203.0.113.9",
+               "subnet": "192.168.9.0/24", "id": 9, "name": "vxlan9", "enabled": False})
+check("op_tunnel persists enabled False", _saved.get("vxlan9", {}).get("enabled") is False)
+
 print()
 if FAILS:
     print("%d FAILED: %s" % (len(FAILS), ", ".join(FAILS)))

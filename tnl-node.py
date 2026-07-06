@@ -665,6 +665,24 @@ def _core_teardown(cfg):
         pass
 
 
+def _set_link_state(cfg, enabled):
+    """Bring a tunnel's data path up or down WITHOUT tearing the config down. For a core tunnel the
+    TUN is owned by the core process (and Restart=always would fight an `ip link down`), so we stop the
+    unit to disable and (re)build it to enable. Plain kernel tunnels just toggle the netdev's admin state."""
+    name = cfg.get("name", "")
+    if not NAME_RE.match(name):
+        return
+    if cfg.get("type") == "core":
+        if enabled:
+            build_core(cfg)
+        else:
+            unit = _core_unit(name)
+            run(["systemctl", "stop", unit])
+            run(["systemctl", "reset-failed", unit])
+    else:
+        run(["ip", "link", "set", name, "up" if enabled else "down"])
+
+
 def _pf_match(cfg, iface, proto, lp):
     """PREROUTING match args for this forward; a listen_ip pins the rule to ONE local IP (multi-IP hosts)."""
     m = ["-i", iface, "-p", proto, "--dport", lp]
@@ -793,6 +811,10 @@ def apply_config(cfg):
         build_core(cfg)
     elif t == "portfw":
         build_portfw(cfg)
+    # A tunnel the operator turned OFF is still built (so edit/rebuild/boot reconstruct it correctly)
+    # but its data path is left DOWN until re-enabled. portfw has no admin on/off.
+    if t != "portfw" and not cfg.get("enabled", True):
+        _set_link_state(cfg, False)
 
 
 def teardown_config(cfg):
@@ -1246,6 +1268,8 @@ def op_tunnel(d):
     tunnel_ip = derive_tunnel_ip(ttype, self_ip, peer_ip, subnet)
     obj = {"name": name, "type": ttype, "id": tid, "iface": iface,
            "remote_ip": peer_ip, "tunnel_ip": tunnel_ip, "local_ip": self_ip}
+    _prev = read_config(name)   # preserve the operator's on/off across a rebuild that doesn't restate it
+    obj["enabled"] = bool(d.get("enabled", (_prev or {}).get("enabled", True)))
     if ttype in ("l2tpv3", "fou", "core", "vxlan"):   # optional UDP port; l2tp/fou/core blank->from id, vxlan blank->4789
         if d.get("port") not in (None, ""):
             port = int(d["port"])
@@ -1465,6 +1489,23 @@ def op_delete(d):
     except FileNotFoundError:
         pass
     return {"ok": True}
+
+
+def op_link_enable(d):
+    """Turn a tunnel's data path on or off without rebuilding it. Persists the state so edit/rebuild/boot
+    keep it, and brings the interface up/down now (core: (re)start/stop the core unit; others: ip link up/down)."""
+    _require(d, ["name"])
+    name = d["name"]
+    if not NAME_RE.match(name):
+        raise ValueError("bad name")
+    enabled = bool(d.get("enabled", True))
+    cfg = read_config(name)
+    if not cfg or cfg.get("type") == "portfw":
+        return {"ok": True, "already": True}   # nothing to toggle (idempotent)
+    cfg["enabled"] = enabled
+    write_config(name, cfg)
+    _set_link_state(cfg, enabled)
+    return {"ok": True, "enabled": enabled}
 
 
 def op_wipe(d):
@@ -1713,7 +1754,8 @@ OPS = {"ping": op_ping, "list": op_list, "check": op_check, "tunnel": op_tunnel,
        "portfw": op_portfw, "portfw-edit": op_portfw_edit, "portfw-next": op_portfw_next,
        "delete": op_delete, "apply": op_apply, "update": op_update, "wipe": op_wipe,
        "portcheck": op_portcheck, "core-update": op_core_update,
-       "core-install": op_core_install, "spoof-probe": op_spoof_probe}
+       "core-install": op_core_install, "spoof-probe": op_spoof_probe,
+       "link-enable": op_link_enable}
 READ_ONLY = {"ping", "list", "check", "portcheck", "spoof-probe"}
 
 # ----------------------------------------------------------------------------- HTTP
