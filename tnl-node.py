@@ -521,9 +521,9 @@ def _core_config(cfg):
     if crypto_on:
         # AEAD nonce+tag, plus the 12-byte per-frame mask salt the core prepends (v2 wire).
         overhead += (40 if cipher == "xchacha20-poly1305" else 28) + 12
-    # FEC (flux datagram carriers) prepends an 11-byte block header + a 2-byte shard-len
-    # to every data shard, so it costs 13 bytes of usable payload per carrier packet.
-    if transport == "flux" and bool(cfg.get("fec")):
+    # FEC (datagram carriers: udp/raw/flux) prepends an 11-byte block header + a 2-byte
+    # shard-len to every data shard, so it costs 13 bytes of usable payload per packet.
+    if transport in ("udp", "raw", "flux") and bool(cfg.get("fec")):
         overhead += 13
     mtu = max(1280, base_mtu() - overhead)
     ecfg = {
@@ -557,12 +557,6 @@ def _core_config(cfg):
         off = int(cfg.get("flux_epoch_offset") or 0)
         if off:
             ecfg["flux_epoch_offset"] = off
-        # FEC (forward error correction): reconstructs lost carrier datagrams from
-        # parity so a throttled/high-loss link stays usable. Datagram carriers only.
-        if bool(cfg.get("fec")):
-            ecfg["fec"] = True
-            ecfg["fec_data"] = int(cfg.get("fec_data") or 10)
-            ecfg["fec_parity"] = int(cfg.get("fec_parity") or 3)
     if transport == "ws":
         # WebSocket carrier (CDN-frontable): Host/SNI, path, and whether the client
         # speaks wss (TLS to the CDN edge). The server stays plain — the CDN terminates TLS.
@@ -572,6 +566,13 @@ def _core_config(cfg):
             ecfg["ws_path"] = str(cfg["ws_path"])
         if bool(cfg.get("ws_tls")):
             ecfg["ws_tls"] = True
+    # FEC (forward error correction): reconstructs lost carrier datagrams from parity so a
+    # throttled/high-loss link stays usable. Datagram carriers only (udp/raw/flux) — on
+    # tcp/ws it's wasted (TCP is already reliable), so it's only forwarded for those three.
+    if transport in ("udp", "raw", "flux") and bool(cfg.get("fec")):
+        ecfg["fec"] = True
+        ecfg["fec_data"] = int(cfg.get("fec_data") or 10)
+        ecfg["fec_parity"] = int(cfg.get("fec_parity") or 3)
     if bool(cfg.get("gso")):     # TUN segmentation offload — local throughput optimization
         ecfg["gso"] = True
     # IP spoofing (raw bip + crypto only): forge the outer source and/or the destination (a decoy).
@@ -1322,17 +1323,17 @@ def op_tunnel(d):
                 raise ValueError("bad flux_shape")
             obj["flux_shape"] = shape
             obj["flux_epoch_offset"] = int(d.get("flux_epoch_offset") or 0)  # manual "rotate now" bump
-            # FEC (forward error correction) — repairs lost carrier datagrams from parity.
-            # Persisting these in the whitelist is mandatory: an un-whitelisted key is
-            # silently dropped from the stored config and the feature never reaches the core.
-            if bool(d.get("fec")):
-                obj["fec"] = True
-                fd = int(d.get("fec_data") or 10)
-                fp = int(d.get("fec_parity") or 3)
-                if fd < 1 or fp < 1 or fd + fp > 255:
-                    raise ValueError("fec_data/fec_parity out of range (>=1, sum<=255)")
-                obj["fec_data"] = fd
-                obj["fec_parity"] = fp
+        # FEC (forward error correction) — repairs lost carrier datagrams from parity, on the
+        # datagram carriers only (udp/raw/flux). Persisting these in the whitelist is mandatory:
+        # an un-whitelisted key is silently dropped from the stored config and never reaches the core.
+        if transport in ("udp", "raw", "flux") and bool(d.get("fec")):
+            obj["fec"] = True
+            fd = int(d.get("fec_data") or 10)
+            fp = int(d.get("fec_parity") or 3)
+            if fd < 1 or fp < 1 or fd + fp > 255:
+                raise ValueError("fec_data/fec_parity out of range (>=1, sum<=255)")
+            obj["fec_data"] = fd
+            obj["fec_parity"] = fp
         psk = str(d.get("psk") or "").strip()
         if psk:                       # crypto is optional but recommended; when set it must be strong enough
             if len(psk) < 16:
