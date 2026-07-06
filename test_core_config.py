@@ -160,6 +160,17 @@ check("ws forwards ws_host", e.get("ws_host") == "cdn.example.com")
 check("ws forwards ws_path", e.get("ws_path") == "/live")
 check("ws forwards ws_tls", e.get("ws_tls") is True)
 check("ws omits ws_tls when false", "ws_tls" not in cfg(psk="k"*16, transport="ws", role="client"))
+# edge_ip: the client dials the CDN edge instead of the origin; ws_host stays the domain.
+e = cfg(psk="k"*16, transport="ws", role="client", remote_ip="203.0.113.9",
+        ws_host="cdn.example.com", ws_tls=True, edge_ip="104.16.0.1:443")
+check("edge_ip overrides client dial target", e.get("peer") == "104.16.0.1:443")
+check("edge_ip keeps ws_host as the domain", e.get("ws_host") == "cdn.example.com")
+e = cfg(psk="k"*16, transport="ws", role="client", remote_ip="203.0.113.9", edge_ip="104.16.0.1")
+check("edge_ip without port uses the link port", e.get("peer", "").startswith("104.16.0.1:"))
+check("no edge_ip dials the origin",
+      cfg(psk="k"*16, transport="ws", role="client", remote_ip="203.0.113.9")["peer"].startswith("203.0.113.9:"))
+check("edge_ip ignored on the server (listens)",
+      cfg(psk="k"*16, transport="ws", role="server", edge_ip="104.16.0.1").get("peer") is None)
 _saved.clear()
 tnl.op_tunnel({"type": "core", "self_ip": "10.0.0.2", "peer_ip": "203.0.113.9",
                "subnet": "192.168.9.0/24", "id": 7, "name": "core7", "role": "client",

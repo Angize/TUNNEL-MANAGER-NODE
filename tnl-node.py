@@ -646,7 +646,19 @@ def _core_config(cfg):
         lip = cfg.get("local_ip") or "0.0.0.0"
         ecfg["listen"] = f"{lip}:{port}"
     else:
-        ecfg["peer"] = f"{cfg['remote_ip']}:{port}"
+        # The client dials the peer. For a ws link fronted through a CDN, edge_ip
+        # overrides the dial target to the CDN edge (host or host:port) while ws_host
+        # stays the fronting domain; the CDN routes on to the real origin. The core is
+        # unaware — it just dials whatever peer it is given.
+        dial, dport = cfg["remote_ip"], port
+        edge = str(cfg.get("edge_ip") or "").strip()
+        if transport == "ws" and edge:
+            h, sep, p = edge.rpartition(":")
+            if sep and p.isdigit():
+                dial, dport = h, int(p)
+            else:
+                dial = edge
+        ecfg["peer"] = f"{dial}:{dport}"
     return ecfg
 
 
@@ -1331,6 +1343,12 @@ def op_tunnel(d):
                 obj["ws_path"] = wp
             if bool(d.get("ws_tls")):
                 obj["ws_tls"] = True
+            edge = str(d.get("edge_ip") or "").strip()   # CDN edge the client dials instead of the origin
+            if edge:
+                host = edge.rpartition(":")[0] or edge
+                if not re.match(r"^[A-Za-z0-9.\-]{1,253}$", host):
+                    raise ValueError("bad edge_ip")
+                obj["edge_ip"] = edge
         if transport == "raw":        # raw-IP carrier: which protocol the sealed frame is wrapped in
             profile = str(d.get("raw_profile") or "bip").strip().lower()
             if profile not in ("bip", "ipip", "gre", "icmp", "udp", "tcp"):
