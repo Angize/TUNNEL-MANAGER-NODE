@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Unit tests for the pure config-mapping logic in tnl-node.py (no root / no
-# network needed). Run: python3 test_engine_config.py
+# network needed). Run: python3 test_core_config.py
 import importlib.util
 import os
 import sys
@@ -24,7 +24,7 @@ def cfg(**kw):
     base = {"name": "eng-1", "id": 5, "role": "server",
             "tunnel_ip": "10.200.0.1/24", "remote_ip": "203.0.113.9"}
     base.update(kw)
-    return tnl._engine_config(base)
+    return tnl._core_config(base)
 
 
 # #20: a psk with cipher="none" must NOT be reported as encryption enabled.
@@ -84,4 +84,4 @@ print()
 if FAILS:
     print("%d FAILED: %s" % (len(FAILS), ", ".join(FAILS)))
     sys.exit(1)
-print("all engine-config tests passed")
+print("all core-config tests passed")

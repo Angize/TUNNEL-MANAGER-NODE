@@ -92,7 +92,7 @@ SS_TCP = (
     "LISTEN 0      128             [::]:22            [::]:*     users:((\"sshd\",pid=700,fd=3))\n"
 )
 SS_UDP = (
-    "UNCONN 0      0            0.0.0.0:4789       0.0.0.0:*     users:((\"tnl-engine\",pid=2222,fd=4))\n"
+    "UNCONN 0      0            0.0.0.0:4789       0.0.0.0:*     users:((\"tnl-core\",pid=2222,fd=4))\n"
 )
 
 
@@ -117,7 +117,7 @@ try:
     b, _ = tnl._port_busy(8443, "tcp")
     check("ss parse: unlisted port free", b is False)
     b, who = tnl._port_busy(4789, "udp")
-    check("ss parse: 4789/udp busy (tnl-engine)", b is True and who == "tnl-engine")
+    check("ss parse: 4789/udp busy (tnl-core)", b is True and who == "tnl-core")
     b, _ = tnl._port_busy(4789, "tcp")
     check("ss parse: 4789 free on TCP (proto isolation)", b is False)
 finally:

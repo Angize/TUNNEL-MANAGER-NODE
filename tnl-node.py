@@ -44,17 +44,17 @@ SERVICE_FILE = "/etc/systemd/system/tnl-node.service"
 SELF_PATH = os.path.realpath(__file__)
 INSTALLED = os.path.join(CONFIG_DIR, "tnl-node.py")  # stable path the systemd unit points at
 
-# The custom Go data-plane engine (packet/bip): a static binary the node fetches from the engine
+# The custom Go data-plane core (packet/bip): a static binary the node fetches from the core
 # repo (raw, like the agent's own git update), verifies by sha256, and supervises via systemd-run.
-ENGINE_BIN = os.path.join(CONFIG_DIR, "tnl-engine")
-# The engine binary is published as a GitHub Release ASSET, one release per version
-# (tag v1, v2, …). A node can pin a specific version (stored as conf["engine_version"])
+CORE_BIN = os.path.join(CONFIG_DIR, "tnl-core")
+# The core binary is published as a GitHub Release ASSET, one release per version
+# (tag v1, v2, …). A node can pin a specific version (stored as conf["core_version"])
 # or track "latest"; downgrade is just pinning an older tag. The panel drives the pin
-# via the "engine-update" op.
-ENGINE_RELEASES = "https://github.com/Angize/TUNNEL-MANAGER-ENGINE/releases"
-_engine_lock = threading.Lock()  # serialize download/replace of the shared engine binary
-_engine_sha_cache = {"mtime": None, "sha": ""}  # avoid re-hashing the 3 MB binary on every ping
-OBFS_DATA_PAD_MAX = 64   # must match the engine's obfsDataPadMax so the MTU budget covers worst-case padding
+# via the "core-update" op.
+CORE_RELEASES = "https://github.com/Angize/TUNNEL-MANAGER-ENGINE/releases"
+_core_lock = threading.Lock()  # serialize download/replace of the shared core binary
+_core_sha_cache = {"mtime": None, "sha": ""}  # avoid re-hashing the 3 MB binary on every ping
+OBFS_DATA_PAD_MAX = 64   # must match the core's obfsDataPadMax so the MTU budget covers worst-case padding
 
 NAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
 IFACE_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.@-]*$")  # no leading '-' → can't be mistaken for a CLI flag (arg-injection guard)
@@ -452,7 +452,7 @@ def build_ipsec(cfg):
     run(["ip", "link", "set", "dev", name, "mtu", str(base_mtu() - 80)])
 
 
-def _engine_arch():
+def _core_arch():
     m = os.uname().machine
     return {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64"}.get(m, "amd64")
 
@@ -465,56 +465,56 @@ def _http_get(url, timeout=30):
         return None
 
 
-def _engine_ref():
-    """The engine version this node is pinned to: a release tag (e.g. "v2") or "latest"."""
+def _core_ref():
+    """The core version this node is pinned to: a release tag (e.g. "v2") or "latest"."""
     try:
-        return str(load_conf().get("engine_version") or "latest").strip() or "latest"
+        return str(load_conf().get("core_version") or "latest").strip() or "latest"
     except Exception:
         return "latest"
 
 
-def _engine_urls(ref, arch):
-    """Download URL for the engine binary at `ref`: the GitHub Release ASSET, and only that. The panel
-    publishes each version as a release asset (tnl-engine-linux-<arch> + .sha256); there is no repo-tree
+def _core_urls(ref, arch):
+    """Download URL for the core binary at `ref`: the GitHub Release ASSET, and only that. The panel
+    publishes each version as a release asset (tnl-core-linux-<arch> + .sha256); there is no repo-tree
     fallback, so a version exists exactly when its release asset does."""
-    asset = f"tnl-engine-linux-{arch}"
+    asset = f"tnl-core-linux-{arch}"
     if ref in ("", "latest", None):
-        return [f"{ENGINE_RELEASES}/latest/download/{asset}"]
-    return [f"{ENGINE_RELEASES}/download/{ref}/{asset}"]
+        return [f"{CORE_RELEASES}/latest/download/{asset}"]
+    return [f"{CORE_RELEASES}/download/{ref}/{asset}"]
 
 
-def _installed_engine_sha():
+def _installed_core_sha():
     """sha256 of the installed binary, cached by mtime so ping doesn't re-hash 3 MB each time."""
     try:
-        st = os.stat(ENGINE_BIN)
-        if _engine_sha_cache["mtime"] != st.st_mtime:
-            with open(ENGINE_BIN, "rb") as f:
-                _engine_sha_cache["sha"] = hashlib.sha256(f.read()).hexdigest()
-            _engine_sha_cache["mtime"] = st.st_mtime
-        return _engine_sha_cache["sha"]
+        st = os.stat(CORE_BIN)
+        if _core_sha_cache["mtime"] != st.st_mtime:
+            with open(CORE_BIN, "rb") as f:
+                _core_sha_cache["sha"] = hashlib.sha256(f.read()).hexdigest()
+            _core_sha_cache["mtime"] = st.st_mtime
+        return _core_sha_cache["sha"]
     except Exception:
         return ""
 
 
-def _ensure_engine(ref=None, force=False):
-    """Make sure /opt/tunnel/tnl-engine exists. Routine callers (a tunnel build/rebuild) pass force=False:
+def _ensure_core(ref=None, force=False):
+    """Make sure /opt/tunnel/tnl-core exists. Routine callers (a tunnel build/rebuild) pass force=False:
     if a binary is ALREADY present it is left completely untouched — no network call, no version check —
-    so builds, rebuilds and reconciles never change the engine. Only an explicit engine-update passes
+    so builds, rebuilds and reconciles never change the core. Only an explicit core-update passes
     force=True, which downloads the release asset for `ref`, verifies its sha256, and installs it. We
     never install a binary whose checksum does not verify (it runs as root)."""
-    with _engine_lock:
-        have = os.path.isfile(ENGINE_BIN)
+    with _core_lock:
+        have = os.path.isfile(CORE_BIN)
         if have and not force:
-            return                       # a binary is present; only engine-update (force) ever replaces it
+            return                       # a binary is present; only core-update (force) ever replaces it
         if ref is None:
-            ref = _engine_ref()
-        arch = _engine_arch()
+            ref = _core_ref()
+        arch = _core_arch()
         cur = None
         if have:
-            with open(ENGINE_BIN, "rb") as f:
+            with open(CORE_BIN, "rb") as f:
                 cur = hashlib.sha256(f.read()).hexdigest()
         last = "no source reachable"
-        for url in _engine_urls(ref, arch):
+        for url in _core_urls(ref, arch):
             sha_raw = _http_get(url + ".sha256")
             want = sha_raw.decode().split()[0].strip() if sha_raw else ""
             if not want:                # can't verify this source -> try the next
@@ -529,28 +529,28 @@ def _ensure_engine(ref=None, force=False):
             if hashlib.sha256(data).hexdigest() != want:
                 last = "checksum mismatch"    # NEVER install an unverified binary (runs as root)
                 continue
-            tmp = ENGINE_BIN + ".new"
+            tmp = CORE_BIN + ".new"
             with open(tmp, "wb") as f:
                 f.write(data)
             os.chmod(tmp, 0o755)
-            os.replace(tmp, ENGINE_BIN)
+            os.replace(tmp, CORE_BIN)
             return
         # no source produced a verified binary
         if have:
             return                      # offline-tolerant: keep the working copy we already have
-        raise RuntimeError(f"could not install engine {ref}: {last}")
+        raise RuntimeError(f"could not install core {ref}: {last}")
 
 
-def _engine_port(cfg):
+def _core_port(cfg):
     return int(cfg.get("port") or (20000 + int(cfg["id"])))
 
 
-def _engine_config(cfg):
-    """Pure: build the JSON the engine binary consumes from a stored tunnel config. The tun device is
+def _core_config(cfg):
+    """Pure: build the JSON the core binary consumes from a stored tunnel config. The tun device is
     named after the config so /proc/net/dev accounting and `ip link show <name>` health work unchanged.
     Crypto is on whenever a psk is present; the psk never leaves the node (public_configs pops it)."""
     name = cfg["name"]
-    port = _engine_port(cfg)
+    port = _core_port(cfg)
     cipher = str(cfg.get("cipher") or "auto")   # match the panel's default so the MTU/crypto sizing agrees
     crypto_on = bool(cfg.get("psk")) and cipher != "none"  # a psk with cipher=none is NOT encryption
     transport = str(cfg.get("transport") or "udp").lower()
@@ -568,18 +568,18 @@ def _engine_config(cfg):
         framing = 4 if transport == "tcp" else 2        # (len)+magic+type | magic+type
     overhead = outer + framing
     if crypto_on:
-        # AEAD nonce+tag, plus the 12-byte per-frame mask salt the engine prepends (v2 wire).
+        # AEAD nonce+tag, plus the 12-byte per-frame mask salt the core prepends (v2 wire).
         overhead += (40 if cipher == "xchacha20-poly1305" else 28) + 12
     mtu = max(1280, base_mtu() - overhead)
     ecfg = {
         "role": cfg.get("role"),
         "mode": "packet",
-        "profile": "bip",
+        "profile": "core",
         "transport": transport,
         "obfs": obfs,
         "tun_name": name,
         "tun_addr": cfg["tunnel_ip"],
-        "tun_peer": peer_of(cfg["tunnel_ip"], "engine"),
+        "tun_peer": peer_of(cfg["tunnel_ip"], "core"),
         "mtu": mtu,
         "keepalive": 15,
         "crypto": {"enabled": crypto_on, "psk": cfg.get("psk", ""), "cipher": cipher},
@@ -601,43 +601,43 @@ def _engine_config(cfg):
     return ecfg
 
 
-def _engine_unit(name):
+def _core_unit(name):
     return "tnl-eng-" + name
 
 
-def build_engine(cfg):
-    """Fetch/verify the engine binary, write its per-tunnel config, and (re)launch it under a transient
+def build_core(cfg):
+    """Fetch/verify the core binary, write its per-tunnel config, and (re)launch it under a transient
     systemd unit with Restart=always. Then wait for the TUN to appear so op_tunnel's verify sees it."""
     name = cfg["name"]
-    _ensure_engine()
-    ecfg = _engine_config(cfg)
-    path = os.path.join(CONFIG_DIR, "engine-" + name + ".json")
+    _ensure_core()
+    ecfg = _core_config(cfg)
+    path = os.path.join(CONFIG_DIR, "core-" + name + ".json")
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
         json.dump(ecfg, f, indent=2)
     os.chmod(tmp, 0o600)          # holds the psk -> keep it private like node.conf
     os.replace(tmp, path)
-    unit = _engine_unit(name)
+    unit = _core_unit(name)
     run(["systemctl", "stop", unit])
     run(["systemctl", "reset-failed", unit])
     run(["systemd-run", "--unit", unit, "--collect",
          "-p", "Restart=always", "-p", "RestartSec=3",
-         ENGINE_BIN, "--config", path])
-    for _ in range(30):          # engine opens the TUN a beat after systemd-run returns
+         CORE_BIN, "--config", path])
+    for _ in range(30):          # core opens the TUN a beat after systemd-run returns
         if run(["ip", "link", "show", name])[0] == 0:
             break
         time.sleep(0.1)
 
 
-def _engine_teardown(cfg):
+def _core_teardown(cfg):
     name = cfg.get("name", "")
     if not NAME_RE.match(name):
         return
-    unit = _engine_unit(name)
-    run(["systemctl", "stop", unit])       # kills the engine -> its non-persistent TUN disappears
+    unit = _core_unit(name)
+    run(["systemctl", "stop", unit])       # kills the core -> its non-persistent TUN disappears
     run(["systemctl", "reset-failed", unit])
     try:
-        os.remove(os.path.join(CONFIG_DIR, "engine-" + name + ".json"))
+        os.remove(os.path.join(CONFIG_DIR, "core-" + name + ".json"))
     except OSError:
         pass
 
@@ -766,8 +766,8 @@ def apply_config(cfg):
         build_fou(cfg)
     elif t == "ipsec":
         build_ipsec(cfg)
-    elif t == "engine":
-        build_engine(cfg)
+    elif t == "core":
+        build_core(cfg)
     elif t == "portfw":
         build_portfw(cfg)
 
@@ -794,8 +794,8 @@ def teardown_config(cfg):
             run(["ip", "fou", "del", "port", str(port), "ipproto", "4"])
     elif ttype == "ipsec":
         _ipsec_clear(cfg)
-    elif ttype == "engine":
-        _engine_teardown(cfg)
+    elif ttype == "core":
+        _core_teardown(cfg)
     elif ttype == "portfw":
         _pf_acct_teardown(cfg)   # drop the byte counters (keyed on name/listen_port, independent of iface)
         iface, lp, dp = cfg.get("iface", ""), str(cfg.get("listen_port", "")), str(cfg.get("dst_port", ""))
@@ -1184,7 +1184,7 @@ def op_ping(d):
             "hostname": socket.gethostname(), "ips": all_ips(), "sha256": _SELF_SHA,
             "tunnels": len([c for c in cfgs if c.get("type") != "portfw"]),
             "portfw": len([c for c in cfgs if c.get("type") == "portfw"]),
-            "engine_ver": _engine_ref(), "engine_sha": _installed_engine_sha()[:12],
+            "core_ver": _core_ref(), "core_sha": _installed_core_sha()[:12],
             "stats": stats}
 
 
@@ -1199,7 +1199,7 @@ def op_tunnel(d):
     """Create ONE side of a node<->node tunnel (central calls this on both nodes)."""
     _require(d, ["type", "self_ip", "peer_ip", "subnet"])
     ttype = d["type"]
-    if ttype not in ("vxlan", "gre", "sit", "ipip", "l2tpv3", "fou", "ipsec", "engine"):
+    if ttype not in ("vxlan", "gre", "sit", "ipip", "l2tpv3", "fou", "ipsec", "core"):
         raise ValueError("bad type")
     self_ip, peer_ip = d["self_ip"], d["peer_ip"]
     if not is_ipv4(self_ip) or not is_ipv4(peer_ip):
@@ -1223,7 +1223,7 @@ def op_tunnel(d):
     tunnel_ip = derive_tunnel_ip(ttype, self_ip, peer_ip, subnet)
     obj = {"name": name, "type": ttype, "id": tid, "iface": iface,
            "remote_ip": peer_ip, "tunnel_ip": tunnel_ip, "local_ip": self_ip}
-    if ttype in ("l2tpv3", "fou", "engine", "vxlan"):   # optional UDP port; l2tp/fou/engine blank->from id, vxlan blank->4789
+    if ttype in ("l2tpv3", "fou", "core", "vxlan"):   # optional UDP port; l2tp/fou/core blank->from id, vxlan blank->4789
         if d.get("port") not in (None, ""):
             port = int(d["port"])
             if not 1 <= port <= 65535:
@@ -1234,18 +1234,18 @@ def op_tunnel(d):
         if len(psk) < 32:
             raise ValueError("ipsec needs a psk")
         obj["psk"] = psk
-    if ttype == "engine":
+    if ttype == "core":
         role = d.get("role")
         if role not in ("server", "client"):
-            raise ValueError("engine needs role server|client")
+            raise ValueError("core needs role server|client")
         obj["role"] = role
         cipher = str(d.get("cipher") or "auto").strip().lower()
         if cipher not in ("auto", "aes-256-gcm", "aes-128-gcm", "chacha20-poly1305", "xchacha20-poly1305", "none"):
-            raise ValueError("bad engine cipher")
+            raise ValueError("bad core cipher")
         obj["cipher"] = cipher
         transport = str(d.get("transport") or "udp").strip().lower()
         if transport not in ("udp", "tcp", "raw"):
-            raise ValueError("bad engine transport")
+            raise ValueError("bad core transport")
         obj["transport"] = transport
         if transport == "raw":        # raw-IP carrier: which protocol the sealed frame is wrapped in
             profile = str(d.get("raw_profile") or "bip").strip().lower()
@@ -1255,13 +1255,13 @@ def op_tunnel(d):
         psk = str(d.get("psk") or "").strip()
         if psk:                       # crypto is optional but recommended; when set it must be strong enough
             if len(psk) < 16:
-                raise ValueError("engine psk too short (>=16)")
+                raise ValueError("core psk too short (>=16)")
             obj["psk"] = psk          # popped from public_configs, so it never leaves the node
         obfs = bool(d.get("obfs"))    # anti-DPI: needs the AEAD key, so a psk (and a real cipher) is required
         if obfs and (not psk or cipher == "none"):
             raise ValueError("obfs requires a psk and encryption")
         obj["obfs"] = obfs
-        # TLS cover (HTTPS camouflage) — persist it so _engine_config can forward it to the engine.
+        # TLS cover (HTTPS camouflage) — persist it so _core_config can forward it to the core.
         if bool(d.get("cover")) and transport == "tcp":
             obj["cover"] = True
             sni = str(d.get("cover_sni") or "").strip()
@@ -1276,7 +1276,7 @@ def op_tunnel(d):
     try:
         apply_config(obj)
     except Exception as e:
-        # apply blew up (e.g. engine download/checksum failure): the old build is
+        # apply blew up (e.g. core download/checksum failure): the old build is
         # already gone and this config was just written, so undo the partial build
         # and drop the file — otherwise it lingers, inflates op_ping/op_list counts,
         # and gets retried on every boot via apply_all. Mirrors the rc!=0 cleanup.
@@ -1296,7 +1296,7 @@ def op_tunnel(d):
             pass
         need = {"vxlan": "vxlan", "gre": "ip_gre", "sit": "sit", "ipip": "ipip",
                 "l2tpv3": "l2tp_eth", "fou": "fou و ipip", "ipsec": "xfrm_interface",
-                "engine": "موتورِ tnl-engine"}[ttype]
+                "core": "هستهٔ tnl-core"}[ttype]
         return {"ok": False, "msg": f"اینترفیسِ {ttype} ساخته نشد — «{need}» روی این نود نصب/فعال نیست"}
     return {"ok": True, "name": name, "tunnel_ip": tunnel_ip}
 
@@ -1526,73 +1526,73 @@ def op_portcheck(d):
     return {"ok": True, "busy": busy, "who": who, "port": port, "proto": proto}
 
 
-ENGINE_VER_RE = re.compile(r"^(?!.*\.\.)[A-Za-z0-9._-]{1,40}$")  # negative-lookahead rejects any '..' → no path traversal in the release URL
-ENGINE_SHA_RE = re.compile(r"^[0-9a-f]{64}$")
+CORE_VER_RE = re.compile(r"^(?!.*\.\.)[A-Za-z0-9._-]{1,40}$")  # negative-lookahead rejects any '..' → no path traversal in the release URL
+CORE_SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
-def op_engine_update(d):
-    """Pin this node to a specific engine version (a release tag, or "latest") and install it, then
-    rebuild the running engine tunnels so they restart on the new binary. Downgrade = pass an older tag.
-    Pinning stops routine tunnel rebuilds from silently changing the engine."""
+def op_core_update(d):
+    """Pin this node to a specific core version (a release tag, or "latest") and install it, then
+    rebuild the running core tunnels so they restart on the new binary. Downgrade = pass an older tag.
+    Pinning stops routine tunnel rebuilds from silently changing the core."""
     version = str(d.get("version") or "latest").strip()
-    if version != "latest" and (".." in version or not ENGINE_VER_RE.match(version)):
-        raise ValueError("bad engine version")   # reject '..' explicitly → never let a tag traverse out of the release URL
+    if version != "latest" and (".." in version or not CORE_VER_RE.match(version)):
+        raise ValueError("bad core version")   # reject '..' explicitly → never let a tag traverse out of the release URL
     conf = load_conf()
-    conf["engine_version"] = version
+    conf["core_version"] = version
     save_conf(conf)
-    _ensure_engine(version, force=True)   # explicit update: download + verify + install even if a binary exists
+    _ensure_core(version, force=True)   # explicit update: download + verify + install even if a binary exists
     restarted, errs = 0, []
-    for c in raw_configs():           # relaunch every engine tunnel on the freshly-installed binary
-        if c.get("type") == "engine":
+    for c in raw_configs():           # relaunch every core tunnel on the freshly-installed binary
+        if c.get("type") == "core":
             try:
-                build_engine(c)
+                build_core(c)
                 restarted += 1
             except Exception as e:
                 errs.append(f"{c.get('name')}: {e}")
-    logline(f"engine pinned to {version}; rebuilt {restarted} engine tunnel(s)")
-    return {"ok": True, "version": version, "engine_sha": _installed_engine_sha()[:12],
+    logline(f"core pinned to {version}; rebuilt {restarted} core tunnel(s)")
+    return {"ok": True, "version": version, "core_sha": _installed_core_sha()[:12],
             "restarted": restarted, "errors": errs}
 
 
-def op_engine_install(d):
-    """Install a raw engine binary pushed from the panel (base64), not a published release. Verify its
-    sha256, swap it in atomically, pin the node to a custom label, then rebuild the engine tunnels so they
+def op_core_install(d):
+    """Install a raw core binary pushed from the panel (base64), not a published release. Verify its
+    sha256, swap it in atomically, pin the node to a custom label, then rebuild the core tunnels so they
     relaunch on it. NEVER install a binary whose checksum does not verify (it runs as root)."""
     _require(d, ["data", "sha256"])
     want = str(d.get("sha256") or "").strip().lower()
-    if not ENGINE_SHA_RE.match(want):
+    if not CORE_SHA_RE.match(want):
         raise ValueError("bad sha256")
     try:
         raw = base64.b64decode(d["data"], validate=True)
     except Exception:
         raise ValueError("bad base64 payload")
-    if len(raw) < 100000:                         # an engine binary is ~3 MB; anything tiny is a mistake, never install it
+    if len(raw) < 100000:                         # an core binary is ~3 MB; anything tiny is a mistake, never install it
         return {"ok": False, "msg": "binary too small"}
     got = hashlib.sha256(raw).hexdigest()
     if got != want:
         return {"ok": False, "msg": "checksum mismatch"}   # transport truncation guard — never install unverified bytes
     label = str(d.get("version") or "custom").strip() or "custom"
-    if not ENGINE_VER_RE.match(label):
+    if not CORE_VER_RE.match(label):
         label = "custom"
-    with _engine_lock:
-        tmp = ENGINE_BIN + ".new"
+    with _core_lock:
+        tmp = CORE_BIN + ".new"
         with open(tmp, "wb") as f:
             f.write(raw)
         os.chmod(tmp, 0o755)
-        os.replace(tmp, ENGINE_BIN)               # atomic swap on the same fs — no half-written window
+        os.replace(tmp, CORE_BIN)               # atomic swap on the same fs — no half-written window
     conf = load_conf()
-    conf["engine_version"] = label
+    conf["core_version"] = label
     save_conf(conf)
     restarted, errs = 0, []
-    for c in raw_configs():                        # relaunch every engine tunnel on the freshly-installed binary
-        if c.get("type") == "engine":
+    for c in raw_configs():                        # relaunch every core tunnel on the freshly-installed binary
+        if c.get("type") == "core":
             try:
-                build_engine(c)
+                build_core(c)
                 restarted += 1
             except Exception as e:
                 errs.append(f"{c.get('name')}: {e}")
-    logline(f"engine installed from upload ({label}, sha {got[:12]}); rebuilt {restarted} engine tunnel(s)")
-    return {"ok": True, "version": label, "engine_sha": got[:12], "restarted": restarted, "errors": errs}
+    logline(f"core installed from upload ({label}, sha {got[:12]}); rebuilt {restarted} core tunnel(s)")
+    return {"ok": True, "version": label, "core_sha": got[:12], "restarted": restarted, "errors": errs}
 
 
 def op_apply(d):
@@ -1656,8 +1656,8 @@ def op_update(d):
 OPS = {"ping": op_ping, "list": op_list, "check": op_check, "tunnel": op_tunnel,
        "portfw": op_portfw, "portfw-edit": op_portfw_edit, "portfw-next": op_portfw_next,
        "delete": op_delete, "apply": op_apply, "update": op_update, "wipe": op_wipe,
-       "portcheck": op_portcheck, "engine-update": op_engine_update,
-       "engine-install": op_engine_install}
+       "portcheck": op_portcheck, "core-update": op_core_update,
+       "core-install": op_core_install}
 READ_ONLY = {"ping", "list", "check", "portcheck"}
 
 # ----------------------------------------------------------------------------- HTTP
@@ -1695,7 +1695,7 @@ class Handler(BaseHTTPRequestHandler):
             n = int(self.headers.get("Content-Length", "0"))
         except ValueError:
             n = 0
-        n = min(max(n, 0), cap)   # default 1MB — headroom for a pushed agent source (JSON-escaped); raised for engine uploads
+        n = min(max(n, 0), cap)   # default 1MB — headroom for a pushed agent source (JSON-escaped); raised for core uploads
         raw = self.rfile.read(n) if n > 0 else b""
         try:
             obj = json.loads(raw.decode()) if raw else {}
@@ -1733,9 +1733,9 @@ class Handler(BaseHTTPRequestHandler):
         if cmd not in READ_ONLY and method != "POST":
             self._send(405, {"error": "use POST"})
             return
-        # engine-install carries a base64-encoded engine binary (~3MB raw → ~4MB base64); a 1MB cap
+        # core-install carries a base64-encoded core binary (~3MB raw → ~4MB base64); a 1MB cap
         # would truncate it and fail the JSON parse, so raise the cap for that op only.
-        cap = 20971520 if cmd == "engine-install" else 1048576
+        cap = 20971520 if cmd == "core-install" else 1048576
         d = self._body(cap) if method == "POST" else {}
         try:
             if cmd in READ_ONLY:
