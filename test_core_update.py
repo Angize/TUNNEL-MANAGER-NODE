@@ -79,6 +79,14 @@ check("core-install wrote the exact bytes", open(tnl.CORE_BIN, "rb").read() == b
 check("core-install pins the node to the pushed label", _conf.get("core_version") == "v2.2.2")
 check("core-install is a mutation (not read-only)", "core-install" in tnl.OPS and "core-install" not in tnl.READ_ONLY)
 
+# re-pushing the SAME binary is a no-op: no swap, no tunnel restart (unchanged=True)
+_rebuilt = {"n": 0}
+tnl.raw_configs = lambda: [{"type": "core", "name": "c1"}]
+tnl.build_core = lambda c: _rebuilt.__setitem__("n", _rebuilt["n"] + 1)
+r = tnl.op_core_install({"data": b64, "sha256": good, "version": "v2.2.2"})
+check("re-push same binary => unchanged", r.get("unchanged") is True)
+check("re-push same binary => no tunnel restart", _rebuilt["n"] == 0 and r.get("restarted") == 0)
+
 # ---- ping advertises arch + installed sha so the panel can relay/label ----
 check("ping reports arch", tnl._core_arch() in ("amd64", "arm64"))
 

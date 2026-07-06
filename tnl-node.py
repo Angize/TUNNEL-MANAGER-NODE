@@ -1644,6 +1644,14 @@ def op_core_install(d):
     label = str(d.get("version") or "custom").strip() or "custom"
     if not CORE_VER_RE.match(label):
         label = "custom"
+    # Already the exact binary? Then this is a no-op: do NOT swap and do NOT restart the
+    # running core tunnels (a re-push of the same version must not blip live tunnels).
+    if os.path.isfile(CORE_BIN) and _installed_core_sha() == got:
+        conf = load_conf()
+        if conf.get("core_version") != label:
+            conf["core_version"] = label
+            save_conf(conf)
+        return {"ok": True, "unchanged": True, "version": label, "core_sha": got[:12], "restarted": 0}
     with _core_lock:
         tmp = CORE_BIN + ".new"
         with open(tmp, "wb") as f:
