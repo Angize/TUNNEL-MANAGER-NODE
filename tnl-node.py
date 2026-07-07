@@ -584,6 +584,13 @@ def _core_config(cfg):
         # terminates TLS and forwards the WebSocket to the origin. Never emit ws_tls server-side.
         if bool(cfg.get("ws_tls")) and cfg.get("role") == "client":
             ecfg["ws_tls"] = True
+            # ECH: encrypt the SNI so an SNI-blocklisting censor can't see the real domain.
+            # The panel fetches the base64 ECHConfigList from the domain's HTTPS record over
+            # DoH (clean internet) and hands it to us; we just forward it to the core. Client
+            # + wss only (it rides the TLS ClientHello). Empty = no ECH.
+            ech = str(cfg.get("ws_ech") or "").strip()
+            if ech:
+                ecfg["ws_ech"] = ech
     # FEC (forward error correction): reconstructs lost carrier datagrams from parity so a
     # throttled/high-loss link stays usable. Datagram carriers only (udp/raw/flux) — on
     # tcp/ws it's wasted (TCP is already reliable), so it's only forwarded for those three.
@@ -1424,6 +1431,14 @@ def op_tunnel(d):
                 # domain); catch it here with a precise error instead of a late "interface not created".
                 if role == "client" and not obj.get("ws_host"):
                     raise ValueError("ws_tls به ws_host نیاز دارد (SNI/دامنهٔ فرانت‌کننده)")
+                # ECH: base64 ECHConfigList that hides the SNI. The panel fetches it from the
+                # domain's HTTPS record over DoH and sends it here; whitelist it so it survives
+                # (forgetting = silently dropped, and the SNI leaks). Client + wss only.
+                ech = str(d.get("ws_ech") or "").strip()
+                if ech:
+                    if len(ech) > 4096 or not re.match(r"^[A-Za-z0-9+/=]+$", ech):
+                        raise ValueError("bad ws_ech")
+                    obj["ws_ech"] = ech
             edge = str(d.get("edge_ip") or "").strip()   # CDN edge the client dials instead of the origin
             if edge:
                 host = edge.rpartition(":")[0] or edge
