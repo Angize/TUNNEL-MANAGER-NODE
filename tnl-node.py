@@ -127,8 +127,10 @@ def derive_tunnel_ip(ttype, local_ip, remote_ip, subnet):
     prefix = parts[1] if len(parts) > 1 else ("64" if ttype == "sit" else "24")   # never IndexError on a prefix-less subnet
     host = "1" if ip2int(local_ip) < ip2int(remote_ip) else "2"
     if ttype == "sit":
-        base = base[:-2] if base.endswith("::") else base.rstrip(":")
-        return f"{base}::{host}/{prefix}"
+        # build the host address with ipaddress so full-form / non-'::'-terminated v6 subnets
+        # don't yield a malformed double-'::' string that `ip -6 addr add` silently rejects
+        net = ipaddress.ip_network(f"{base}/{prefix}", strict=False)
+        return f"{net.network_address + int(host)}/{net.prefixlen}"
     return f"{base.rsplit('.', 1)[0]}.{host}/{prefix}"
 
 # ----------------------------------------------------------------------------- config IO
@@ -639,8 +641,8 @@ def build_core(cfg):
     run(["systemd-run", "--unit", unit, "--collect",
          "-p", "Restart=always", "-p", "RestartSec=3",
          CORE_BIN, "--config", path])
-    for _ in range(30):          # core opens the TUN a beat after systemd-run returns
-        if run(["ip", "link", "show", name])[0] == 0:
+    for _ in range(80):          # up to 8s: must exceed RestartSec=3 so one restart cycle
+        if run(["ip", "link", "show", name])[0] == 0:   # (a slow/first-launch core) isn't misread as failure
             break
         time.sleep(0.1)
 
@@ -778,9 +780,22 @@ def build_portfw(cfg):
                     + ["-j", "DNAT", "--to-destination", f"{ip}:{dp}"])
         run(["iptables", "-t", "nat", "-A", "PREROUTING"] + match
             + ["-j", "DNAT", "--to-destination", f"{active}:{dp}"])
-    rc, _, _ = run(["iptables", "-t", "nat", "-C", "POSTROUTING", "-o", iface, "-j", "MASQUERADE"])
-    if rc != 0:
-        run(["iptables", "-t", "nat", "-A", "POSTROUTING", "-o", iface, "-j", "MASQUERADE"])
+    for proto in ("tcp", "udp"):   # SNAT ONLY the forwarded flow (dst+port), not all egress on the iface
+        for ip in ips:             # flush every candidate first so a rotation leaves no stale masq rule
+            for _ in range(64):
+                rc, _, _ = run(["iptables", "-t", "nat", "-C", "POSTROUTING", "-d", ip, "-p", proto,
+                               "--dport", dp, "-o", iface, "-j", "MASQUERADE"])
+                if rc != 0:
+                    break
+                run(["iptables", "-t", "nat", "-D", "POSTROUTING", "-d", ip, "-p", proto,
+                    "--dport", dp, "-o", iface, "-j", "MASQUERADE"])
+        run(["iptables", "-t", "nat", "-A", "POSTROUTING", "-d", active, "-p", proto,
+            "--dport", dp, "-o", iface, "-j", "MASQUERADE"])
+    for _ in range(16):   # remove any legacy broad `-o iface MASQUERADE` this forward may have left (now per-flow)
+        rc, _, _ = run(["iptables", "-t", "nat", "-C", "POSTROUTING", "-o", iface, "-j", "MASQUERADE"])
+        if rc != 0:
+            break
+        run(["iptables", "-t", "nat", "-D", "POSTROUTING", "-o", iface, "-j", "MASQUERADE"])
     _pf_acct_build(cfg)   # idempotent byte counters (rx/tx) that survive rotation
 
 
@@ -850,13 +865,17 @@ def teardown_config(cfg):
                             break
                         run(["iptables", "-t", "nat", "-D", "PREROUTING"] + match
                             + ["-j", "DNAT", "--to-destination", f"{ip}:{dp}"])
-            rc, out, _ = run(["iptables", "-t", "nat", "-S", "PREROUTING"])
-            if not [l for l in out.splitlines() if re.search(rf"-i {re.escape(iface)} -p (?:tcp|udp) .*-j DNAT", l)]:
-                for _ in range(16):
-                    rc, _, _ = run(["iptables", "-t", "nat", "-C", "POSTROUTING", "-o", iface, "-j", "MASQUERADE"])
-                    if rc != 0:
-                        break
-                    run(["iptables", "-t", "nat", "-D", "POSTROUTING", "-o", iface, "-j", "MASQUERADE"])
+            for proto in ("tcp", "udp"):   # remove the per-flow MASQUERADE rules this forward installed
+                for ip in cfg.get("dst_ips", []):   # (each is scoped to its own dst+port, so no cross-forward guard needed)
+                    if not is_ipv4(ip):
+                        continue
+                    for _ in range(64):
+                        rc, _, _ = run(["iptables", "-t", "nat", "-C", "POSTROUTING", "-d", ip, "-p", proto,
+                                       "--dport", dp, "-o", iface, "-j", "MASQUERADE"])
+                        if rc != 0:
+                            break
+                        run(["iptables", "-t", "nat", "-D", "POSTROUTING", "-d", ip, "-p", proto,
+                            "--dport", dp, "-o", iface, "-j", "MASQUERADE"])
 
 
 def apply_all():
@@ -932,9 +951,18 @@ def health_of(cfg, thorough=False):
         active = ips[idx] if ips else ""
         rule = False
         if active and IFACE_RE.match(iface) and lp.isdigit() and dp.isdigit():
-            rc, _, _ = run(["iptables", "-t", "nat", "-C", "PREROUTING", "-i", iface, "-p", "tcp",
-                            "--dport", lp, "-j", "DNAT", "--to-destination", f"{active}:{dp}"])
-            rule = rc == 0
+            # Check the SAME rules build_portfw installs: BOTH protocols, and the -d listen_ip
+            # pin (via _pf_match). Hand-rolling the match with just "-p tcp" and no -d meant a
+            # listen_ip-pinned forward's -C never matched, so it was reported DOWN forever even
+            # while it carried traffic (and the udp DNAT was never verified at all).
+            rule = True
+            for proto in ("tcp", "udp"):
+                match = _pf_match(cfg, iface, proto, lp)
+                rc, _, _ = run(["iptables", "-t", "nat", "-C", "PREROUTING"] + match
+                               + ["-j", "DNAT", "--to-destination", f"{active}:{dp}"])
+                if rc != 0:
+                    rule = False
+                    break
         reachable = False
         if active and dp.isdigit():
             try:
@@ -946,7 +974,8 @@ def health_of(cfg, thorough=False):
                 reachable = False
         return {"active": active, "rule": rule, "reachable": reachable, "up": rule}
     up = False
-    rc, _, _ = run(["ip", "link", "show", name])   # every type is now a plain kernel netdev
+    with _apply_lock:  # serialize with a rebuild (mutations hold this) so we don't read the brief
+        rc, _, _ = run(["ip", "link", "show", name])   # mid-teardown gap as a transient false 'down'
     if rc == 0:
         up = True
     ping = None
@@ -1155,15 +1184,68 @@ _SELF_SHA = _self_sha()
 
 # ----------------------------------------------------------------------------- central check-in
 # The panel reaches us at host:port (from its registry). If our public IP changes, the panel can no
-# longer find us — so we phone home. We learn the panel's address purely from its INCOMING requests
-# (it stamps X-Central-Port; the source IP is the address it reached us from), never at install time.
+# longer find us — so we phone home. We learn the panel's callback from its INCOMING requests (it
+# stamps X-Central-Port; the source IP is where it reached us from). Because our check-in POSTs the
+# node's bearer token, we must NOT hand that callback to just any authenticated caller: the source IP
+# is bound to the panel — pinned on first contact (persisted to node.conf) or set explicitly via
+# `central_allow` — so a stolen/shared token replayed from another host cannot redirect our token.
 # When our IP set changes we POST /api/checkin so the panel can fix our host and heal the tunnels.
+
+def _ip_in_allow(ip, allow):
+    """True if ip matches any host/CIDR in `allow` (a str list or a comma/space-separated string)."""
+    if isinstance(allow, str):
+        allow = re.split(r"[,\s]+", allow.strip())
+    try:
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    for entry in allow or []:
+        entry = str(entry).strip()
+        if not entry:
+            continue
+        try:
+            if "/" in entry:
+                if a in ipaddress.ip_network(entry, strict=False):
+                    return True
+            elif a == ipaddress.ip_address(entry):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _central_ip_ok(ip):
+    """Gate which source IP may become our check-in callback. An explicit `central_allow`
+    (host/CIDR list) in node.conf wins; otherwise the panel IP is pinned on first contact and
+    persisted, so a later token-bearing request from a DIFFERENT host cannot hijack the callback
+    and exfiltrate our token."""
+    try:
+        conf = load_conf()
+    except Exception:
+        return False
+    allow = conf.get("central_allow")
+    if allow:
+        return _ip_in_allow(ip, allow)
+    pinned = conf.get("central_ip")
+    if pinned:
+        return ip == pinned
+    try:                       # trust-on-first-use: remember the first panel IP we ever learn
+        conf["central_ip"] = ip
+        save_conf(conf)
+    except Exception:
+        pass
+    return True
+
 
 def note_central(ip, port):
     global _central_cb
     try:
         p = int(port)
     except (TypeError, ValueError):
+        return
+    if not (1 <= p <= 65535):  # X-Central-Port is fully attacker-controlled — bound it
+        return
+    if not _central_ip_ok(ip):
         return
     with _central_cb_lock:
         _central_cb = (ip, p)
@@ -1295,6 +1377,8 @@ def op_tunnel(d):
                 obj["ws_host"] = wh
             wp = str(d.get("ws_path") or "").strip()
             if wp:
+                if len(wp) > 1024 or not re.match(r"^/[\x21-\x7e]*$", wp):   # start with /, printable, no CR/LF/space/ctrl
+                    raise ValueError("bad ws_path")
                 obj["ws_path"] = wp
             if bool(d.get("ws_tls")):
                 obj["ws_tls"] = True
@@ -1352,6 +1436,8 @@ def op_tunnel(d):
             obj["cover"] = True
             sni = str(d.get("cover_sni") or "").strip()
             if sni:
+                if not re.match(r"^[A-Za-z0-9.-]{1,253}$", sni):   # hostname charset, like ws_host
+                    raise ValueError("bad cover_sni")
                 obj["cover_sni"] = sni
         if bool(d.get("gso")):        # TUN segmentation offload (throughput); Linux only, harmless if unsupported
             obj["gso"] = True
@@ -1372,31 +1458,41 @@ def op_tunnel(d):
     if old and old.get("type") != "portfw":   # now-overwritten field (e.g. FOU's old UDP-port decap listener) leaks
         teardown_config(old)
     write_config(name, obj)
+
+    def _fail(msg):
+        # The new build failed. Tear it down, then ROLL BACK to the previously-working config
+        # instead of deleting the tunnel outright: a transient build/verify blip (e.g. a core
+        # cold-start slower than the TUN wait) must not permanently destroy a tunnel that was
+        # healthy before this edit. Only drop the file if there was no prior build to restore,
+        # or the restore itself also fails.
+        teardown_config(obj)
+        if old and old.get("type") != "portfw" and NAME_RE.match(old.get("name", "")):
+            write_config(name, old)
+            try:
+                apply_config(old)
+            except Exception:
+                pass
+            if run(["ip", "link", "show", name])[0] == 0:
+                return {"ok": False, "msg": msg, "restored": True}
+        try:
+            os.remove(os.path.join(CONFIG_DIR, name + ".json"))
+        except OSError:
+            pass
+        return {"ok": False, "msg": msg, "restored": False}
+
     try:
         apply_config(obj)
     except Exception as e:
-        # apply blew up (e.g. core download/checksum failure): the old build is
-        # already gone and this config was just written, so undo the partial build
-        # and drop the file — otherwise it lingers, inflates op_ping/op_list counts,
-        # and gets retried on every boot via apply_all. Mirrors the rc!=0 cleanup.
-        teardown_config(obj)
-        try:
-            os.remove(os.path.join(CONFIG_DIR, name + ".json"))
-        except OSError:
-            pass
-        return {"ok": False, "msg": str(e)}
+        # apply blew up (e.g. core download/checksum failure): the old build is already gone
+        # and this config was just written, so undo the partial build and restore the old one.
+        return _fail(str(e))
     # builds run `ip` via run() which never raises on failure, so verify the netdev really exists
     rc, _, _ = run(["ip", "link", "show", name])   # every type is a plain kernel netdev now
     if rc != 0:
-        teardown_config(obj)
-        try:
-            os.remove(os.path.join(CONFIG_DIR, name + ".json"))
-        except OSError:
-            pass
         need = {"vxlan": "vxlan", "gre": "ip_gre", "sit": "sit", "ipip": "ipip",
                 "l2tpv3": "l2tp_eth", "fou": "fou و ipip", "ipsec": "xfrm_interface",
                 "core": "هستهٔ tnl-core"}[ttype]
-        return {"ok": False, "msg": f"اینترفیسِ {ttype} ساخته نشد — «{need}» روی این نود نصب/فعال نیست"}
+        return _fail(f"اینترفیسِ {ttype} ساخته نشد — «{need}» روی این نود نصب/فعال نیست")
     return {"ok": True, "name": name, "tunnel_ip": tunnel_ip}
 
 
@@ -1646,6 +1742,61 @@ CORE_VER_RE = re.compile(r"^(?!.*\.\.)[A-Za-z0-9._-]{1,40}$")  # negative-lookah
 CORE_SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
+def _verify_update_sig(msg, sig_b64):
+    """Verify an RSA-SHA256 signature (base64) over `msg` (bytes) with the panel PUBLIC key stored in
+    node.conf['update_pubkey'], via openssl. Returns True when NO key is provisioned yet (legacy /
+    pre-rollout node — behave exactly as before) or the signature verifies; False when a key IS set but
+    the signature is missing/invalid. This is what stops a stolen token from pushing malicious root code:
+    only the panel (holding the matching private key) can produce a valid signature. Callers run under
+    _apply_lock, so the fixed temp paths below are never used concurrently."""
+    try:
+        pub = str(load_conf().get("update_pubkey") or "").strip()
+    except Exception:
+        return False
+    if not pub:
+        return True   # backward-compat: node not yet provisioned with a key -> accept unsigned as before
+    if not sig_b64:
+        return False
+    try:
+        sig = base64.b64decode(sig_b64, validate=True)
+    except Exception:
+        return False
+    kp, sp = os.path.join(CONFIG_DIR, ".upd_pub.pem"), os.path.join(CONFIG_DIR, ".upd_sig.bin")
+    try:
+        with open(kp, "w") as f:
+            f.write(pub)
+        with open(sp, "wb") as f:
+            f.write(sig)
+        p = subprocess.run(["openssl", "dgst", "-sha256", "-verify", kp, "-signature", sp],
+                           input=msg, capture_output=True)
+        return p.returncode == 0 and b"Verified OK" in (p.stdout or b"")
+    except Exception:
+        return False
+    finally:
+        for pth in (kp, sp):
+            try:
+                os.remove(pth)
+            except OSError:
+                pass
+
+
+def op_set_update_key(d):
+    """Provision the panel's update-signing PUBLIC key (PEM). FIRST-SET ONLY: once a key is stored it
+    can only be changed by re-installing over SSH — so a token holder can't swap in their own key and
+    then sign malicious updates. Idempotent when the identical key is re-sent."""
+    pub = str(d.get("pubkey") or "").strip()
+    if "PUBLIC KEY" not in pub or len(pub) > 8192:
+        raise ValueError("bad pubkey")
+    conf = load_conf()
+    cur = str(conf.get("update_pubkey") or "").strip()
+    if cur and cur != pub:
+        return {"ok": False, "msg": "update key already set (re-provision over SSH to change)"}
+    if not cur:
+        conf["update_pubkey"] = pub
+        save_conf(conf)
+    return {"ok": True, "already": bool(cur)}
+
+
 def op_core_install(d):
     """Install a raw core binary pushed from the panel (base64), not a published release. Verify its
     sha256, swap it in atomically, pin the node to a custom label, then rebuild the core tunnels so they
@@ -1663,6 +1814,8 @@ def op_core_install(d):
     got = hashlib.sha256(raw).hexdigest()
     if got != want:
         return {"ok": False, "msg": "checksum mismatch"}   # transport truncation guard — never install unverified bytes
+    if not _verify_update_sig(want.encode(), d.get("sig")):   # authenticity: only the panel's key may authorize a root binary
+        return {"ok": False, "msg": "signature verification failed (panel key)"}
     label = str(d.get("version") or "custom").strip() or "custom"
     if not CORE_VER_RE.match(label):
         label = "custom"
@@ -1711,6 +1864,8 @@ def op_update(d):
     h = hashlib.sha256(src.encode()).hexdigest()
     if d.get("sha256") and d["sha256"] != h:            # transport truncation guard (a truncated prefix could still compile)
         return {"ok": False, "msg": "checksum mismatch"}
+    if not _verify_update_sig(h.encode(), d.get("sig")):   # authenticity: only the panel's key may authorize new agent code
+        return {"ok": False, "msg": "signature verification failed (panel key)"}
     if h == _SELF_SHA:                                   # already running this exact code -> no-op, do NOT restart
         return {"ok": True, "sha256": h, "restarting": False, "already": True}
     try:
@@ -1778,6 +1933,7 @@ OPS = {"ping": op_ping, "list": op_list, "check": op_check, "tunnel": op_tunnel,
        "delete": op_delete, "apply": op_apply, "update": op_update, "wipe": op_wipe,
        "portcheck": op_portcheck,
        "core-install": op_core_install, "spoof-probe": op_spoof_probe,
+       "set-update-key": op_set_update_key,
        "link-enable": op_link_enable}
 READ_ONLY = {"ping", "list", "check", "portcheck", "spoof-probe"}
 
