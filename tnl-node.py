@@ -1501,11 +1501,14 @@ def op_tunnel(d):
         teardown_config(obj)
         if old and old.get("type") != "portfw" and NAME_RE.match(old.get("name", "")):
             write_config(name, old)
+            restored = True
             try:
                 apply_config(old)
             except Exception:
-                pass
-            if run(["ip", "link", "show", name])[0] == 0:
+                restored = False
+            # A disabled tunnel legitimately has no netdev, so its restore succeeds as long as
+            # apply_config didn't throw; only require the netdev to exist when it should be UP.
+            if restored and (not old.get("enabled", True) or run(["ip", "link", "show", name])[0] == 0):
                 return {"ok": False, "msg": msg, "restored": True}
         try:
             os.remove(os.path.join(CONFIG_DIR, name + ".json"))
@@ -1519,6 +1522,12 @@ def op_tunnel(d):
         # apply blew up (e.g. core download/checksum failure): the old build is already gone
         # and this config was just written, so undo the partial build and restore the old one.
         return _fail(str(e))
+    # A tunnel the operator turned OFF has its data path down BY DESIGN — for a core tunnel that
+    # means apply_config stopped the unit and its non-persistent TUN is absent, so a netdev-exists
+    # check would read as a build failure and _fail would delete the (perfectly good) config. Skip
+    # the check for a disabled tunnel: a successful apply_config IS the success signal here.
+    if not obj.get("enabled", True):
+        return {"ok": True, "name": name, "tunnel_ip": tunnel_ip}
     # builds run `ip` via run() which never raises on failure, so verify the netdev really exists
     rc, _, _ = run(["ip", "link", "show", name])   # every type is a plain kernel netdev now
     if rc != 0:
@@ -1872,6 +1881,8 @@ def op_core_install(d):
     restarted, errs = 0, []
     for c in raw_configs():                        # relaunch every core tunnel on the freshly-installed binary
         if c.get("type") == "core":
+            if not c.get("enabled", True):
+                continue                           # a tunnel the operator turned OFF stays down — an install must not silently re-enable it
             try:
                 build_core(c)
                 restarted += 1
