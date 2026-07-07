@@ -552,7 +552,7 @@ def _core_config(cfg):
         "tun_addr": cfg["tunnel_ip"],
         "tun_peer": peer_of(cfg["tunnel_ip"], "core"),
         "mtu": mtu,
-        "keepalive": 15,
+        "keepalive": max(5, min(120, int(cfg.get("keepalive") or 15))),   # honor a configured value (clamped 5..120s); 15 default
         "crypto": {"enabled": crypto_on, "psk": cfg.get("psk", ""), "cipher": cipher},
     }
     # TLS cover (HTTPS camouflage) — TCP only; carries an optional SNI to present.
@@ -1365,6 +1365,8 @@ def op_tunnel(d):
            "remote_ip": peer_ip, "tunnel_ip": tunnel_ip, "local_ip": self_ip}
     _prev = read_config(name)   # preserve the operator's on/off across a rebuild that doesn't restate it
     obj["enabled"] = _as_bool(d.get("enabled", (_prev or {}).get("enabled", True)))
+    if ttype == "core" and d.get("keepalive") not in (None, ""):   # optional; whitelist so a set value survives (else _core_config falls back to 15)
+        obj["keepalive"] = max(5, min(120, int(d["keepalive"])))
     if ttype in ("l2tpv3", "fou", "core", "vxlan"):   # optional UDP port; l2tp/fou/core blank->from id, vxlan blank->4789
         if d.get("port") not in (None, ""):
             port = int(d["port"])
