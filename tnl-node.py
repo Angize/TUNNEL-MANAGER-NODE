@@ -1235,6 +1235,10 @@ def _central_ip_ok(ip):
     (host/CIDR list) in node.conf wins; otherwise the panel IP is pinned on first contact and
     persisted, so a later token-bearing request from a DIFFERENT host cannot hijack the callback
     and exfiltrate our token."""
+    # Fast, LOCK-FREE read path — runs for EVERY request (incl. read-only ping/list). Only the
+    # rare first-contact TOFU write needs _apply_lock; never take it on the steady-state path,
+    # or a slow core build (holding _apply_lock ~8-16s) would make every health ping block and
+    # the panel read the node as down mid-build.
     try:
         conf = load_conf()
     except Exception:
@@ -1245,12 +1249,25 @@ def _central_ip_ok(ip):
     pinned = conf.get("central_ip")
     if pinned:
         return ip == pinned
-    try:                       # trust-on-first-use: remember the first panel IP we ever learn
-        conf["central_ip"] = ip
-        save_conf(conf)
-    except Exception:
-        pass
-    return True
+    # No pin yet: a persist IS required. Take _apply_lock only now and RE-CHECK under it (a
+    # concurrent request may have pinned meanwhile) so we can't lose a write / clobber a peer's.
+    with _apply_lock:
+        try:
+            conf = load_conf()
+        except Exception:
+            return False
+        allow = conf.get("central_allow")
+        if allow:
+            return _ip_in_allow(ip, allow)
+        pinned = conf.get("central_ip")
+        if pinned:
+            return ip == pinned
+        try:                   # trust-on-first-use: remember the first panel IP we ever learn
+            conf["central_ip"] = ip
+            save_conf(conf)
+        except Exception:
+            pass
+        return True
 
 
 def note_central(ip, port):
@@ -1261,11 +1278,10 @@ def note_central(ip, port):
         return
     if not (1 <= p <= 65535):  # X-Central-Port is fully attacker-controlled — bound it
         return
-    # _central_ip_ok does a load_conf/modify/save_conf (TOFU pin). op_core_install / op_set_update_key do
-    # the same under _apply_lock; take it here too so a concurrent interleave can't lose one side's write.
-    with _apply_lock:
-        ok = _central_ip_ok(ip)
-    if not ok:
+    # _central_ip_ok is lock-free on the common read path and takes _apply_lock ITSELF only for the
+    # rare first-contact TOFU write (re-checking under the lock to stay race-safe). Don't wrap it here,
+    # or every request — including read-only pings — would serialize behind a long core build.
+    if not _central_ip_ok(ip):
         return
     with _central_cb_lock:
         _central_cb = (ip, p)
