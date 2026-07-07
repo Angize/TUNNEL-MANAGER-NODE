@@ -107,6 +107,13 @@ def is_ipv4(s):
         return False
 
 
+def _as_bool(v):
+    """Coerce an API value to a real bool WITHOUT the bool("false")==True trap: genuine JSON
+    booleans pass through (True stays True, False/None stay False) and a stringly-typed flag only
+    counts as True for an explicit truthy token. Use for every security/toggle flag read off the wire."""
+    return v is True or (isinstance(v, str) and v.strip().lower() in ("1", "true", "yes", "on"))
+
+
 def valid_cidr(s, want6):
     if "/" not in str(s):   # a bare IP has no prefix: ip_network() treats it as /32, but derive_tunnel_ip needs the slash
         return False
@@ -265,9 +272,12 @@ def primary_ip():
     return None
 
 
-def base_mtu():
-    dev = default_iface()
-    if dev:
+def base_mtu(dev=None):
+    """MTU of the underlay a tunnel egresses on. Pass the tunnel's own `iface` to sample THAT link
+    (PPPoE 1492 / IPv6-min 1280 uplinks differ from the default route); no arg falls back to the
+    default-route iface as before."""
+    dev = dev or default_iface()
+    if dev and IFACE_RE.match(dev):
         rc, out, _ = run(["ip", "link", "show", dev])
         m = re.search(r"\bmtu (\d+)", out)
         if m:
@@ -515,10 +525,11 @@ def _core_config(cfg):
         outer = 40 + 14        # IP20 + TCP20 + up to a 14-byte WebSocket frame header
     else:
         outer = 40 if transport == "tcp" else 28        # IP20 + TCP20 | IP20 + UDP8
+    stream = transport in ("tcp", "ws")   # ws is TCP-family: length-prefixed frames, same 2-byte prefix as tcp
     if obfs:
-        framing = (2 if transport == "tcp" else 0) + 3 + OBFS_DATA_PAD_MAX  # masked-len + [type,len] + max pad
+        framing = (2 if stream else 0) + 3 + OBFS_DATA_PAD_MAX  # masked-len + [type,len] + max pad
     else:
-        framing = 4 if transport == "tcp" else 2        # (len)+magic+type | magic+type
+        framing = 4 if stream else 2        # (len)+magic+type | magic+type
     overhead = outer + framing
     if crypto_on:
         # AEAD nonce+tag, plus the 12-byte per-frame mask salt the core prepends (v2 wire).
@@ -527,7 +538,10 @@ def _core_config(cfg):
     # shard-len to every data shard, so it costs 13 bytes of usable payload per packet.
     if transport in ("udp", "raw", "flux") and bool(cfg.get("fec")):
         overhead += 13
-    mtu = max(1280, base_mtu() - overhead)
+    # The TUN MTU must never EXCEED the carrier budget, or datagram carriers fragment/black-hole on a
+    # small underlay (PPPoE 1492 / IPv6-min 1280): floor 1280 could hand out MORE than base-overhead.
+    # Sample the tunnel's own egress iface, and clamp only at a safe small minimum, never raising above budget.
+    mtu = max(576, base_mtu(cfg.get("iface")) - overhead)
     ecfg = {
         "role": cfg.get("role"),
         "mode": "packet",
@@ -566,7 +580,9 @@ def _core_config(cfg):
             ecfg["ws_host"] = str(cfg["ws_host"])
         if cfg.get("ws_path"):
             ecfg["ws_path"] = str(cfg["ws_path"])
-        if bool(cfg.get("ws_tls")):
+        # Only the CLIENT speaks wss (TLS to the CDN edge); the server stays plain — the CDN
+        # terminates TLS and forwards the WebSocket to the origin. Never emit ws_tls server-side.
+        if bool(cfg.get("ws_tls")) and cfg.get("role") == "client":
             ecfg["ws_tls"] = True
     # FEC (forward error correction): reconstructs lost carrier datagrams from parity so a
     # throttled/high-loss link stays usable. Datagram carriers only (udp/raw/flux) — on
@@ -1245,7 +1261,11 @@ def note_central(ip, port):
         return
     if not (1 <= p <= 65535):  # X-Central-Port is fully attacker-controlled — bound it
         return
-    if not _central_ip_ok(ip):
+    # _central_ip_ok does a load_conf/modify/save_conf (TOFU pin). op_core_install / op_set_update_key do
+    # the same under _apply_lock; take it here too so a concurrent interleave can't lose one side's write.
+    with _apply_lock:
+        ok = _central_ip_ok(ip)
+    if not ok:
         return
     with _central_cb_lock:
         _central_cb = (ip, p)
@@ -1344,7 +1364,7 @@ def op_tunnel(d):
     obj = {"name": name, "type": ttype, "id": tid, "iface": iface,
            "remote_ip": peer_ip, "tunnel_ip": tunnel_ip, "local_ip": self_ip}
     _prev = read_config(name)   # preserve the operator's on/off across a rebuild that doesn't restate it
-    obj["enabled"] = bool(d.get("enabled", (_prev or {}).get("enabled", True)))
+    obj["enabled"] = _as_bool(d.get("enabled", (_prev or {}).get("enabled", True)))
     if ttype in ("l2tpv3", "fou", "core", "vxlan"):   # optional UDP port; l2tp/fou/core blank->from id, vxlan blank->4789
         if d.get("port") not in (None, ""):
             port = int(d["port"])
@@ -1380,8 +1400,12 @@ def op_tunnel(d):
                 if len(wp) > 1024 or not re.match(r"^/[\x21-\x7e]*$", wp):   # start with /, printable, no CR/LF/space/ctrl
                     raise ValueError("bad ws_path")
                 obj["ws_path"] = wp
-            if bool(d.get("ws_tls")):
+            if _as_bool(d.get("ws_tls")):
                 obj["ws_tls"] = True
+                # The core rejects ws_tls on a client without ws_host (it is the TLS SNI / fronting
+                # domain); catch it here with a precise error instead of a late "interface not created".
+                if role == "client" and not obj.get("ws_host"):
+                    raise ValueError("ws_tls به ws_host نیاز دارد (SNI/دامنهٔ فرانت‌کننده)")
             edge = str(d.get("edge_ip") or "").strip()   # CDN edge the client dials instead of the origin
             if edge:
                 host = edge.rpartition(":")[0] or edge
@@ -1410,7 +1434,7 @@ def op_tunnel(d):
         # FEC (forward error correction) — repairs lost carrier datagrams from parity, on the
         # datagram carriers only (udp/raw/flux). Persisting these in the whitelist is mandatory:
         # an un-whitelisted key is silently dropped from the stored config and never reaches the core.
-        if transport in ("udp", "raw", "flux") and bool(d.get("fec")):
+        if transport in ("udp", "raw", "flux") and _as_bool(d.get("fec")):
             obj["fec"] = True
             fd = int(d.get("fec_data") or 10)
             fp = int(d.get("fec_parity") or 3)
@@ -1423,7 +1447,7 @@ def op_tunnel(d):
             if len(psk) < 16:
                 raise ValueError("core psk too short (>=16)")
             obj["psk"] = psk          # popped from public_configs, so it never leaves the node
-        obfs = bool(d.get("obfs"))    # anti-DPI: needs the AEAD key, so a psk (and a real cipher) is required
+        obfs = _as_bool(d.get("obfs"))    # anti-DPI: needs the AEAD key, so a psk (and a real cipher) is required
         if obfs and (not psk or cipher == "none"):
             raise ValueError("obfs requires a psk and encryption")
         obj["obfs"] = obfs
@@ -1431,15 +1455,22 @@ def op_tunnel(d):
         # decode with the AEAD, so crypto is mandatory — reject early rather than let the core fail.
         if transport == "flux" and (not psk or cipher == "none"):
             raise ValueError("flux requires a psk and encryption")
+        # The raw transport authenticates+encrypts every raw IP packet with the AEAD, so the core
+        # rejects it without crypto; validate here so the failure is precise, not "interface not created".
+        if transport == "raw" and (not psk or cipher == "none"):
+            raise ValueError("ترنسپورت raw به رمزنگاری (psk) نیاز دارد — هر فریم با AEAD رمز و احراز می‌شود")
         # TLS cover (HTTPS camouflage) — persist it so _core_config can forward it to the core.
-        if bool(d.get("cover")) and transport == "tcp":
+        if _as_bool(d.get("cover")) and transport == "tcp":
             obj["cover"] = True
             sni = str(d.get("cover_sni") or "").strip()
-            if sni:
-                if not re.match(r"^[A-Za-z0-9.-]{1,253}$", sni):   # hostname charset, like ws_host
-                    raise ValueError("bad cover_sni")
-                obj["cover_sni"] = sni
-        if bool(d.get("gso")):        # TUN segmentation offload (throughput); Linux only, harmless if unsupported
+            # The core rejects cover without a cover_sni (the SNI it presents / borrows a real cert for),
+            # so require it up front rather than fail later with the generic "interface not created".
+            if not sni:
+                raise ValueError("پوشش TLS به cover_sni نیاز دارد (نام دامنه‌ای که ارائه می‌شود)")
+            if not re.match(r"^[A-Za-z0-9.-]{1,253}$", sni):   # hostname charset, like ws_host
+                raise ValueError("bad cover_sni")
+            obj["cover_sni"] = sni
+        if _as_bool(d.get("gso")):        # TUN segmentation offload (throughput); Linux only, harmless if unsupported
             obj["gso"] = True
         # IP spoofing (raw bip only): persist the forged source and/or decoy destination so _core_config
         # can wire them per role. Without this the fields never reach the stored cfg and spoofing is a no-op.
@@ -1633,7 +1664,7 @@ def op_link_enable(d):
     name = d["name"]
     if not NAME_RE.match(name):
         raise ValueError("bad name")
-    enabled = bool(d.get("enabled", True))
+    enabled = _as_bool(d.get("enabled", True))
     cfg = read_config(name)
     if not cfg or cfg.get("type") == "portfw":
         return {"ok": True, "already": True}   # nothing to toggle (idempotent)
@@ -1946,6 +1977,36 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
+    # MAX_CONNS is enforced at the CONNECTION level (here), not per parsed request: ThreadingHTTPServer
+    # spawns a thread per accepted TCP connection BEFORE any header is read, so a slowloris dribbling
+    # headers used to tie up threads bounded only by the 30s socket timeout. We try-acquire _conn_sem the
+    # moment the connection is set up; if the cap is already reached we refuse instantly in handle()
+    # (no header read at all), so the thread exits immediately and can never be pinned by a slow client.
+    def setup(self):
+        BaseHTTPRequestHandler.setup(self)
+        self._sem_held = _conn_sem.acquire(blocking=False)
+
+    def finish(self):
+        try:
+            BaseHTTPRequestHandler.finish(self)
+        finally:
+            if getattr(self, "_sem_held", False):
+                _conn_sem.release()
+                self._sem_held = False
+
+    def handle(self):
+        if not getattr(self, "_sem_held", False):   # over the connection cap → refuse without reading headers
+            try:
+                body = b'{"error":"server busy, retry shortly"}'
+                self.wfile.write(b"HTTP/1.1 503 Service Unavailable\r\n"
+                                 b"Content-Type: application/json\r\n"
+                                 b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+                                 b"Connection: close\r\n\r\n" + body)
+            except Exception:
+                pass
+            return
+        BaseHTTPRequestHandler.handle(self)   # normal (keep-alive) request loop, holding one permit
+
     def _authed(self):
         tok = self.headers.get("X-Node-Token", "")
         want = self.server.conf.get("token", "")
@@ -1981,16 +2042,9 @@ class Handler(BaseHTTPRequestHandler):
         return obj if isinstance(obj, dict) else {}   # a top-level array/string/number must not reach ops as non-dict
 
     def _handle(self, method):
-        if not _conn_sem.acquire(blocking=False):   # too many in-flight handlers → shed load instead of spawning unbounded root threads
-            try:
-                self._send(503, {"error": "server busy, retry shortly"})
-            except Exception:
-                pass
-            return
-        try:
-            self._handle_locked(method)
-        finally:
-            _conn_sem.release()
+        # The _conn_sem permit is already held for the whole connection (see setup()/handle()), so the
+        # number of connections that ever reach here is bounded — no per-request acquire needed.
+        self._handle_locked(method)
 
     def _handle_locked(self, method):
         path = self.path.split("?", 1)[0]
