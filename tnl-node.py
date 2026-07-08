@@ -591,6 +591,20 @@ def _core_config(cfg):
             ech = str(cfg.get("ws_ech") or "").strip()
             if ech:
                 ecfg["ws_ech"] = ech
+            # Edge pool: the panel sends clean edge-IP + SNI lists (each SNI with its own
+            # ECH/path) plus the rotation settings. A non-empty pool overrides the single
+            # ws_host/ws_ech/edge above — the core cycles (IP × SNI) and burns blocked ones,
+            # writing its live state to a status file we expose back to the panel.
+            ips = [str(x).strip() for x in (cfg.get("ws_edge_ips") or []) if str(x).strip()]
+            snis = [s for s in (cfg.get("ws_edge_snis") or []) if isinstance(s, dict) and str(s.get("host") or "").strip()]
+            if ips and snis:
+                ecfg["ws_edge_ips"] = ips
+                ecfg["ws_edge_snis"] = [{"host": str(s["host"]).strip(),
+                                         "ech": str(s.get("ech") or "").strip(),
+                                         "path": str(s.get("path") or "").strip()} for s in snis]
+                ecfg["ws_rotate_secs"] = int(cfg.get("ws_rotate_secs") or 600)
+                ecfg["ws_auto_burn"] = bool(cfg.get("ws_auto_burn"))
+                ecfg["ws_status_path"] = os.path.join(CONFIG_DIR, "core-" + name + ".status")
     # FEC (forward error correction): reconstructs lost carrier datagrams from parity so a
     # throttled/high-loss link stays usable. Datagram carriers only (udp/raw/flux) — on
     # tcp/ws it's wasted (TCP is already reliable), so it's only forwarded for those three.
@@ -1439,6 +1453,37 @@ def op_tunnel(d):
                     if len(ech) > 4096 or not re.match(r"^[A-Za-z0-9+/=]+$", ech):
                         raise ValueError("bad ws_ech")
                     obj["ws_ech"] = ech
+                # Edge pool: clean IP + SNI lists (each SNI {host,ech,path}) + rotation. Whitelist
+                # them so the rotation config survives (dropping = the pool silently collapses to
+                # the single edge). Validate every entry — these reach the core config verbatim.
+                pips = [str(x).strip() for x in (d.get("ws_edge_ips") or []) if str(x).strip()]
+                psnis = d.get("ws_edge_snis") or []
+                if pips or psnis:
+                    if len(pips) > 64 or len(psnis) > 64:
+                        raise ValueError("ws edge pool too large")
+                    for ip in pips:
+                        h = ip.rpartition(":")[0] or ip
+                        if not re.match(r"^[A-Za-z0-9.\-]{1,253}$", h):
+                            raise ValueError("bad ws_edge_ip")
+                    clean_snis = []
+                    for s in psnis:
+                        if not isinstance(s, dict):
+                            raise ValueError("bad ws_edge_sni")
+                        h = str(s.get("host") or "").strip()
+                        if not re.match(r"^[A-Za-z0-9.\-]{1,253}$", h):
+                            raise ValueError("bad ws_edge_sni host")
+                        se = str(s.get("ech") or "").strip()
+                        if se and (len(se) > 4096 or not re.match(r"^[A-Za-z0-9+/=]+$", se)):
+                            raise ValueError("bad ws_edge_sni ech")
+                        sp = str(s.get("path") or "").strip()
+                        if sp and (len(sp) > 1024 or not re.match(r"^/[\x21-\x7e]*$", sp)):
+                            raise ValueError("bad ws_edge_sni path")
+                        clean_snis.append({"host": h, "ech": se, "path": sp})
+                    if pips and clean_snis:
+                        obj["ws_edge_ips"] = pips
+                        obj["ws_edge_snis"] = clean_snis
+                        obj["ws_rotate_secs"] = max(0, min(28800, int(d.get("ws_rotate_secs") or 600)))
+                        obj["ws_auto_burn"] = _as_bool(d.get("ws_auto_burn"))
             edge = str(d.get("edge_ip") or "").strip()   # CDN edge the client dials instead of the origin
             if edge:
                 host = edge.rpartition(":")[0] or edge
@@ -1811,6 +1856,27 @@ def op_portcheck(d):
     return {"ok": True, "busy": busy, "who": who, "port": port, "proto": proto}
 
 
+def op_edge_status(d):
+    """READ_ONLY: return the ws edge pool's live status (active edge + auto-burned IP/SNI
+    lists) the core writes for tunnel {name}, so the panel can surface and persist the burns.
+    Empty status when the tunnel has no pool or the core hasn't written the file yet."""
+    _require(d, ["name"])
+    name = str(d["name"])
+    if not NAME_RE.match(name):
+        raise ValueError("bad name")
+    path = os.path.join(CONFIG_DIR, "core-" + name + ".status")
+    try:
+        with open(path) as f:
+            st = json.load(f)
+    except (OSError, ValueError):
+        return {"ok": True, "active": "", "burned_ips": [], "burned_snis": [], "ts": 0}
+    return {"ok": True,
+            "active": str(st.get("active") or ""),
+            "burned_ips": [str(x) for x in (st.get("burned_ips") or [])][:64],
+            "burned_snis": [str(x) for x in (st.get("burned_snis") or [])][:64],
+            "ts": int(st.get("ts") or 0)}
+
+
 CORE_VER_RE = re.compile(r"^(?!.*\.\.)[A-Za-z0-9._-]{1,40}$")  # negative-lookahead rejects any '..' → no path traversal in the release URL
 CORE_SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -2006,11 +2072,11 @@ def op_spoof_probe(d):
 OPS = {"ping": op_ping, "list": op_list, "check": op_check, "tunnel": op_tunnel,
        "portfw": op_portfw, "portfw-edit": op_portfw_edit, "portfw-next": op_portfw_next,
        "delete": op_delete, "apply": op_apply, "update": op_update, "wipe": op_wipe,
-       "portcheck": op_portcheck,
+       "portcheck": op_portcheck, "edge-status": op_edge_status,
        "core-install": op_core_install, "spoof-probe": op_spoof_probe,
        "set-update-key": op_set_update_key,
        "link-enable": op_link_enable}
-READ_ONLY = {"ping", "list", "check", "portcheck", "spoof-probe"}
+READ_ONLY = {"ping", "list", "check", "portcheck", "spoof-probe", "edge-status"}
 
 # ----------------------------------------------------------------------------- HTTP
 
