@@ -580,6 +580,13 @@ def _core_config(cfg):
             ecfg["ws_host"] = str(cfg["ws_host"])
         if cfg.get("ws_path"):
             ecfg["ws_path"] = str(cfg["ws_path"])
+        # xhttp mode: carry the stream over a GET(down)+POST(up) HTTP request pair instead
+        # of a WebSocket upgrade, so it passes a CDN/account that blocks WebSocket. Both
+        # roles need the flag (server serves the xhttp endpoint, client dials it); the same
+        # fronting fields (ws_host/ws_tls/ws_ech/ws_path) apply. Not combined with the pool.
+        xhttp = bool(cfg.get("ws_xhttp"))
+        if xhttp:
+            ecfg["ws_xhttp"] = True
         # Only the CLIENT speaks wss (TLS to the CDN edge); the server stays plain — the CDN
         # terminates TLS and forwards the WebSocket to the origin. Never emit ws_tls server-side.
         if bool(cfg.get("ws_tls")) and cfg.get("role") == "client":
@@ -597,7 +604,7 @@ def _core_config(cfg):
             # writing its live state to a status file we expose back to the panel.
             ips = [str(x).strip() for x in (cfg.get("ws_edge_ips") or []) if str(x).strip()]
             snis = [s for s in (cfg.get("ws_edge_snis") or []) if isinstance(s, dict) and str(s.get("host") or "").strip()]
-            if ips and snis:
+            if ips and snis and not xhttp:  # xhttp uses the single edge, never the pool
                 ecfg["ws_edge_ips"] = ips
                 ecfg["ws_edge_snis"] = [{"host": str(s["host"]).strip(),
                                          "ech": str(s.get("ech") or "").strip(),
@@ -1439,6 +1446,12 @@ def op_tunnel(d):
                 if len(wp) > 1024 or not re.match(r"^/[\x21-\x7e]*$", wp):   # start with /, printable, no CR/LF/space/ctrl
                     raise ValueError("bad ws_path")
                 obj["ws_path"] = wp
+            # xhttp mode (GET-down + POST-up instead of a WebSocket upgrade) — passes a CDN
+            # that blocks WebSocket. Independent of ws_tls (server side is plain HTTP either
+            # way); whitelist it here so it survives persistence (dropping = silently reverts
+            # to a plain WebSocket, which the WS-block rule then kills).
+            if _as_bool(d.get("ws_xhttp")):
+                obj["ws_xhttp"] = True
             if _as_bool(d.get("ws_tls")):
                 obj["ws_tls"] = True
                 # The core rejects ws_tls on a client without ws_host (it is the TLS SNI / fronting
