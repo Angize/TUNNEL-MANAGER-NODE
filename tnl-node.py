@@ -587,6 +587,13 @@ def _core_config(cfg):
         xhttp = bool(cfg.get("ws_xhttp"))
         if xhttp:
             ecfg["ws_xhttp"] = True
+            # xhttp upstream style: "packet" (packet-up, default — many short POSTs, most
+            # CDN-compatible) or "stream" (stream-one, a single full-duplex request that needs
+            # HTTP/2, hence ws_tls). Forward for both roles; the core server auto-detects the
+            # client's style per request but the client must be told which to use.
+            xmode = str(cfg.get("ws_xhttp_mode") or "").strip().lower()
+            if xmode in ("packet", "stream"):
+                ecfg["ws_xhttp_mode"] = xmode
         # Only the CLIENT speaks wss (TLS to the CDN edge); the server stays plain — the CDN
         # terminates TLS and forwards the WebSocket to the origin. Never emit ws_tls server-side.
         if bool(cfg.get("ws_tls")) and cfg.get("role") == "client":
@@ -1452,6 +1459,11 @@ def op_tunnel(d):
             # to a plain WebSocket, which the WS-block rule then kills).
             if _as_bool(d.get("ws_xhttp")):
                 obj["ws_xhttp"] = True
+                # xhttp upstream style: packet-up (default) or stream-one. Whitelist it so the
+                # choice survives persistence (dropping = silently reverts to packet-up).
+                xm = str(d.get("ws_xhttp_mode") or "").strip().lower()
+                if xm in ("packet", "stream"):
+                    obj["ws_xhttp_mode"] = xm
             if _as_bool(d.get("ws_tls")):
                 obj["ws_tls"] = True
                 # The core rejects ws_tls on a single-edge client without ws_host (it is the TLS
