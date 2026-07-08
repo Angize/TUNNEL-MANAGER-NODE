@@ -1972,6 +1972,27 @@ def op_pool_rotate(d):
     return {"ok": True}
 
 
+def op_pool_select(d):
+    """Live 'pin this edge' for a ws edge pool: drop a JSON command file the running core polls
+    (<status>.cmd) so it jumps its rotation to THIS specific IP/SNI and re-dials onto it — no
+    rebuild, TUN stays up. Backs the panel's per-edge select button."""
+    _require(d, ["name", "kind", "key"])
+    name = str(d["name"])
+    if not NAME_RE.match(name):
+        raise ValueError("bad name")
+    kind = "sni" if str(d.get("kind")) == "sni" else "ip"
+    key = str(d.get("key") or "").strip()
+    if not key or len(key) > 255:
+        raise ValueError("مقدارِ لبه نامعتبر است")
+    path = os.path.join(CONFIG_DIR, "core-" + name + ".status.cmd")
+    try:
+        with open(path, "w") as f:
+            json.dump({"kind": kind, "key": key}, f)
+    except OSError as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": True}
+
+
 def op_pool_probe_now(d):
     """Live 'probe now' for a ws edge pool: SIGHUP tells the running core to retest EVERY
     suspect/dead edge immediately (cheap TLS-only probes) instead of waiting out the backoff,
@@ -2182,7 +2203,7 @@ OPS = {"ping": op_ping, "list": op_list, "check": op_check, "tunnel": op_tunnel,
        "portfw": op_portfw, "portfw-edit": op_portfw_edit, "portfw-next": op_portfw_next,
        "delete": op_delete, "apply": op_apply, "update": op_update, "wipe": op_wipe,
        "portcheck": op_portcheck, "edge-status": op_edge_status, "pool-rotate": op_pool_rotate,
-       "pool-probe-now": op_pool_probe_now,
+       "pool-probe-now": op_pool_probe_now, "pool-select": op_pool_select,
        "core-install": op_core_install, "spoof-probe": op_spoof_probe,
        "set-update-key": op_set_update_key,
        "link-enable": op_link_enable}
