@@ -619,6 +619,7 @@ def _core_config(cfg):
                                          "path": str(s.get("path") or "").strip()} for s in snis]
                 corecfg["ws_rotate_secs"] = int(cfg.get("ws_rotate_secs") or 600)
                 corecfg["ws_auto_burn"] = bool(cfg.get("ws_auto_burn"))
+                corecfg["ws_warm_standby"] = bool(cfg.get("ws_warm_standby"))  # make-before-break failover
                 corecfg["ws_status_path"] = os.path.join(CONFIG_DIR, "core-" + name + ".status")
     # FEC (forward error correction): reconstructs lost carrier datagrams from parity so a
     # throttled/high-loss link stays usable. Datagram carriers only (udp/raw/flux) — on
@@ -1509,6 +1510,7 @@ def op_tunnel(d):
                         obj["ws_edge_snis"] = clean_snis
                         obj["ws_rotate_secs"] = max(0, min(28800, int(d.get("ws_rotate_secs") or 600)))
                         obj["ws_auto_burn"] = _as_bool(d.get("ws_auto_burn"))
+                        obj["ws_warm_standby"] = _as_bool(d.get("ws_warm_standby"))  # make-before-break failover
             edge = str(d.get("edge_ip") or "").strip()   # CDN edge the client dials instead of the origin
             if edge:
                 host = edge.rpartition(":")[0] or edge
