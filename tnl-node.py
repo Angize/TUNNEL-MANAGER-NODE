@@ -604,7 +604,7 @@ def _core_config(cfg):
             # writing its live state to a status file we expose back to the panel.
             ips = [str(x).strip() for x in (cfg.get("ws_edge_ips") or []) if str(x).strip()]
             snis = [s for s in (cfg.get("ws_edge_snis") or []) if isinstance(s, dict) and str(s.get("host") or "").strip()]
-            if ips and snis and not xhttp:  # xhttp uses the single edge, never the pool
+            if ips and snis:  # rotating pool — works for both the ws and xhttp carriers
                 ecfg["ws_edge_ips"] = ips
                 ecfg["ws_edge_snis"] = [{"host": str(s["host"]).strip(),
                                          "ech": str(s.get("ech") or "").strip(),
