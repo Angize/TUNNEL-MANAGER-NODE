@@ -1935,11 +1935,23 @@ def op_edge_status(d):
         with open(path) as f:
             st = json.load(f)
     except (OSError, ValueError):
-        return {"ok": True, "active": "", "burned_ips": [], "burned_snis": [], "ts": 0}
+        return {"ok": True, "active": "", "burned_ips": [], "burned_snis": [], "health": [], "ts": 0}
+    health = []
+    for h in (st.get("health") or [])[:256]:
+        if not isinstance(h, dict):
+            continue
+        health.append({
+            "key": str(h.get("key") or ""),
+            "kind": "sni" if str(h.get("kind")) == "sni" else "ip",
+            "state": str(h.get("state") or "healthy"),
+            "fails": int(h.get("fails") or 0),
+            "next_retest_unix": int(h.get("next_retest_unix") or 0),
+        })
     return {"ok": True,
             "active": str(st.get("active") or ""),
             "burned_ips": [str(x) for x in (st.get("burned_ips") or [])][:64],
             "burned_snis": [str(x) for x in (st.get("burned_snis") or [])][:64],
+            "health": health,
             "ts": int(st.get("ts") or 0)}
 
 
@@ -1955,6 +1967,20 @@ def op_pool_rotate(d):
     if not sig:
         raise ValueError("bad dim (باید ip یا sni باشد)")
     rc, out, err = run(["systemctl", "kill", "-s", sig, _core_unit(name)])
+    if rc != 0:
+        return {"ok": False, "error": (err or out or "").strip() or ("سیگنال به هسته نرسید (" + name + ")")}
+    return {"ok": True}
+
+
+def op_pool_probe_now(d):
+    """Live 'probe now' for a ws edge pool: SIGHUP tells the running core to retest EVERY
+    suspect/dead edge immediately (cheap TLS-only probes) instead of waiting out the backoff,
+    so a lifted block heals at once. No rebuild, TUN stays up."""
+    _require(d, ["name"])
+    name = str(d["name"])
+    if not NAME_RE.match(name):
+        raise ValueError("bad name")
+    rc, out, err = run(["systemctl", "kill", "-s", "SIGHUP", _core_unit(name)])
     if rc != 0:
         return {"ok": False, "error": (err or out or "").strip() or ("سیگنال به هسته نرسید (" + name + ")")}
     return {"ok": True}
@@ -2156,6 +2182,7 @@ OPS = {"ping": op_ping, "list": op_list, "check": op_check, "tunnel": op_tunnel,
        "portfw": op_portfw, "portfw-edit": op_portfw_edit, "portfw-next": op_portfw_next,
        "delete": op_delete, "apply": op_apply, "update": op_update, "wipe": op_wipe,
        "portcheck": op_portcheck, "edge-status": op_edge_status, "pool-rotate": op_pool_rotate,
+       "pool-probe-now": op_pool_probe_now,
        "core-install": op_core_install, "spoof-probe": op_spoof_probe,
        "set-update-key": op_set_update_key,
        "link-enable": op_link_enable}
