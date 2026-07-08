@@ -1097,24 +1097,13 @@ def _proc_net_dev():
     return out
 
 
-def _default_iface_name():
-    """Default-route interface from /proc/net/route (pure file read, no subprocess)."""
-    with open("/proc/net/route") as f:
-        next(f, None)  # header row
-        for line in f:
-            p = line.split()
-            if len(p) > 3 and p[1] == "00000000" and int(p[3], 16) & 2:  # RTF_GATEWAY
-                return p[0]
-    return None
-
-
 def _read_net(cfgs):
     """Per-tunnel + whole-node RX/TX byte counters. sit -> the config name is the netdev;
     vxlan/gre -> veth{id}b (the tunnel_ip-bearing leg). Keyed by config name; portfw excluded."""
     raw = _proc_net_dev()
     net = {}
     for c in cfgs:
-        t, nm, tid = c.get("type"), c.get("name"), str(c.get("id"))
+        t, nm = c.get("type"), c.get("name")
         if t == "portfw" or not nm:
             continue
         v = raw.get(nm)   # every tunnel is now its own netdev (named after the config); counters live there
