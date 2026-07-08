@@ -1454,9 +1454,12 @@ def op_tunnel(d):
                 obj["ws_xhttp"] = True
             if _as_bool(d.get("ws_tls")):
                 obj["ws_tls"] = True
-                # The core rejects ws_tls on a client without ws_host (it is the TLS SNI / fronting
-                # domain); catch it here with a precise error instead of a late "interface not created".
-                if role == "client" and not obj.get("ws_host"):
+                # The core rejects ws_tls on a single-edge client without ws_host (it is the TLS
+                # SNI / fronting domain); catch it here with a precise error instead of a late
+                # "interface not created". A rotating edge POOL carries its own per-SNI hosts, so
+                # ws_host is NOT required in that mode — only demand it for the single edge.
+                _has_pool = bool(d.get("ws_edge_ips")) and bool(d.get("ws_edge_snis"))
+                if role == "client" and not obj.get("ws_host") and not _has_pool:
                     raise ValueError("ws_tls به ws_host نیاز دارد (SNI/دامنهٔ فرانت‌کننده)")
                 # ECH: base64 ECHConfigList that hides the SNI. The panel fetches it from the
                 # domain's HTTPS record over DoH and sends it here; whitelist it so it survives
