@@ -1795,9 +1795,35 @@ def _ss_proc(line):
     return m.group(1) if m else ""
 
 
-def _port_busy_proc(port, proto):
+def _norm_ip(x):
+    """Bare IP: drop [] and whitespace. '' for none/wildcard placeholders."""
+    return str(x or "").strip().strip("[]")
+
+
+_WILD = ("0.0.0.0", "::", "*", "")
+
+
+def _decode_hexip(h):
+    """Decode a /proc/net local address hex string to a dotted/normal IP for comparison.
+    IPv4 is 8 hex chars little-endian; the all-zero form (any length) is the wildcard '::'.
+    Returns None when it can't decode (caller then treats the socket conservatively)."""
+    h = h.strip()
+    if set(h) <= {"0"}:
+        return "0.0.0.0"
+    if len(h) == 8:
+        try:
+            b = bytes.fromhex(h)
+            return "%d.%d.%d.%d" % (b[3], b[2], b[1], b[0])  # little-endian
+        except ValueError:
+            return None
+    return None  # IPv6 (non-zero) — don't attempt, let the caller be conservative
+
+
+def _port_busy_proc(port, proto, tip=None):
     """Fallback when `ss` is unavailable: scan /proc/net/{tcp,tcp6}|{udp,udp6}. No process name.
-    TCP listeners have st==0A; a bound UDP socket has a non-zero local port. Returns bool."""
+    TCP listeners have st==0A. When tip is given, only a matching-IP or wildcard bind conflicts;
+    an undecodable listener IP is treated conservatively (busy) so two tunnels never silently
+    collide. Returns bool."""
     files = ("/proc/net/tcp", "/proc/net/tcp6") if proto == "tcp" else ("/proc/net/udp", "/proc/net/udp6")
     for path in files:
         try:
@@ -1810,22 +1836,30 @@ def _port_busy_proc(port, proto):
                     local, st = parts[1], parts[3]
                     if proto == "tcp" and st != "0A":   # only LISTEN sockets conflict for TCP
                         continue
-                    hexport = local.rsplit(":", 1)[-1]
+                    hexaddr, _, hexport = local.rpartition(":")
                     try:
-                        if int(hexport, 16) == int(port):
-                            return True
+                        if int(hexport, 16) != int(port):
+                            continue
                     except ValueError:
                         continue
+                    if tip is None:
+                        return True
+                    lip = _decode_hexip(hexaddr)
+                    if lip is None or lip in _WILD or lip == tip:
+                        return True
         except (OSError, StopIteration):
             continue
     return False
 
 
-def _port_busy(port, proto):
+def _port_busy(port, proto, ip=None):
     """Is `port` already listening on this node for the given proto? Sees ALL processes
-    (Xray/nginx/x-ui/…), not just our tunnels. Returns (busy, who)."""
+    (Xray/nginx/x-ui/…), not just our tunnels. When `ip` is given, only a bind on that same IP
+    or a wildcard (0.0.0.0/::) counts — so several ws tunnels can share a port across the host's
+    different IPs. Returns (busy, who)."""
     proto = "tcp" if str(proto).lower() == "tcp" else "udp"
     flag = "-t" if proto == "tcp" else "-u"
+    tip = _norm_ip(ip) or None
     rc, out, _ = run(["ss", "-H", "-l", "-n", "-p", flag])
     if rc == 0:
         for line in out.splitlines():
@@ -1835,10 +1869,14 @@ def _port_busy(port, proto):
             local = f[3]   # State Recv-Q Send-Q Local:Port Peer:Port [users:(...)]
             if ":" not in local:
                 continue
-            if local.rsplit(":", 1)[-1] == str(port):
+            host, _, lport = local.rpartition(":")
+            if lport != str(port):
+                continue
+            lhost = _norm_ip(host)
+            if tip is None or lhost in _WILD or lhost == tip:
                 return True, _ss_proc(line)
         return False, ""
-    return _port_busy_proc(port, proto), ""
+    return _port_busy_proc(port, proto, tip), ""
 
 
 def op_portcheck(d):
@@ -1852,8 +1890,11 @@ def op_portcheck(d):
     if not 1 <= port <= 65535:
         raise ValueError("port out of range")
     proto = "tcp" if str(d.get("proto", "udp")).lower() == "tcp" else "udp"
-    busy, who = _port_busy(port, proto)
-    return {"ok": True, "busy": busy, "who": who, "port": port, "proto": proto}
+    ip = _norm_ip(d.get("ip")) or None  # optional: only conflict on this bind IP (or a wildcard)
+    if ip and not re.match(r"^[0-9A-Fa-f:.]{1,45}$", ip):
+        raise ValueError("bad ip")
+    busy, who = _port_busy(port, proto, ip)
+    return {"ok": True, "busy": busy, "who": who, "port": port, "proto": proto, "ip": ip or ""}
 
 
 def op_edge_status(d):
