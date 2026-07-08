@@ -44,7 +44,7 @@ SERVICE_FILE = "/etc/systemd/system/tnl-node.service"
 SELF_PATH = os.path.realpath(__file__)
 INSTALLED = os.path.join(CONFIG_DIR, "tnl-node.py")  # stable path the systemd unit points at
 
-# The custom Go data-plane core (packet/bip): a static binary the PANEL delivers by pushing verified
+# The custom Go data-plane core (packet/core): a static binary the PANEL delivers by pushing verified
 # bytes to the node (op core-install). The node never downloads it itself — nodes may have no internet
 # (e.g. an Iran node), so the panel is the single source and stages/relays the binary. The node only
 # verifies the pushed sha256 and supervises the binary via systemd-run.
@@ -512,7 +512,7 @@ def _core_config(cfg):
     transport = str(cfg.get("transport") or "udp").lower()
     raw_profile = str(cfg.get("raw_profile") or "bip").lower()
     obfs = bool(cfg.get("obfs")) and crypto_on   # obfs is meaningless without the AEAD key
-    # MTU budget = outer headers + bip framing + obfs padding + AEAD (nonce+tag) + wire mask salt.
+    # MTU budget = outer headers + core framing + obfs padding + AEAD (nonce+tag) + wire mask salt.
     flux_carrier = str(cfg.get("flux_carrier") or "udp").lower()
     if transport == "raw":
         # IP20 + the profile's carrier header (bip/ipip add none; gre 4; icmp/udp 8; tcp 20).
@@ -542,7 +542,7 @@ def _core_config(cfg):
     # small underlay (PPPoE 1492 / IPv6-min 1280): floor 1280 could hand out MORE than base-overhead.
     # Sample the tunnel's own egress iface, and clamp only at a safe small minimum, never raising above budget.
     mtu = max(576, base_mtu(cfg.get("iface")) - overhead)
-    ecfg = {
+    corecfg = {
         "role": cfg.get("role"),
         "mode": "packet",
         "profile": "core",
@@ -557,36 +557,36 @@ def _core_config(cfg):
     }
     # TLS cover (HTTPS camouflage) — TCP only; carries an optional SNI to present.
     if bool(cfg.get("cover")) and transport == "tcp" and crypto_on:
-        ecfg["cover"] = True
+        corecfg["cover"] = True
         sni = str(cfg.get("cover_sni") or "").strip()
         if sni:
-            ecfg["cover_sni"] = sni
+            corecfg["cover_sni"] = sni
     if transport == "raw":
-        ecfg["raw_profile"] = raw_profile
+        corecfg["raw_profile"] = raw_profile
     if transport == "flux":
         # flux is a distinct transport (not a raw_profile): carrier, shape profile,
         # epoch length and a manual epoch offset are all it needs — both ends derive
         # the rotating shape from the PSK + clock (+ offset), no on-wire negotiation.
-        ecfg["flux_carrier"] = flux_carrier
-        ecfg["flux_rotate_secs"] = int(cfg.get("flux_rotate_secs") or 600)
-        ecfg["flux_shape"] = str(cfg.get("flux_shape") or "random").lower()
+        corecfg["flux_carrier"] = flux_carrier
+        corecfg["flux_rotate_secs"] = int(cfg.get("flux_rotate_secs") or 600)
+        corecfg["flux_shape"] = str(cfg.get("flux_shape") or "random").lower()
         off = int(cfg.get("flux_epoch_offset") or 0)
         if off:
-            ecfg["flux_epoch_offset"] = off
+            corecfg["flux_epoch_offset"] = off
     if transport == "ws":
         # WebSocket carrier (CDN-frontable): Host/SNI, path, and whether the client
         # speaks wss (TLS to the CDN edge). The server stays plain — the CDN terminates TLS.
         if cfg.get("ws_host"):
-            ecfg["ws_host"] = str(cfg["ws_host"])
+            corecfg["ws_host"] = str(cfg["ws_host"])
         if cfg.get("ws_path"):
-            ecfg["ws_path"] = str(cfg["ws_path"])
+            corecfg["ws_path"] = str(cfg["ws_path"])
         # xhttp mode: carry the stream over a GET(down)+POST(up) HTTP request pair instead
         # of a WebSocket upgrade, so it passes a CDN/account that blocks WebSocket. Both
         # roles need the flag (server serves the xhttp endpoint, client dials it); the same
         # fronting fields (ws_host/ws_tls/ws_ech/ws_path) apply. Not combined with the pool.
         xhttp = bool(cfg.get("ws_xhttp"))
         if xhttp:
-            ecfg["ws_xhttp"] = True
+            corecfg["ws_xhttp"] = True
             # xhttp upstream style: "packet" (packet-up, default — many short POSTs, most
             # CDN-compatible), "stream" (stream-one, a single full-duplex request; needs HTTP/2,
             # hence ws_tls), or "grpc" (stream-one dressed as a real gRPC call so a CDN reaches the
@@ -594,18 +594,18 @@ def _core_config(cfg):
             # roles; the core server auto-detects the client's style but the client must be told.
             xmode = str(cfg.get("ws_xhttp_mode") or "").strip().lower()
             if xmode in ("packet", "stream", "grpc"):
-                ecfg["ws_xhttp_mode"] = xmode
+                corecfg["ws_xhttp_mode"] = xmode
         # Only the CLIENT speaks wss (TLS to the CDN edge); the server stays plain — the CDN
         # terminates TLS and forwards the WebSocket to the origin. Never emit ws_tls server-side.
         if bool(cfg.get("ws_tls")) and cfg.get("role") == "client":
-            ecfg["ws_tls"] = True
+            corecfg["ws_tls"] = True
             # ECH: encrypt the SNI so an SNI-blocklisting censor can't see the real domain.
             # The panel fetches the base64 ECHConfigList from the domain's HTTPS record over
             # DoH (clean internet) and hands it to us; we just forward it to the core. Client
             # + wss only (it rides the TLS ClientHello). Empty = no ECH.
             ech = str(cfg.get("ws_ech") or "").strip()
             if ech:
-                ecfg["ws_ech"] = ech
+                corecfg["ws_ech"] = ech
             # Edge pool: the panel sends clean edge-IP + SNI lists (each SNI with its own
             # ECH/path) plus the rotation settings. A non-empty pool overrides the single
             # ws_host/ws_ech/edge above — the core cycles (IP × SNI) and burns blocked ones,
@@ -613,22 +613,22 @@ def _core_config(cfg):
             ips = [str(x).strip() for x in (cfg.get("ws_edge_ips") or []) if str(x).strip()]
             snis = [s for s in (cfg.get("ws_edge_snis") or []) if isinstance(s, dict) and str(s.get("host") or "").strip()]
             if ips and snis:  # rotating pool — works for both the ws and xhttp carriers
-                ecfg["ws_edge_ips"] = ips
-                ecfg["ws_edge_snis"] = [{"host": str(s["host"]).strip(),
+                corecfg["ws_edge_ips"] = ips
+                corecfg["ws_edge_snis"] = [{"host": str(s["host"]).strip(),
                                          "ech": str(s.get("ech") or "").strip(),
                                          "path": str(s.get("path") or "").strip()} for s in snis]
-                ecfg["ws_rotate_secs"] = int(cfg.get("ws_rotate_secs") or 600)
-                ecfg["ws_auto_burn"] = bool(cfg.get("ws_auto_burn"))
-                ecfg["ws_status_path"] = os.path.join(CONFIG_DIR, "core-" + name + ".status")
+                corecfg["ws_rotate_secs"] = int(cfg.get("ws_rotate_secs") or 600)
+                corecfg["ws_auto_burn"] = bool(cfg.get("ws_auto_burn"))
+                corecfg["ws_status_path"] = os.path.join(CONFIG_DIR, "core-" + name + ".status")
     # FEC (forward error correction): reconstructs lost carrier datagrams from parity so a
     # throttled/high-loss link stays usable. Datagram carriers only (udp/raw/flux) — on
     # tcp/ws it's wasted (TCP is already reliable), so it's only forwarded for those three.
     if transport in ("udp", "raw", "flux") and bool(cfg.get("fec")):
-        ecfg["fec"] = True
-        ecfg["fec_data"] = int(cfg.get("fec_data") or 10)
-        ecfg["fec_parity"] = int(cfg.get("fec_parity") or 3)
+        corecfg["fec"] = True
+        corecfg["fec_data"] = int(cfg.get("fec_data") or 10)
+        corecfg["fec_parity"] = int(cfg.get("fec_parity") or 3)
     if bool(cfg.get("gso")):     # TUN segmentation offload — local throughput optimization
-        ecfg["gso"] = True
+        corecfg["gso"] = True
     # IP spoofing (raw bip + crypto only): forge the outer source and/or the destination (a decoy).
     # The client puts the decoy in the header dst while still routing to the real server; the server
     # then receives those frames via AF_PACKET and answers AS the decoy, so it must be told the
@@ -638,14 +638,14 @@ def _core_config(cfg):
         spoof_dst = str(cfg.get("spoof_dst") or "").strip()
         if cfg.get("role") == "client":
             if spoof_src:
-                ecfg["spoof_src_ip"] = spoof_src
+                corecfg["spoof_src_ip"] = spoof_src
             if spoof_dst:
-                ecfg["spoof_dst_ip"] = spoof_dst
+                corecfg["spoof_dst_ip"] = spoof_dst
         else:  # server
             if spoof_dst:
-                ecfg["spoof_dst_ip"] = spoof_dst
+                corecfg["spoof_dst_ip"] = spoof_dst
             if spoof_src or spoof_dst:
-                ecfg["spoof_peer"] = cfg["remote_ip"]
+                corecfg["real_peer_ip"] = cfg["remote_ip"]
     if cfg.get("role") == "server":
         # Bind to THIS node's physical IP for the tunnel, not 0.0.0.0. With multiple IPs on the
         # host this is required for the raw transport: a raw (portless) socket bound to 0.0.0.0
@@ -653,7 +653,7 @@ def _core_config(cfg):
         # wrong source and the client (which filters by peer IP) drops every reply. Binding to the
         # exact listen IP makes the reply source correct and also cleanly demuxes by destination IP.
         lip = cfg.get("local_ip") or "0.0.0.0"
-        ecfg["listen"] = f"{lip}:{port}"
+        corecfg["listen"] = f"{lip}:{port}"
     else:
         # The client dials the peer. For a ws link fronted through a CDN, edge_ip
         # overrides the dial target to the CDN edge (host or host:port) while ws_host
@@ -667,15 +667,15 @@ def _core_config(cfg):
                 dial, dport = h, int(p)
             else:
                 dial = edge
-        ecfg["peer"] = f"{dial}:{dport}"
+        corecfg["peer"] = f"{dial}:{dport}"
         # Pin the client's outbound source to THIS node's own IP (local_ip is validated to be a
         # local address in op_tunnel). On a host with several IPs the kernel would otherwise egress
         # from its primary IP; binding makes the peer/CDN see this node's registered IP. The core
         # applies it only for the TCP-family carriers (tcp/ws/xhttp) and ignores it otherwise.
         lip = str(cfg.get("local_ip") or "").strip()
         if lip:
-            ecfg["bind_ip"] = lip
-    return ecfg
+            corecfg["bind_ip"] = lip
+    return corecfg
 
 
 def _core_unit(name):
@@ -687,11 +687,11 @@ def build_core(cfg):
     systemd unit with Restart=always. Then wait for the TUN to appear so op_tunnel's verify sees it."""
     name = cfg["name"]
     _ensure_core()
-    ecfg = _core_config(cfg)
+    corecfg = _core_config(cfg)
     path = os.path.join(CONFIG_DIR, "core-" + name + ".json")
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
-        json.dump(ecfg, f, indent=2)
+        json.dump(corecfg, f, indent=2)
     os.chmod(tmp, 0o600)          # holds the psk -> keep it private like node.conf
     os.replace(tmp, path)
     unit = _core_unit(name)
