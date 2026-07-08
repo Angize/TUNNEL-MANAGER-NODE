@@ -668,6 +668,13 @@ def _core_config(cfg):
             else:
                 dial = edge
         ecfg["peer"] = f"{dial}:{dport}"
+        # Pin the client's outbound source to THIS node's own IP (local_ip is validated to be a
+        # local address in op_tunnel). On a host with several IPs the kernel would otherwise egress
+        # from its primary IP; binding makes the peer/CDN see this node's registered IP. The core
+        # applies it only for the TCP-family carriers (tcp/ws/xhttp) and ignores it otherwise.
+        lip = str(cfg.get("local_ip") or "").strip()
+        if lip:
+            ecfg["bind_ip"] = lip
     return ecfg
 
 
