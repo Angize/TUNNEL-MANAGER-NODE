@@ -1,59 +1,61 @@
-<div align="center">
+# TUNNEL-MANAGER-NODE
 
-# 🛰️ tnl-node
+ایجنتِ خودکفای نود: از پنل config می‌گیرد، تونل و پورت‌فوروارد می‌سازد، بعد از ریبوت
+بازمی‌سازد و تغییرِ آی‌پی را به پنل خبر می‌دهد. تونل‌ها مستقیم بینِ نودها جریان دارند؛
+پنل فقط فرمان می‌دهد.
 
-**ایجنتِ خودکفای نود** برای [tnl-central](https://github.com/Angize/TUNNEL-MANAGER)
-خودش تونل و پورت‌فوروارد می‌سازد و بعد از ریبوت بازمی‌سازد.
+> ساده‌ترین راه اصلاً دستی نیست: در پنل **«افزودنِ نود → خودکار»** فقط SSHِ سرور را بده؛
+> پنل خودش وارد می‌شود، ایجنت را نصب می‌کند و نود را وصل می‌کند. مراحلِ زیر نصبِ دستی است.
 
-![Python](https://img.shields.io/badge/Python-3.7%2B-3776AB?logo=python&logoColor=white)
-![Linux](https://img.shields.io/badge/Linux-systemd-333?logo=linux&logoColor=white)
-![auth](https://img.shields.io/badge/auth-token-e67e22)
+## پیش‌نیاز
 
-</div>
+| ابزار | برای چه |
+|---|---|
+| `python3` | اجرای ایجنت |
+| `iproute2` (`ip`) | ساختِ تونل‌های کرنلی |
+| `iptables` | پورت‌فوروارد + شمارشِ ترافیک |
+| Linux + systemd | سرویسِ ماندگار |
 
----
+بدونِ OpenvSwitch — همهٔ تونل‌ها netdevِ نیتیوِ کرنل‌اند. هستهٔ رمزنگاری‌شده را پنل
+push می‌کند (روی نود ساخته نمی‌شود).
 
-## ⚡ نصب
-
-**ساده‌ترین راه — از پنل:** در **«افزودنِ نود» → خودکار**، فقط مشخصاتِ SSHِ سرور را بده؛ پنل خودش وارد می‌شود، ایجنت را نصب می‌کند، توکن می‌سازد و نود را وصل می‌کند.
-
-نصبِ دستی روی سرورِ نود — تک‌خطی:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/Angize/TUNNEL-MANAGER-NODE/main/tnl-node.py -o tnl-node.py && sudo python3 tnl-node.py --install
-```
-
-> جایگزینِ git: `git clone https://github.com/Angize/TUNNEL-MANAGER-NODE.git && cd TUNNEL-MANAGER-NODE && sudo python3 tnl-node.py --install`
-> نصبِ غیرتعاملی (همان چیزی که پنل اجرا می‌کند): `sudo python3 tnl-node.py --auto-install <port>`
-
-**بروزرسانی:** از پنل، تبِ **تنظیمات → بروزرسانیِ ایجنت** → آپلود و push (بدونِ SSH).
-
----
-
-## 🔗 ثبت در پنل
+## راه‌اندازی از صفر
 
 ```bash
-sudo python3 tnl-node.py --show
+# ۱) پیش‌نیازها (Debian/Ubuntu)
+sudo apt update && sudo apt install -y python3 iproute2 iptables git
+
+# ۲) دریافتِ کد
+git clone https://github.com/Angize/TUNNEL-MANAGER-NODE.git
+cd TUNNEL-MANAGER-NODE
+# یا تک‌فایل بدونِ git:
+# curl -fsSL https://raw.githubusercontent.com/Angize/TUNNEL-MANAGER-NODE/main/tnl-node.py -o tnl-node.py
+
+# ۳) نصب (سرویسِ systemd + توکن می‌سازد)
+sudo python3 tnl-node.py --install
+
+# ۴) نمایشِ مشخصات و ثبت در پنل
+sudo python3 tnl-node.py --show      # host / port / token → در تبِ «نودها»ی پنل
 ```
 
-`host / port / token` را در تبِ **«نودها»**ی پنل وارد کن. تمام.
+## دستورها
+
+| دستور | کار |
+|---|---|
+| `--install` | نصبِ تعاملیِ سرویسِ systemd + ساختِ توکن |
+| `--auto-install <port>` | نصبِ غیرتعاملی (همان چیزی که پنل اجرا می‌کند؛ پیش‌فرض `8099`) |
+| `--show` | نمایشِ `host / port / token` برای ثبت در پنل |
+
+**بروزرسانی:** از پنل، تبِ **تنظیمات → بروزرسانیِ ایجنت** (آپلود و push، بدونِ SSH).
+
+## چه می‌سازد
+
+| نوع | جزئیات |
+|---|---|
+| `core` | تونلِ رمزنگاری‌شدهٔ هسته (udp/tcp/raw/flux/ws) |
+| kernel | VXLAN · GRE · SIT · IPIP · L2TPv3 · FOU · IPsec |
+| forward | پورت‌فورواردِ TCP+UDP با چرخشِ چند مقصد |
 
 ---
 
-## ✨ قابلیت‌ها
-
-- 🧩 VXLAN / GRE / SIT
-- 🔀 پورت‌فورواردِ TCP+UDP با چرخش
-- ♻️ بازسازیِ خودکار بعد از بوت
-- 📞 خبردادن به پنل هنگام تغییرِ آی‌پی
-- 🔐 APIِ توکن‌دار
-
-**پیش‌نیاز:** Python 3 · iproute2 · iptables · openvswitch (برای VXLAN/GRE)
-
----
-
-<div align="center">
-
-کنترل‌پنل 👉 [**tnl-central**](https://github.com/Angize/TUNNEL-MANAGER) • مجوز 👉 [LICENSE](./LICENSE)
-
-</div>
+کنترل‌پنل 👉 [tnl-central](https://github.com/Angize/TUNNEL-MANAGER) • مجوز 👉 [LICENSE](./LICENSE)
