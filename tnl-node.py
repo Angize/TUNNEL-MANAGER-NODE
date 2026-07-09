@@ -1979,11 +1979,23 @@ def op_edge_status(d):
             "fails": int(h.get("fails") or 0),
             "next_retest_unix": int(h.get("next_retest_unix") or 0),
         })
+    events = []
+    for e in (st.get("events") or [])[:64]:
+        if not isinstance(e, dict):
+            continue
+        events.append({
+            "seq": int(e.get("seq") or 0),
+            "ts": int(e.get("ts") or 0),
+            "kind": str(e.get("kind") or ""),
+            "code": str(e.get("code") or ""),
+            "detail": str(e.get("detail") or ""),
+        })
     return {"ok": True,
             "active": str(st.get("active") or ""),
             "burned_ips": [str(x) for x in (st.get("burned_ips") or [])][:64],
             "burned_snis": [str(x) for x in (st.get("burned_snis") or [])][:64],
             "health": health,
+            "events": events,
             "ts": int(st.get("ts") or 0),
             # The core stamps next_retest_unix on the NODE's clock, so return the node's "now"
             # too — the panel counts down against this, not its own (possibly skewed) clock, and
