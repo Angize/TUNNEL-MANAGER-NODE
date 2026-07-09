@@ -1136,8 +1136,8 @@ def _proc_net_dev():
 
 
 def _read_net(cfgs):
-    """Per-tunnel + whole-node RX/TX byte counters. sit -> the config name is the netdev;
-    vxlan/gre -> veth{id}b (the tunnel_ip-bearing leg). Keyed by config name; portfw excluded."""
+    """Per-tunnel + whole-node RX/TX byte counters. Every tunnel is a single kernel netdev named
+    after its config (the OpenvSwitch/veth data path was removed). Keyed by config name; portfw excluded."""
     raw = _proc_net_dev()
     net = {}
     for c in cfgs:
@@ -1545,7 +1545,8 @@ def op_tunnel(d):
                     if pips and clean_snis:
                         obj["ws_edge_ips"] = pips
                         obj["ws_edge_snis"] = clean_snis
-                        obj["ws_rotate_secs"] = max(0, min(28800, int(d.get("ws_rotate_secs") or 600)))
+                        _rs = d.get("ws_rotate_secs")   # 0 = rotation off (failover-only) — a truthiness `or 600` would wrongly force 600
+                        obj["ws_rotate_secs"] = max(0, min(28800, int(_rs))) if _rs is not None else 600
                         obj["ws_auto_burn"] = _as_bool(d.get("ws_auto_burn"))
                         obj["ws_warm_standby"] = _as_bool(d.get("ws_warm_standby"))  # make-before-break failover
             edge = str(d.get("edge_ip") or "").strip()   # CDN edge the client dials instead of the origin
