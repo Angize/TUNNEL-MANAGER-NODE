@@ -561,6 +561,13 @@ def _core_config(cfg):
         sni = str(cfg.get("cover_sni") or "").strip()
         if sni:
             corecfg["cover_sni"] = sni
+    # Datagram transports (udp/raw/flux) have no ws edge pool, but the CLIENT still writes a
+    # precise self-heal event ring (stale-detect / recovery) to a status file we expose back to the
+    # panel's system log — same file name the pool uses, so op_edge_status reads it unchanged. This
+    # is `status_path` (NOT `ws_status_path`), so _is_ws_pool keeps telling a pool core apart from a
+    # plain datagram core (only the pool has SIGHUP/SIGUSR handlers).
+    if transport in ("udp", "raw", "flux") and str(cfg.get("role")) == "client":
+        corecfg["status_path"] = os.path.join(CONFIG_DIR, "core-" + name + ".status")
     if transport == "raw":
         corecfg["raw_profile"] = raw_profile
     if transport == "flux":
