@@ -683,11 +683,36 @@ def _core_unit(name):
     return "tnl-cor-" + name
 
 
+def _core_status_paths(name):
+    """The core's live status file and its select-edge command sidecar for tunnel `name`."""
+    base = os.path.join(CONFIG_DIR, "core-" + name + ".status")
+    return base, base + ".cmd"
+
+
+def _is_ws_pool(name):
+    """True if the running core for `name` is a ws edge-pool client — the ONLY core that installs
+    SIGHUP/SIGUSR handlers. Signaling any other core falls through to Go's default signal
+    disposition and TERMINATES the tunnel, so pool-only ops (probe-now / rotate) must guard on this."""
+    try:
+        with open(os.path.join(CONFIG_DIR, "core-" + name + ".json")) as f:
+            cc = json.load(f)
+    except (OSError, ValueError):
+        return False
+    return bool(cc.get("ws_status_path") or cc.get("ws_edge_ips"))
+
+
 def build_core(cfg):
     """Fetch/verify the core binary, write its per-tunnel config, and (re)launch it under a transient
     systemd unit with Restart=always. Then wait for the TUN to appear so op_tunnel's verify sees it."""
     name = cfg["name"]
     _ensure_core()
+    # Drop any stale status + select-edge sidecar from a previous core with this name, so a rebuild
+    # never shows a stale pool state or replays a leftover "pin this edge" command on first tick.
+    for p in _core_status_paths(name):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
     corecfg = _core_config(cfg)
     path = os.path.join(CONFIG_DIR, "core-" + name + ".json")
     tmp = path + ".tmp"
@@ -718,6 +743,11 @@ def _core_teardown(cfg):
         os.remove(os.path.join(CONFIG_DIR, "core-" + name + ".json"))
     except OSError:
         pass
+    for p in _core_status_paths(name):   # don't leave a dead tunnel's pool state as "live"
+        try:
+            os.remove(p)
+        except OSError:
+            pass
 
 
 def _set_link_state(cfg, enabled):
@@ -1954,7 +1984,11 @@ def op_edge_status(d):
             "burned_ips": [str(x) for x in (st.get("burned_ips") or [])][:64],
             "burned_snis": [str(x) for x in (st.get("burned_snis") or [])][:64],
             "health": health,
-            "ts": int(st.get("ts") or 0)}
+            "ts": int(st.get("ts") or 0),
+            # The core stamps next_retest_unix on the NODE's clock, so return the node's "now"
+            # too — the panel counts down against this, not its own (possibly skewed) clock, and
+            # can flag a stale file (now - ts large) as offline.
+            "now": int(time.time())}
 
 
 def op_pool_rotate(d):
@@ -1968,6 +2002,8 @@ def op_pool_rotate(d):
     sig = {"ip": "SIGUSR1", "sni": "SIGUSR2"}.get(str(d["dim"]))
     if not sig:
         raise ValueError("bad dim (باید ip یا sni باشد)")
+    if not _is_ws_pool(name):   # a non-pool core has no SIGUSR handler -> the signal would kill it
+        return {"ok": False, "error": "این تونل استخرِ لبه ندارد"}
     rc, out, err = run(["systemctl", "kill", "-s", sig, _core_unit(name)])
     if rc != 0:
         return {"ok": False, "error": (err or out or "").strip() or ("سیگنال به هسته نرسید (" + name + ")")}
@@ -1982,15 +2018,25 @@ def op_pool_select(d):
     name = str(d["name"])
     if not NAME_RE.match(name):
         raise ValueError("bad name")
+    if not _is_ws_pool(name):
+        return {"ok": False, "error": "این تونل استخرِ لبه ندارد"}
     kind = "sni" if str(d.get("kind")) == "sni" else "ip"
     key = str(d.get("key") or "").strip()
     if not key or len(key) > 255:
         raise ValueError("مقدارِ لبه نامعتبر است")
     path = os.path.join(CONFIG_DIR, "core-" + name + ".status.cmd")
+    # Write atomically (tmp + replace): the core polls this file once per second and removes it,
+    # so a half-written file would be read+deleted and the pin SILENTLY LOST. os.replace is atomic.
+    tmp = path + ".tmp"
     try:
-        with open(path, "w") as f:
+        with open(tmp, "w") as f:
             json.dump({"kind": kind, "key": key}, f)
+        os.replace(tmp, path)
     except OSError as e:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
         return {"ok": False, "error": str(e)}
     return {"ok": True}
 
@@ -2003,6 +2049,8 @@ def op_pool_probe_now(d):
     name = str(d["name"])
     if not NAME_RE.match(name):
         raise ValueError("bad name")
+    if not _is_ws_pool(name):   # a non-pool core has no SIGHUP handler -> the signal would kill it
+        return {"ok": False, "error": "این تونل استخرِ لبه ندارد"}
     rc, out, err = run(["systemctl", "kill", "-s", "SIGHUP", _core_unit(name)])
     if rc != 0:
         return {"ok": False, "error": (err or out or "").strip() or ("سیگنال به هسته نرسید (" + name + ")")}
