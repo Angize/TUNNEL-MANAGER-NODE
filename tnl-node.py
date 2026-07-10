@@ -1136,8 +1136,8 @@ def _proc_net_dev():
 
 
 def _read_net(cfgs):
-    """Per-tunnel + whole-node RX/TX byte counters. sit -> the config name is the netdev;
-    vxlan/gre -> veth{id}b (the tunnel_ip-bearing leg). Keyed by config name; portfw excluded."""
+    """Per-tunnel + whole-node RX/TX byte counters. Every tunnel is a single kernel netdev named
+    after its config (the OpenvSwitch/veth data path was removed). Keyed by config name; portfw excluded."""
     raw = _proc_net_dev()
     net = {}
     for c in cfgs:
@@ -1545,7 +1545,8 @@ def op_tunnel(d):
                     if pips and clean_snis:
                         obj["ws_edge_ips"] = pips
                         obj["ws_edge_snis"] = clean_snis
-                        obj["ws_rotate_secs"] = max(0, min(28800, int(d.get("ws_rotate_secs") or 600)))
+                        _rs = d.get("ws_rotate_secs")   # 0 = rotation off (failover-only) — a truthiness `or 600` would wrongly force 600
+                        obj["ws_rotate_secs"] = max(0, min(28800, int(_rs))) if _rs is not None else 600
                         obj["ws_auto_burn"] = _as_bool(d.get("ws_auto_burn"))
                         obj["ws_warm_standby"] = _as_bool(d.get("ws_warm_standby"))  # make-before-break failover
             edge = str(d.get("edge_ip") or "").strip()   # CDN edge the client dials instead of the origin
@@ -2010,25 +2011,6 @@ def op_edge_status(d):
             "now": int(time.time())}
 
 
-def op_pool_rotate(d):
-    """Live 'rotate now' for a ws edge pool: signal the running core to advance ONE dimension
-    without a rebuild. dim='ip' -> SIGUSR1 (next edge IP), dim='sni' -> SIGUSR2 (next SNI). The
-    core drops+re-dials the carrier on the new edge while the TUN stays up (no interface teardown)."""
-    _require(d, ["name", "dim"])
-    name = str(d["name"])
-    if not NAME_RE.match(name):
-        raise ValueError("bad name")
-    sig = {"ip": "SIGUSR1", "sni": "SIGUSR2"}.get(str(d["dim"]))
-    if not sig:
-        raise ValueError("bad dim (باید ip یا sni باشد)")
-    if not _is_ws_pool(name):   # a non-pool core has no SIGUSR handler -> the signal would kill it
-        return {"ok": False, "error": "این تونل استخرِ لبه ندارد"}
-    rc, out, err = run(["systemctl", "kill", "-s", sig, _core_unit(name)])
-    if rc != 0:
-        return {"ok": False, "error": (err or out or "").strip() or ("سیگنال به هسته نرسید (" + name + ")")}
-    return {"ok": True}
-
-
 def op_pool_select(d):
     """Live 'pin this edge' for a ws edge pool: drop a JSON command file the running core polls
     (<status>.cmd) so it jumps its rotation to THIS specific IP/SNI and re-dials onto it — no
@@ -2271,7 +2253,7 @@ def op_spoof_probe(d):
 OPS = {"ping": op_ping, "list": op_list, "check": op_check, "tunnel": op_tunnel,
        "portfw": op_portfw, "portfw-edit": op_portfw_edit, "portfw-next": op_portfw_next,
        "delete": op_delete, "apply": op_apply, "update": op_update, "wipe": op_wipe,
-       "portcheck": op_portcheck, "edge-status": op_edge_status, "pool-rotate": op_pool_rotate,
+       "portcheck": op_portcheck, "edge-status": op_edge_status,
        "pool-probe-now": op_pool_probe_now, "pool-select": op_pool_select,
        "core-install": op_core_install, "spoof-probe": op_spoof_probe,
        "set-update-key": op_set_update_key,
