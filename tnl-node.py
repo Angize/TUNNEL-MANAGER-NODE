@@ -654,6 +654,16 @@ def _core_config(cfg):
                 corecfg["spoof_dst_ip"] = spoof_dst
             if spoof_src or spoof_dst:
                 corecfg["real_peer_ip"] = cfg["remote_ip"]
+    # Fake-packet desync (client, raw/flux only): the core emits decoy packets (low-TTL /
+    # bad-checksum) before each handshake to mis-sync a stateful DPI, without touching the real
+    # session. Only the raw/flux carriers can forge the IPv4 header, so it's forwarded only there.
+    # Decoys are separate packets, not extra per-frame overhead, so they cost no MTU budget.
+    if transport in ("raw", "flux") and cfg.get("role") == "client" and bool(cfg.get("fake_desync")):
+        corecfg["fake_desync"] = True
+        corecfg["fake_ttl"] = max(1, min(255, int(cfg.get("fake_ttl") or 4)))
+        corecfg["fake_count"] = max(1, min(64, int(cfg.get("fake_count") or 2)))
+        mode = str(cfg.get("fake_mode") or "ttl").strip().lower()
+        corecfg["fake_mode"] = mode if mode in ("ttl", "badsum", "both") else "ttl"
     if cfg.get("role") == "server":
         # Bind to THIS node's physical IP for the tunnel, not 0.0.0.0. With multiple IPs on the
         # host this is required for the raw transport: a raw (portless) socket bound to 0.0.0.0
@@ -1615,6 +1625,26 @@ def op_tunnel(d):
             obj["cover_sni"] = sni
         if _as_bool(d.get("gso")):        # TUN segmentation offload (throughput); Linux only, harmless if unsupported
             obj["gso"] = True
+        # Fake-packet desync (raw/flux only): persist the decoy knobs so _core_config can forward them.
+        # Only the raw/flux carriers build the IPv4 header themselves, so reject it elsewhere. Whitelisting
+        # is mandatory — an un-whitelisted key is silently dropped from the stored config and never reaches
+        # the core (this is exactly the bug spoofing hit).
+        if _as_bool(d.get("fake_desync")):
+            if transport not in ("raw", "flux"):
+                raise ValueError("fake_desync is only supported on the raw and flux carriers")
+            obj["fake_desync"] = True
+            ttl = int(d.get("fake_ttl") or 4)
+            if ttl < 1 or ttl > 255:
+                raise ValueError("fake_ttl out of range (1..255)")
+            obj["fake_ttl"] = ttl
+            cnt = int(d.get("fake_count") or 2)
+            if cnt < 1 or cnt > 64:
+                raise ValueError("fake_count out of range (1..64)")
+            obj["fake_count"] = cnt
+            mode = str(d.get("fake_mode") or "ttl").strip().lower()
+            if mode not in ("ttl", "badsum", "both"):
+                raise ValueError("bad fake_mode")
+            obj["fake_mode"] = mode
         # IP spoofing (raw bip only): persist the forged source and/or decoy destination so _core_config
         # can wire them per role. Without this the fields never reach the stored cfg and spoofing is a no-op.
         if transport == "raw" and obj.get("raw_profile") == "bip":
