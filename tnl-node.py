@@ -693,6 +693,13 @@ def _core_config(cfg):
         lip = str(cfg.get("local_ip") or "").strip()
         if lip:
             corecfg["bind_ip"] = lip
+    # Single-edge ws/xhttp (not a pool): the CLIENT core writes the same self-heal event ring the
+    # datagram carriers do — e.g. an in-band ECH self-heal — to a status file we expose to the panel.
+    # Use status_path (NOT ws_status_path) so _is_ws_pool keeps treating it as a non-pool core (a
+    # single-edge ws core installs no SIGHUP/SIGUSR handlers, so a pool-only signal would kill it).
+    if (transport == "ws" and str(cfg.get("role")) == "client"
+            and "ws_status_path" not in corecfg):
+        corecfg["status_path"] = os.path.join(CONFIG_DIR, "core-" + name + ".status")
     return corecfg
 
 
@@ -1416,7 +1423,7 @@ def op_ping(d):
         stats["net"] = net
     except Exception:
         pass
-    return {"ok": True, "agent": "tnl-node", "version": 22, "ready": True,
+    return {"ok": True, "agent": "tnl-node", "version": 23, "ready": True,
             "hostname": socket.gethostname(), "ips": all_ips(), "sha256": _SELF_SHA,
             "tunnels": len([c for c in cfgs if c.get("type") != "portfw"]),
             "portfw": len([c for c in cfgs if c.get("type") == "portfw"]),
