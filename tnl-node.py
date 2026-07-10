@@ -654,11 +654,11 @@ def _core_config(cfg):
                 corecfg["spoof_dst_ip"] = spoof_dst
             if spoof_src or spoof_dst:
                 corecfg["real_peer_ip"] = cfg["remote_ip"]
-    # Fake-packet desync (client, raw/flux only): the core emits decoy packets (low-TTL /
-    # bad-checksum) before each handshake to mis-sync a stateful DPI, without touching the real
-    # session. Only the raw/flux carriers can forge the IPv4 header, so it's forwarded only there.
-    # Decoys are separate packets, not extra per-frame overhead, so they cost no MTU budget.
-    if transport in ("raw", "flux") and cfg.get("role") == "client" and bool(cfg.get("fake_desync")):
+    # Fake-packet desync (client): the core emits decoy packets to mis-sync a stateful DPI without
+    # touching the real session. raw/flux forge whole IPv4 packets; tcp/ws INJECT decoy TCP segments
+    # on the kernel connection's 4-tuple (AF_PACKET). Plain udp has no such hook. Decoys are separate
+    # packets, not extra per-frame overhead, so they cost no MTU budget.
+    if transport in ("raw", "flux", "tcp", "ws") and cfg.get("role") == "client" and bool(cfg.get("fake_desync")):
         corecfg["fake_desync"] = True
         corecfg["fake_ttl"] = max(1, min(255, int(cfg.get("fake_ttl") or 4)))
         corecfg["fake_count"] = max(1, min(64, int(cfg.get("fake_count") or 2)))
@@ -1625,13 +1625,13 @@ def op_tunnel(d):
             obj["cover_sni"] = sni
         if _as_bool(d.get("gso")):        # TUN segmentation offload (throughput); Linux only, harmless if unsupported
             obj["gso"] = True
-        # Fake-packet desync (raw/flux only): persist the decoy knobs so _core_config can forward them.
-        # Only the raw/flux carriers build the IPv4 header themselves, so reject it elsewhere. Whitelisting
-        # is mandatory — an un-whitelisted key is silently dropped from the stored config and never reaches
-        # the core (this is exactly the bug spoofing hit).
+        # Fake-packet desync: persist the decoy knobs so _core_config can forward them. Supported on
+        # raw/flux (forge IPv4) and tcp/ws (inject decoy TCP segments); not on plain udp. Whitelisting
+        # is mandatory — an un-whitelisted key is silently dropped from the stored config and never
+        # reaches the core (this is exactly the bug spoofing hit).
         if _as_bool(d.get("fake_desync")):
-            if transport not in ("raw", "flux"):
-                raise ValueError("fake_desync is only supported on the raw and flux carriers")
+            if transport not in ("raw", "flux", "tcp", "ws"):
+                raise ValueError("fake_desync is supported on the raw, flux, tcp and ws carriers (not udp)")
             obj["fake_desync"] = True
             ttl = int(d.get("fake_ttl") or 4)
             if ttl < 1 or ttl > 255:
