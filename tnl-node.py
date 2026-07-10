@@ -606,6 +606,15 @@ def _core_config(cfg):
         # terminates TLS and forwards the WebSocket to the origin. Never emit ws_tls server-side.
         if bool(cfg.get("ws_tls")) and cfg.get("role") == "client":
             corecfg["ws_tls"] = True
+            # SNI fragmentation: split the wss ClientHello so the cleartext SNI crosses a TCP segment
+            # boundary — a stateless SNI-blocklist DPI can't match the full hostname. Cheap complement
+            # to ECH (which hides the SNI entirely). Applies to both single-edge and pool ws/xhttp.
+            # split_pos is the byte offset into the ClientHello (0 = auto: middle of the hostname).
+            if bool(cfg.get("sni_split")):
+                corecfg["sni_split"] = True
+                sp = int(cfg.get("split_pos") or 0)
+                if sp:
+                    corecfg["split_pos"] = max(0, min(1400, sp))
             # ECH: encrypt the SNI so an SNI-blocklisting censor can't see the real domain.
             # The panel fetches the base64 ECHConfigList from the domain's HTTPS record over
             # DoH (clean internet) and hands it to us; we just forward it to the core. Client
@@ -1423,7 +1432,7 @@ def op_ping(d):
         stats["net"] = net
     except Exception:
         pass
-    return {"ok": True, "agent": "tnl-node", "version": 23, "ready": True,
+    return {"ok": True, "agent": "tnl-node", "version": 24, "ready": True,
             "hostname": socket.gethostname(), "ips": all_ips(), "sha256": _SELF_SHA,
             "tunnels": len([c for c in cfgs if c.get("type") != "portfw"]),
             "portfw": len([c for c in cfgs if c.get("type") == "portfw"]),
@@ -1533,6 +1542,17 @@ def op_tunnel(d):
                     if len(ech) > 4096 or not re.match(r"^[A-Za-z0-9+/=]+$", ech):
                         raise ValueError("bad ws_ech")
                     obj["ws_ech"] = ech
+                # SNI fragmentation: split the wss ClientHello so the cleartext SNI crosses a TCP
+                # segment boundary (a cheap complement to ECH). Whitelist it so it survives
+                # persistence — forgetting it means _core_config never sees the key and the split
+                # silently never happens. split_pos is the byte offset (0 = auto: middle of the host).
+                if _as_bool(d.get("sni_split")):
+                    obj["sni_split"] = True
+                    sp = int(d.get("split_pos") or 0)
+                    if sp < 0 or sp > 1400:
+                        raise ValueError("bad split_pos")
+                    if sp:
+                        obj["split_pos"] = sp
                 # Edge pool: clean IP + SNI lists (each SNI {host,ech,path}) + rotation. Whitelist
                 # them so the rotation config survives (dropping = the pool silently collapses to
                 # the single edge). Validate every entry — these reach the core config verbatim.
