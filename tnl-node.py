@@ -615,6 +615,13 @@ def _core_config(cfg):
                 sp = int(cfg.get("split_pos") or 0)
                 if sp:
                     corecfg["split_pos"] = max(0, min(1400, sp))
+                # mode: "split" (in-order) or "disorder" (low-TTL head desyncs a reassembling DPI).
+                mode = str(cfg.get("sni_mode") or "").strip().lower()
+                if mode == "disorder":
+                    corecfg["sni_mode"] = "disorder"
+                    st = int(cfg.get("split_ttl") or 0)
+                    if st:
+                        corecfg["split_ttl"] = max(0, min(255, st))
             # ECH: encrypt the SNI so an SNI-blocklisting censor can't see the real domain.
             # The panel fetches the base64 ECHConfigList from the domain's HTTPS record over
             # DoH (clean internet) and hands it to us; we just forward it to the core. Client
@@ -1432,7 +1439,7 @@ def op_ping(d):
         stats["net"] = net
     except Exception:
         pass
-    return {"ok": True, "agent": "tnl-node", "version": 24, "ready": True,
+    return {"ok": True, "agent": "tnl-node", "version": 25, "ready": True,
             "hostname": socket.gethostname(), "ips": all_ips(), "sha256": _SELF_SHA,
             "tunnels": len([c for c in cfgs if c.get("type") != "portfw"]),
             "portfw": len([c for c in cfgs if c.get("type") == "portfw"]),
@@ -1553,6 +1560,13 @@ def op_tunnel(d):
                         raise ValueError("bad split_pos")
                     if sp:
                         obj["split_pos"] = sp
+                    if str(d.get("sni_mode") or "").strip().lower() == "disorder":
+                        obj["sni_mode"] = "disorder"
+                        st = int(d.get("split_ttl") or 0)
+                        if st < 0 or st > 255:
+                            raise ValueError("bad split_ttl")
+                        if st:
+                            obj["split_ttl"] = st
                 # Edge pool: clean IP + SNI lists (each SNI {host,ech,path}) + rotation. Whitelist
                 # them so the rotation config survives (dropping = the pool silently collapses to
                 # the single edge). Validate every entry — these reach the core config verbatim.
