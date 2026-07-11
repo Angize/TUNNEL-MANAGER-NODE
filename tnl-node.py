@@ -629,6 +629,12 @@ def _core_config(cfg):
             ech = str(cfg.get("ws_ech") or "").strip()
             if ech:
                 corecfg["ws_ech"] = ech
+            # No-SNI: omit the SNI extension entirely so an SNI-matching censor has nothing to match;
+            # the edge routes by the (encrypted) Host header. An alternative to ECH for a CDN that
+            # serves without SNI. Client + wss only; the core rejects combining it with ECH, SNI
+            # fragmentation, or the pool (all of which concern an SNI there no longer is).
+            if bool(cfg.get("ws_no_sni")):
+                corecfg["ws_no_sni"] = True
             # Edge pool: the panel sends clean edge-IP + SNI lists (each SNI with its own
             # ECH/path) plus the rotation settings. A non-empty pool overrides the single
             # ws_host/ws_ech/edge above — the core cycles (IP × SNI) and burns blocked ones,
@@ -1439,7 +1445,7 @@ def op_ping(d):
         stats["net"] = net
     except Exception:
         pass
-    return {"ok": True, "agent": "tnl-node", "version": 26, "ready": True,
+    return {"ok": True, "agent": "tnl-node", "version": 27, "ready": True,
             "hostname": socket.gethostname(), "ips": all_ips(), "sha256": _SELF_SHA,
             "tunnels": len([c for c in cfgs if c.get("type") != "portfw"]),
             "portfw": len([c for c in cfgs if c.get("type") == "portfw"]),
@@ -1568,6 +1574,12 @@ def op_tunnel(d):
                             raise ValueError("bad split_ttl")
                         if st:
                             obj["split_ttl"] = st
+                # No-SNI: omit the SNI extension so an SNI-matching censor has nothing to match; the
+                # edge routes by the encrypted Host header. Whitelist it so it survives persistence
+                # (forgetting it means _core_config never sees the key and no-SNI silently never
+                # happens). Client + wss only; the core rejects combining it with ECH/sni_split/pool.
+                if _as_bool(d.get("ws_no_sni")):
+                    obj["ws_no_sni"] = True
                 # Edge pool: clean IP + SNI lists (each SNI {host,ech,path}) + rotation. Whitelist
                 # them so the rotation config survives (dropping = the pool silently collapses to
                 # the single edge). Validate every entry — these reach the core config verbatim.
