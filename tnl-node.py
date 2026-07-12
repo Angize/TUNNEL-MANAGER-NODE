@@ -680,6 +680,25 @@ def _core_config(cfg):
         corecfg["fake_count"] = max(1, min(64, int(cfg.get("fake_count") or 2)))
         mode = str(cfg.get("fake_mode") or "ttl").strip().lower()
         corecfg["fake_mode"] = mode if mode in ("ttl", "badsum", "both") else "ttl"
+    # Destination rotation pool (client, direct transports udp/tcp/raw/flux): cycle the foreign node's
+    # IPs and burn a blocked one. Build the pool with the primary remote_ip FIRST (so the pool's
+    # starting endpoint matches the single `peer` the core also dials), dedup, then format per
+    # transport: udp/tcp dial "ip:port" (every endpoint shares the tunnel's core port), raw/flux
+    # address a bare IP (the core ignores any port there). A pool of >=2 overrides the single peer;
+    # the core writes its live active/burned state to a dedicated file we expose via op_peer_status.
+    if transport in ("udp", "tcp", "raw", "flux") and str(cfg.get("role")) == "client":
+        prim = str(cfg.get("remote_ip") or "").strip()
+        seen, ordered = set(), []
+        for x in [prim] + [str(v) for v in (cfg.get("peer_ips") or [])]:
+            ip = x.strip().split(":", 1)[0].strip()   # bare IPv4 (drop any accidental :port)
+            if ip and ip not in seen:
+                seen.add(ip)
+                ordered.append(ip)
+        if len(ordered) >= 2:
+            corecfg["peer_ips"] = [f"{ip}:{port}" if transport in ("udp", "tcp") else ip for ip in ordered]
+            corecfg["peer_rotate_secs"] = max(0, int(cfg.get("peer_rotate_secs") or 0))
+            corecfg["peer_auto_burn"] = bool(cfg.get("peer_auto_burn"))
+            corecfg["peer_status_path"] = os.path.join(CONFIG_DIR, "core-" + name + ".peerpool")
     if cfg.get("role") == "server":
         # Bind to THIS node's physical IP for the tunnel, not 0.0.0.0. With multiple IPs on the
         # host this is required for the raw transport: a raw (portless) socket bound to 0.0.0.0
@@ -724,9 +743,11 @@ def _core_unit(name):
 
 
 def _core_status_paths(name):
-    """The core's live status file and its select-edge command sidecar for tunnel `name`."""
+    """The core's live status files for tunnel `name`: the self-heal/ws-pool status, its select-edge
+    command sidecar, and the direct-transport destination-pool status. Callers only iterate to clean
+    them up, so listing all three here means a rebuild/teardown never leaves stale pool state behind."""
     base = os.path.join(CONFIG_DIR, "core-" + name + ".status")
-    return base, base + ".cmd"
+    return base, base + ".cmd", os.path.join(CONFIG_DIR, "core-" + name + ".peerpool")
 
 
 def _is_ws_pool(name):
@@ -1637,6 +1658,25 @@ def op_tunnel(d):
                 raise ValueError("fec_data/fec_parity out of range (>=1, sum<=255)")
             obj["fec_data"] = fd
             obj["fec_parity"] = fp
+        # Destination rotation pool (client, direct transports udp/tcp/raw/flux): the panel sends the
+        # foreign node's IPs to cycle through so a single blocked server IP doesn't kill the tunnel —
+        # the direct-transport analogue of the ws edge pool. Whitelisting these is mandatory (an
+        # un-whitelisted key is silently dropped and never reaches the core). Each must be a plain
+        # IPv4: the pool swaps the dial destination with no DNS step, and raw/flux are IPv4-only.
+        # Meaningless on ws (its own edge pool) or a server (it listens), so restrict to a direct
+        # client. Stored as bare IPs; _core_config appends the port for udp/tcp and leaves raw/flux bare.
+        if transport in ("udp", "tcp", "raw", "flux") and role == "client":
+            pips = [str(x).strip() for x in (d.get("peer_ips") or []) if str(x).strip()]
+            if pips:
+                if len(pips) > 64:
+                    raise ValueError("peer pool too large (>64)")
+                for ip in pips:
+                    if not is_ipv4(ip):
+                        raise ValueError("bad peer_ips entry (must be an IPv4 address)")
+                obj["peer_ips"] = pips
+                _prs = d.get("peer_rotate_secs")   # 0 = failover-only; a truthiness `or N` would wrongly force N
+                obj["peer_rotate_secs"] = max(0, min(86400, int(_prs))) if _prs is not None else 0
+                obj["peer_auto_burn"] = _as_bool(d.get("peer_auto_burn"))
         psk = str(d.get("psk") or "").strip()
         if psk:                       # crypto is optional but recommended; when set it must be strong enough
             if len(psk) < 16:
@@ -2083,6 +2123,29 @@ def op_edge_status(d):
             "now": int(time.time())}
 
 
+def op_peer_status(d):
+    """READ_ONLY: return the direct-transport destination pool's live state (active endpoint +
+    the full list + auto-burned endpoints) the core writes for tunnel {name}, so the panel can
+    show which server IP is in use and which got blocked. Empty when the tunnel has no pool or the
+    core hasn't written the file yet."""
+    _require(d, ["name"])
+    name = str(d["name"])
+    if not NAME_RE.match(name):
+        raise ValueError("bad name")
+    path = os.path.join(CONFIG_DIR, "core-" + name + ".peerpool")
+    try:
+        with open(path) as f:
+            st = json.load(f)
+    except (OSError, ValueError):
+        return {"ok": True, "active": "", "addrs": [], "burned": [], "ts": 0, "now": int(time.time())}
+    return {"ok": True,
+            "active": str(st.get("active") or ""),
+            "addrs": [str(x) for x in (st.get("addrs") or [])][:64],
+            "burned": [str(x) for x in (st.get("burned") or [])][:64],
+            "ts": int(st.get("updated_unix") or 0),
+            "now": int(time.time())}
+
+
 def op_pool_select(d):
     """Live 'pin this edge' for a ws edge pool: drop a JSON command file the running core polls
     (<status>.cmd) so it jumps its rotation to THIS specific IP/SNI and re-dials onto it — no
@@ -2326,11 +2389,12 @@ OPS = {"ping": op_ping, "list": op_list, "check": op_check, "tunnel": op_tunnel,
        "portfw": op_portfw, "portfw-edit": op_portfw_edit, "portfw-next": op_portfw_next,
        "delete": op_delete, "apply": op_apply, "update": op_update, "wipe": op_wipe,
        "portcheck": op_portcheck, "edge-status": op_edge_status,
+       "peer-status": op_peer_status,
        "pool-probe-now": op_pool_probe_now, "pool-select": op_pool_select,
        "core-install": op_core_install, "spoof-probe": op_spoof_probe,
        "set-update-key": op_set_update_key,
        "link-enable": op_link_enable}
-READ_ONLY = {"ping", "list", "check", "portcheck", "spoof-probe", "edge-status"}
+READ_ONLY = {"ping", "list", "check", "portcheck", "spoof-probe", "edge-status", "peer-status"}
 
 # ----------------------------------------------------------------------------- HTTP
 
