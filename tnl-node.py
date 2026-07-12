@@ -865,6 +865,11 @@ def _set_link_state(cfg, enabled):
             unit = _core_unit(name)
             run(["systemctl", "stop", unit])
             run(["systemctl", "reset-failed", unit])
+            for p in _core_status_paths(name):   # a stopped core has no live pool state -> don't leave stale
+                try:                              # status the panel would render as "live" (and never a leftover pin cmd)
+                    os.remove(p)
+                except OSError:
+                    pass
     else:
         run(["ip", "link", "set", name, "up" if enabled else "down"])
 
@@ -2175,6 +2180,9 @@ def op_edge_status(d):
             "now": int(time.time())}
 
 
+_PEER_ADDR_RE = re.compile(r"^[0-9A-Fa-f:.]{1,64}$")  # a pool endpoint is only ever an IPv4/IPv6/ip:port
+
+
 def _read_peer_pool(name, suffix):
     """Parse one direct-transport pool status file (suffix '.peerpool' = destination, '.srcpool' =
     source) into the normalized shape the panel reads: active endpoint, the full list, the flat burned
@@ -2186,22 +2194,30 @@ def _read_peer_pool(name, suffix):
             st = json.load(f)
     except (OSError, ValueError):
         return empty
+    # A pool endpoint is always a bare IP or ip:port; drop anything else so a malformed file can't feed
+    # a non-IP string to the panel's live view (defense-in-depth — the panel re-validates too).
+    ok = lambda s: bool(s) and bool(_PEER_ADDR_RE.match(s))
     health = []
     for h in (st.get("health") or [])[:64]:
         if not isinstance(h, dict):
             continue
+        key = str(h.get("key") or "")
+        if not ok(key):
+            continue
         health.append({
-            "key": str(h.get("key") or ""),
+            "key": key,
             "state": str(h.get("state") or "healthy"),
             "fails": int(h.get("fails") or 0),
             "next_retest_unix": int(h.get("next_retest_unix") or 0),
         })
+    active = str(st.get("active") or "")
+    pin = str(st.get("pin") or "")
     return {
-        "active": str(st.get("active") or ""),
-        "addrs": [str(x) for x in (st.get("addrs") or [])][:64],
-        "burned": [str(x) for x in (st.get("burned") or [])][:64],
+        "active": active if ok(active) else "",
+        "addrs": [x for x in (str(v) for v in (st.get("addrs") or [])) if ok(x)][:64],
+        "burned": [x for x in (str(v) for v in (st.get("burned") or [])) if ok(x)][:64],
         "health": health,
-        "pin": str(st.get("pin") or ""),
+        "pin": pin if ok(pin) else "",
         "ts": int(st.get("updated_unix") or 0),
     }
 
