@@ -724,13 +724,18 @@ def _core_config(cfg):
         # exact listen IP makes the reply source correct and also cleanly demuxes by destination IP.
         lip = cfg.get("local_ip") or "0.0.0.0"
         # EXCEPTION — under a destination rotation pool the client dials THIS server across several of
-        # its IPs, so a udp/tcp server must accept on ALL of them: bind 0.0.0.0. (raw/flux receive via
-        # AF_PACKET regardless of dest IP, so pool_listen is a no-op there.) The client owns its peer
-        # address and won't rebind from our reply source, so a 0.0.0.0 udp socket's default reply
-        # source is harmless.
-        if bool(cfg.get("pool_listen")) and transport in ("udp", "tcp"):
-            lip = "0.0.0.0"
-        corecfg["listen"] = f"{lip}:{port}"
+        # its selected IPs. Bind EACH one explicitly (the core opens one socket/listener per IP) instead
+        # of 0.0.0.0, for two reasons: (1) a UDP reply then egresses from the exact IP the client dialed
+        # — a single 0.0.0.0 socket would reply from the host's primary IP and the client, which filters
+        # by peer IP, would drop it; (2) the server accepts only on the pool IPs, not every host IP.
+        # listen stays the first IP as a friendly anchor; listen_ips drives the actual binds. (raw/flux
+        # receive via AF_PACKET regardless of dest IP, so pool_listen is a no-op there.)
+        pool_ips = [str(x).strip() for x in (cfg.get("listen_ips") or []) if str(x).strip()]
+        if bool(cfg.get("pool_listen")) and transport in ("udp", "tcp") and pool_ips:
+            corecfg["listen"] = f"{pool_ips[0]}:{port}"
+            corecfg["listen_ips"] = [f"{ip}:{port}" for ip in pool_ips]
+        else:
+            corecfg["listen"] = f"{lip}:{port}"
     else:
         # The client dials the peer. For a ws link fronted through a CDN, edge_ip
         # overrides the dial target to the CDN edge (host or host:port) while ws_host
@@ -1743,10 +1748,21 @@ def op_tunnel(d):
                 obj["peer_rotate_secs"] = max(0, min(86400, int(_prs))) if _prs is not None else 0
                 obj["peer_auto_burn"] = _as_bool(d.get("peer_auto_burn"))
         # pool_listen (server side, udp/tcp): the client rotates the destination across THIS server's
-        # IPs, so the server must accept on all of them — bind 0.0.0.0 instead of a single local IP.
+        # selected IPs, so the server binds EACH of them explicitly (one socket/listener per IP) rather
+        # than 0.0.0.0 — see _core_config for why (correct UDP reply source + accept only on pool IPs).
+        # listen_ips carries that selected set as bare IPv4 (the port is appended in _core_config).
+        # Whitelisting both keys is mandatory (an un-whitelisted key is dropped and never reaches core).
         # raw/flux receive via AF_PACKET (every dest IP already), so the flag is a no-op there.
         if transport in ("udp", "tcp") and role == "server" and _as_bool(d.get("pool_listen")):
             obj["pool_listen"] = True
+            lips = [str(x).strip() for x in (d.get("listen_ips") or []) if str(x).strip()]
+            if len(lips) > 64:
+                raise ValueError("listen_ips pool too large (>64)")
+            for ip in lips:
+                if not is_ipv4(ip):
+                    raise ValueError("bad listen_ips entry (must be an IPv4 address)")
+            if lips:
+                obj["listen_ips"] = lips
         psk = str(d.get("psk") or "").strip()
         if psk:                       # crypto is optional but recommended; when set it must be strong enough
             if len(psk) < 16:
