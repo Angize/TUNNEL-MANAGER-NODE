@@ -555,6 +555,11 @@ def _core_config(cfg):
         "keepalive": max(5, min(120, int(cfg.get("keepalive") or 15))),   # honor a configured value (clamped 5..120s); 15 default
         "crypto": {"enabled": crypto_on, "psk": cfg.get("psk", ""), "cipher": cipher},
     }
+    # Per-tunnel self-heal deadline (client): tightens the carrier's dead-detection window so this tunnel
+    # heals faster than the default. 0/unset = default formula; the core clamps a set value to >=2×keepalive.
+    _da = int(cfg.get("dead_after_secs") or 0)
+    if _da:
+        corecfg["dead_after_secs"] = max(10, min(300, _da))
     # TLS cover (HTTPS camouflage) — TCP only; carries an optional SNI to present.
     if bool(cfg.get("cover")) and transport == "tcp" and crypto_on:
         corecfg["cover"] = True
@@ -1570,6 +1575,11 @@ def op_tunnel(d):
     obj["enabled"] = _as_bool(d.get("enabled", (_prev or {}).get("enabled", True)))
     if ttype == "core" and d.get("keepalive") not in (None, ""):   # optional; whitelist so a set value survives (else _core_config falls back to 15)
         obj["keepalive"] = max(5, min(120, int(d["keepalive"])))
+    # dead_after_secs (core, optional): per-tunnel self-heal deadline. Whitelist so a set value survives;
+    # 0/unset leaves the core's default formula. Store within the same 10..300 range the core validates.
+    if ttype == "core" and d.get("dead_after_secs") not in (None, ""):
+        _da = int(d["dead_after_secs"])
+        obj["dead_after_secs"] = 0 if _da <= 0 else max(10, min(300, _da))
     if ttype in ("l2tpv3", "fou", "core", "vxlan"):   # optional UDP port; l2tp/fou/core blank->from id, vxlan blank->4789
         if d.get("port") not in (None, ""):
             port = int(d["port"])
