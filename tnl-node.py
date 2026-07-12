@@ -1517,7 +1517,20 @@ def op_list(d):
     cfgs = public_configs()  # O(1): configs are read fresh, health comes from the background snapshot
     with _health_lock:
         hc = dict(_health_cache)
-    return {"configs": cfgs, "health": {c["name"]: hc.get(c["name"], {"up": None}) for c in cfgs}}
+    # For a direct-transport IP-rotation client, surface the CURRENTLY-ACTIVE pool endpoint per tunnel
+    # (destination + source), so the panel's fleet view shows the live IP the tunnel is really on at load
+    # time — without a separate per-tunnel status call. Only pooled tunnels have these files; the rest are
+    # absent (empty), so this is a cheap best-effort read of a couple of small files per config.
+    pools = {}
+    for c in cfgs:
+        nm = c.get("name") or ""
+        if not nm:
+            continue
+        dst = _read_peer_pool(nm, ".peerpool")["active"]
+        src = _read_peer_pool(nm, ".srcpool")["active"]
+        if dst or src:
+            pools[nm] = {"dst": dst, "src": src}
+    return {"configs": cfgs, "health": {c["name"]: hc.get(c["name"], {"up": None}) for c in cfgs}, "pools": pools}
 
 
 def op_tunnel(d):
