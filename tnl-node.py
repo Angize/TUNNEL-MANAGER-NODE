@@ -713,6 +713,9 @@ def _core_config(cfg):
             corecfg["src_ips"] = sord
             corecfg.setdefault("peer_rotate_secs", max(0, int(cfg.get("peer_rotate_secs") or 0)))
             corecfg.setdefault("peer_auto_burn", bool(cfg.get("peer_auto_burn")))
+            # The source pool writes its own live state / pin cmd file so the panel can show and pin both
+            # sides (destination = .peerpool, source = .srcpool).
+            corecfg["src_status_path"] = os.path.join(CONFIG_DIR, "core-" + name + ".srcpool")
     if cfg.get("role") == "server":
         # Bind to THIS node's physical IP for the tunnel, not 0.0.0.0. With multiple IPs on the
         # host this is required for the raw transport: a raw (portless) socket bound to 0.0.0.0
@@ -764,11 +767,14 @@ def _core_unit(name):
 
 
 def _core_status_paths(name):
-    """The core's live status files for tunnel `name`: the self-heal/ws-pool status, its select-edge
-    command sidecar, and the direct-transport destination-pool status. Callers only iterate to clean
-    them up, so listing all three here means a rebuild/teardown never leaves stale pool state behind."""
+    """The core's live status files for tunnel `name`: the self-heal/ws-pool status and its select-edge
+    command sidecar, plus the direct-transport destination and source pool status files and their own pin
+    command sidecars. Callers only iterate to clean them up, so listing all of them here means a rebuild/
+    teardown never leaves stale pool state — or a leftover pin command — behind."""
     base = os.path.join(CONFIG_DIR, "core-" + name + ".status")
-    return base, base + ".cmd", os.path.join(CONFIG_DIR, "core-" + name + ".peerpool")
+    peer = os.path.join(CONFIG_DIR, "core-" + name + ".peerpool")
+    src = os.path.join(CONFIG_DIR, "core-" + name + ".srcpool")
+    return base, base + ".cmd", peer, peer + ".cmd", src, src + ".cmd"
 
 
 def _is_ws_pool(name):
@@ -781,6 +787,19 @@ def _is_ws_pool(name):
     except (OSError, ValueError):
         return False
     return bool(cc.get("ws_status_path") or cc.get("ws_edge_ips"))
+
+
+def _is_peer_pool(name):
+    """True if the running core for `name` is a direct-transport pool client (a destination and/or
+    source rotation pool). Such a core installs a SIGHUP handler (probe-now) exactly like the ws pool,
+    so pool-only ops must guard on this — signaling a plain core would fall through to Go's default
+    disposition and TERMINATE the tunnel."""
+    try:
+        with open(os.path.join(CONFIG_DIR, "core-" + name + ".json")) as f:
+            cc = json.load(f)
+    except (OSError, ValueError):
+        return False
+    return bool(cc.get("peer_status_path") or cc.get("src_status_path"))
 
 
 def build_core(cfg):
@@ -846,6 +865,11 @@ def _set_link_state(cfg, enabled):
             unit = _core_unit(name)
             run(["systemctl", "stop", unit])
             run(["systemctl", "reset-failed", unit])
+            for p in _core_status_paths(name):   # a stopped core has no live pool state -> don't leave stale
+                try:                              # status the panel would render as "live" (and never a leftover pin cmd)
+                    os.remove(p)
+                except OSError:
+                    pass
     else:
         run(["ip", "link", "set", name, "up" if enabled else "down"])
 
@@ -2156,27 +2180,112 @@ def op_edge_status(d):
             "now": int(time.time())}
 
 
+_PEER_ADDR_RE = re.compile(r"^[0-9A-Fa-f:.]{1,64}$")  # a pool endpoint is only ever an IPv4/IPv6/ip:port
+
+
+def _read_peer_pool(name, suffix):
+    """Parse one direct-transport pool status file (suffix '.peerpool' = destination, '.srcpool' =
+    source) into the normalized shape the panel reads: active endpoint, the full list, the flat burned
+    list, the per-endpoint health FSM (state / fails / retest countdown), and any operator pin. Empty
+    (but well-formed) when the file is missing — the pool doesn't exist or the core hasn't written yet."""
+    empty = {"active": "", "addrs": [], "burned": [], "health": [], "pin": "", "ts": 0}
+    try:
+        with open(os.path.join(CONFIG_DIR, "core-" + name + suffix)) as f:
+            st = json.load(f)
+    except (OSError, ValueError):
+        return empty
+    # A pool endpoint is always a bare IP or ip:port; drop anything else so a malformed file can't feed
+    # a non-IP string to the panel's live view (defense-in-depth — the panel re-validates too).
+    ok = lambda s: bool(s) and bool(_PEER_ADDR_RE.match(s))
+    health = []
+    for h in (st.get("health") or [])[:64]:
+        if not isinstance(h, dict):
+            continue
+        key = str(h.get("key") or "")
+        if not ok(key):
+            continue
+        health.append({
+            "key": key,
+            "state": str(h.get("state") or "healthy"),
+            "fails": int(h.get("fails") or 0),
+            "next_retest_unix": int(h.get("next_retest_unix") or 0),
+        })
+    active = str(st.get("active") or "")
+    pin = str(st.get("pin") or "")
+    return {
+        "active": active if ok(active) else "",
+        "addrs": [x for x in (str(v) for v in (st.get("addrs") or [])) if ok(x)][:64],
+        "burned": [x for x in (str(v) for v in (st.get("burned") or [])) if ok(x)][:64],
+        "health": health,
+        "pin": pin if ok(pin) else "",
+        "ts": int(st.get("updated_unix") or 0),
+    }
+
+
 def op_peer_status(d):
-    """READ_ONLY: return the direct-transport destination pool's live state (active endpoint +
-    the full list + auto-burned endpoints) the core writes for tunnel {name}, so the panel can
-    show which server IP is in use and which got blocked. Empty when the tunnel has no pool or the
-    core hasn't written the file yet."""
+    """READ_ONLY: return the direct-transport pools' live state for tunnel {name} — both the DESTINATION
+    pool (the server IPs the client dials) and the SOURCE pool (this node's own egress IPs) — so the
+    panel can show which IP is active, which got blocked (suspect vs dead, with the retest countdown),
+    and any manual pin. Empty sections when the tunnel has no such pool or the core hasn't written yet.
+    The core stamps next_retest_unix on the NODE's clock, so `now` is returned for the panel to count
+    down against (and to flag a stale file as offline)."""
     _require(d, ["name"])
     name = str(d["name"])
     if not NAME_RE.match(name):
         raise ValueError("bad name")
-    path = os.path.join(CONFIG_DIR, "core-" + name + ".peerpool")
+    dst = _read_peer_pool(name, ".peerpool")
+    src = _read_peer_pool(name, ".srcpool")
+    # Top-level fields mirror the destination pool for backward compatibility with the old reader.
+    return {"ok": True, "now": int(time.time()), "dst": dst, "src": src,
+            "active": dst["active"], "addrs": dst["addrs"], "burned": dst["burned"], "ts": dst["ts"]}
+
+
+def op_peer_select(d):
+    """Live 'pin this IP' for a direct-transport pool: drop a JSON command file the running core polls
+    (<status>.cmd) so it jumps its rotation to THIS specific endpoint and re-points onto it — no rebuild,
+    TUN stays up. side 'src' pins the source pool (<name>.srcpool.cmd); anything else the destination
+    pool (<name>.peerpool.cmd). Backs the panel's per-IP pin button."""
+    _require(d, ["name", "key"])
+    name = str(d["name"])
+    if not NAME_RE.match(name):
+        raise ValueError("bad name")
+    if not _is_peer_pool(name):
+        return {"ok": False, "error": "این تونل استخرِ آی‌پی ندارد"}
+    key = str(d.get("key") or "").strip()
+    if not key or len(key) > 64:
+        raise ValueError("مقدارِ آی‌پی نامعتبر است")
+    suffix = ".srcpool" if str(d.get("side")) == "src" else ".peerpool"
+    path = os.path.join(CONFIG_DIR, "core-" + name + suffix + ".cmd")
+    # Write atomically (tmp + replace): the core polls this file once per second and removes it, so a
+    # half-written file would be read+deleted and the pin SILENTLY LOST. os.replace is atomic.
+    tmp = path + ".tmp"
     try:
-        with open(path) as f:
-            st = json.load(f)
-    except (OSError, ValueError):
-        return {"ok": True, "active": "", "addrs": [], "burned": [], "ts": 0, "now": int(time.time())}
-    return {"ok": True,
-            "active": str(st.get("active") or ""),
-            "addrs": [str(x) for x in (st.get("addrs") or [])][:64],
-            "burned": [str(x) for x in (st.get("burned") or [])][:64],
-            "ts": int(st.get("updated_unix") or 0),
-            "now": int(time.time())}
+        with open(tmp, "w") as f:
+            json.dump({"key": key}, f)
+        os.replace(tmp, path)
+    except OSError as e:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return {"ok": False, "error": str(e)}
+    return {"ok": True}
+
+
+def op_peer_probe_now(d):
+    """Live 'probe now' for a direct-transport pool: SIGHUP tells the running core to retest EVERY
+    suspect/dead endpoint immediately (re-admit it to the live rotation) instead of waiting out the
+    backoff, so a lifted block heals at once. No rebuild, TUN stays up."""
+    _require(d, ["name"])
+    name = str(d["name"])
+    if not NAME_RE.match(name):
+        raise ValueError("bad name")
+    if not _is_peer_pool(name):   # a non-pool core has no SIGHUP handler -> the signal would kill it
+        return {"ok": False, "error": "این تونل استخرِ آی‌پی ندارد"}
+    rc, out, err = run(["systemctl", "kill", "-s", "SIGHUP", _core_unit(name)])
+    if rc != 0:
+        return {"ok": False, "error": (err or out or "").strip() or ("سیگنال به هسته نرسید (" + name + ")")}
+    return {"ok": True}
 
 
 def op_pool_select(d):
@@ -2423,6 +2532,7 @@ OPS = {"ping": op_ping, "list": op_list, "check": op_check, "tunnel": op_tunnel,
        "delete": op_delete, "apply": op_apply, "update": op_update, "wipe": op_wipe,
        "portcheck": op_portcheck, "edge-status": op_edge_status,
        "peer-status": op_peer_status,
+       "peer-select": op_peer_select, "peer-probe-now": op_peer_probe_now,
        "pool-probe-now": op_pool_probe_now, "pool-select": op_pool_select,
        "core-install": op_core_install, "spoof-probe": op_spoof_probe,
        "set-update-key": op_set_update_key,
