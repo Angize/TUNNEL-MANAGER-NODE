@@ -501,6 +501,41 @@ def _core_port(cfg):
     return int(cfg.get("port") or (20000 + int(cfg["id"])))
 
 
+_TUNING_INT_KEYS = ("dead_retest_secs", "pin_ttl_secs", "data_fail_threshold", "data_good_window_secs",
+                    "idle_mult", "idle_min_secs", "session_stale_mult", "session_stale_min_secs",
+                    "ping_loss_threshold", "min_liveness_secs", "probe_timeout_secs", "flux_rotate_default_secs")
+
+
+def _core_tuning(tn):
+    """Sanitize the panel's operational-timing overrides into a type-clean JSON object for the core:
+    positive ints for the scalar knobs, a list of positive ints for suspect_backoff. Drop anything
+    malformed or non-positive (the core treats absent/zero as "keep default"). Returns {} when there
+    is nothing to pass, so the core config omits `tuning` entirely and every timing stays at default."""
+    if not isinstance(tn, dict):
+        return {}
+    out = {}
+    for k in _TUNING_INT_KEYS:
+        try:
+            v = int(tn.get(k) or 0)
+        except (TypeError, ValueError):
+            continue
+        if v > 0:
+            out[k] = v
+    sb = tn.get("suspect_backoff")
+    if isinstance(sb, (list, tuple)):
+        steps = []
+        for x in sb:
+            try:
+                iv = int(x)
+            except (TypeError, ValueError):
+                continue
+            if iv > 0:
+                steps.append(iv)
+        if steps:
+            out["suspect_backoff"] = steps
+    return out
+
+
 def _core_config(cfg):
     """Pure: build the JSON the core binary consumes from a stored tunnel config. The tun device is
     named after the config so /proc/net/dev accounting and `ip link show <name>` health work unchanged.
@@ -560,6 +595,13 @@ def _core_config(cfg):
     _da = int(cfg.get("dead_after_secs") or 0)
     if _da:
         corecfg["dead_after_secs"] = max(10, min(300, _da))
+    # Operator-tuned operational timings (self-heal / pool-health): pass the panel's `tuning` object
+    # through to the core, which clamps every value. Keep it type-clean here (ints, and an int list for
+    # the backoff schedule) so a malformed field can't reach the core config; the core defaults any
+    # field we omit. Applies to both roles (idle/ping-loss are server-side too).
+    _tn = _core_tuning(cfg.get("tuning"))
+    if _tn:
+        corecfg["tuning"] = _tn
     # TLS cover (HTTPS camouflage) — TCP only; carries an optional SNI to present.
     if bool(cfg.get("cover")) and transport == "tcp" and crypto_on:
         corecfg["cover"] = True
