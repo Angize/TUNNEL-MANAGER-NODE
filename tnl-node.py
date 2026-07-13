@@ -615,6 +615,15 @@ def _core_config(cfg):
     # plain datagram core (only the pool has SIGHUP/SIGUSR handlers).
     if transport in ("udp", "raw", "flux") and str(cfg.get("role")) == "client":
         corecfg["status_path"] = os.path.join(CONFIG_DIR, "core-" + name + ".status")
+    # peer_src_ips (raw/flux SERVER): the client's source pool. These carriers receive via a raw/
+    # AF_PACKET socket that sees every host and pre-filter by the learned peer source, so a rotated
+    # client source is otherwise dropped pre-crypto and never re-learned (the tunnel dies on a source
+    # rotation until a rebuild). Handing the server the client's known sources lets a rotated-but-
+    # expected source reach crypto and re-bind. udp/tcp bind per-source and re-learn on their own.
+    if transport in ("raw", "flux") and str(cfg.get("role")) == "server":
+        _psrc = [str(x).strip() for x in (cfg.get("peer_src_ips") or []) if is_ipv4(str(x).strip())]
+        if _psrc:
+            corecfg["peer_src_ips"] = _psrc
     if transport == "raw":
         corecfg["raw_profile"] = raw_profile
     if transport == "flux":
@@ -1815,6 +1824,19 @@ def op_tunnel(d):
                     raise ValueError("bad listen_ips entry (must be an IPv4 address)")
             if lips:
                 obj["listen_ips"] = lips
+        # peer_src_ips (server side, raw/flux): the client's SOURCE pool. raw/flux servers see every host
+        # on the wire and pre-filter by the learned source, so a rotated client source is dropped pre-
+        # crypto and never re-learned without this. Whitelisting is mandatory (un-whitelisted keys are
+        # dropped and never reach the core). udp/tcp bind per-source and re-learn naturally.
+        if transport in ("raw", "flux") and role == "server":
+            psrc = [str(x).strip() for x in (d.get("peer_src_ips") or []) if str(x).strip()]
+            if len(psrc) > 64:
+                raise ValueError("peer_src_ips pool too large (>64)")
+            for ip in psrc:
+                if not is_ipv4(ip):
+                    raise ValueError("bad peer_src_ips entry (must be an IPv4 address)")
+            if psrc:
+                obj["peer_src_ips"] = psrc
         psk = str(d.get("psk") or "").strip()
         if psk:                       # crypto is optional but recommended; when set it must be strong enough
             if len(psk) < 16:
