@@ -1941,7 +1941,14 @@ def op_tunnel(d):
                 restored = False
             # A disabled tunnel legitimately has no netdev, so its restore succeeds as long as
             # apply_config didn't throw; only require the netdev to exist when it should be UP.
-            if restored and (not old.get("enabled", True) or run(["ip", "link", "show", name])[0] == 0):
+            # A `core` tunnel's TUN appears ASYNCHRONOUSLY: build_core launches a Restart=always unit
+            # and only waits ~8s for the TUN, never raising if it's still absent. On a node whose core
+            # cold-starts slower than that wait, a synchronous netdev check here would read False and
+            # fall through to os.remove — DELETING the perfectly-good restored config while the unit
+            # (which will bring the TUN up shortly) keeps running orphaned. So for core, a successful
+            # apply_config IS the restore signal (same reasoning as the disabled-tunnel skip below).
+            old_async_tun = old.get("type") == "core"
+            if restored and (not old.get("enabled", True) or old_async_tun or run(["ip", "link", "show", name])[0] == 0):
                 return {"ok": False, "msg": msg, "restored": True}
         try:
             os.remove(os.path.join(CONFIG_DIR, name + ".json"))
