@@ -51,6 +51,7 @@ INSTALLED = os.path.join(CONFIG_DIR, "tnl-node.py")  # stable path the systemd u
 CORE_BIN = os.path.join(CONFIG_DIR, "tnl-core")
 _core_lock = threading.Lock()  # serialize replace of the shared core binary
 _core_sha_cache = {"mtime": None, "sha": ""}  # avoid re-hashing the 3 MB binary on every ping
+_core_sha_lock = threading.Lock()  # guard the mtime/sha cache RMW (ping loop vs install thread)
 OBFS_DATA_PAD_MAX = 64   # must match the core's obfsDataPadMax so the MTU budget covers worst-case padding
 
 NAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
@@ -368,7 +369,7 @@ def build_sit(cfg):
          "local", cfg["local_ip"], "ttl", "255"])
     must(["ip", "-6", "addr", "add", cfg["tunnel_ip"], "dev", name])
     must(["ip", "link", "set", name, "up"])
-    run(["ip", "link", "set", "dev", name, "mtu", str(base_mtu(cfg.get("iface")) - 28 - 20)])
+    run(["ip", "link", "set", "dev", name, "mtu", str(base_mtu(cfg.get("iface")) - 20)])  # SIT = 6in4 (proto 41): outer IPv4 header only, 20 bytes
 
 
 def build_ipip(cfg):
@@ -493,11 +494,15 @@ def _installed_core_sha():
     """sha256 of the installed binary, cached by mtime so ping doesn't re-hash 3 MB each time."""
     try:
         st = os.stat(CORE_BIN)
-        if _core_sha_cache["mtime"] != st.st_mtime:
-            with open(CORE_BIN, "rb") as f:
-                _core_sha_cache["sha"] = hashlib.sha256(f.read()).hexdigest()
-            _core_sha_cache["mtime"] = st.st_mtime
-        return _core_sha_cache["sha"]
+        # Hold the lock across the whole read-modify-write so a concurrent caller (the health
+        # ping loop vs. the install thread) can't observe a torn cache — sha updated without its
+        # matching mtime, or two threads both hashing and interleaving their two writes.
+        with _core_sha_lock:
+            if _core_sha_cache["mtime"] != st.st_mtime:
+                with open(CORE_BIN, "rb") as f:
+                    _core_sha_cache["sha"] = hashlib.sha256(f.read()).hexdigest()
+                _core_sha_cache["mtime"] = st.st_mtime
+            return _core_sha_cache["sha"]
     except Exception:
         return ""
 
@@ -2459,17 +2464,19 @@ CORE_SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 
 def _verify_update_sig(msg, sig_b64):
     """Verify an RSA-SHA256 signature (base64) over `msg` (bytes) with the panel PUBLIC key stored in
-    node.conf['update_pubkey'], via openssl. Returns True when NO key is provisioned yet (legacy /
-    pre-rollout node — behave exactly as before) or the signature verifies; False when a key IS set but
-    the signature is missing/invalid. This is what stops a stolen token from pushing malicious root code:
-    only the panel (holding the matching private key) can produce a valid signature. Callers run under
-    _apply_lock, so the fixed temp paths below are never used concurrently."""
+    node.conf['update_pubkey'], via openssl. FAIL-CLOSED: returns True ONLY when a key is provisioned AND
+    the signature verifies; False otherwise — including when NO key is provisioned yet. This is what stops
+    a stolen token from pushing malicious root code: only the panel (holding the matching private key) can
+    produce a valid signature, and an unprovisioned node refuses every code/binary push rather than
+    accepting it unsigned. The panel provisions the key (set-update-key, first-set-only) immediately before
+    every push, so a legitimate push always finds the key in place. Callers run under _apply_lock, so the
+    fixed temp paths below are never used concurrently."""
     try:
         pub = str(load_conf().get("update_pubkey") or "").strip()
     except Exception:
         return False
     if not pub:
-        return True   # backward-compat: node not yet provisioned with a key -> accept unsigned as before
+        return False  # fail-closed: no verify key -> refuse the push (the panel self-provisions the key first)
     if not sig_b64:
         return False
     try:
