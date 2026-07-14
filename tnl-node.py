@@ -92,6 +92,20 @@ def run(args, timeout=60):
         return 127, "", str(e)
 
 
+def must(args, timeout=60):
+    """Run a build command that MUST succeed. run() never raises, so a failed `ip`/`ip xfrm` command
+    used to be swallowed silently — the netdev could still exist (so op_tunnel's netdev-exists verify
+    passed) while the tunnel was half-built (missing address, no ESP SA) and carried no traffic yet
+    reported ok. Raising here routes the real failure (stderr) through op_tunnel's apply_config catch,
+    which restores the previous build and returns ok:false with the reason. Use it ONLY for commands
+    that must succeed on a freshly-torn-down device — NOT for idempotent teardown (`ip link del`, xfrm
+    `deleteall`) or already-present-is-fine registrations (`ip fou add`), which stay on run()."""
+    rc, out, err = run(args, timeout=timeout)
+    if rc != 0:
+        raise RuntimeError((err or out or ("rc=" + str(rc))).strip() + "  [" + " ".join(args) + "]")
+    return rc, out, err
+
+
 def logline(msg):
     try:
         with open(LOG, "a") as f:
@@ -327,11 +341,11 @@ def build_vxlan(cfg):
     _purge_ovs(cfg)      # migrate: clear any OVS bridge/veth left by the old scheme so the name is free
     run(["ip", "link", "del", name])
     dstport = int(cfg.get("port") or 4789)   # UDP port is now settable (default 4789) — e.g. to dodge a filter
-    run(["ip", "link", "add", name, "type", "vxlan", "id", str(cfg["id"]),
+    must(["ip", "link", "add", name, "type", "vxlan", "id", str(cfg["id"]),
          "local", cfg["local_ip"], "remote", cfg["remote_ip"], "dstport", str(dstport)])
-    run(["ip", "addr", "add", cfg["tunnel_ip"], "dev", name])
-    run(["ip", "link", "set", name, "up"])
-    run(["ip", "link", "set", "dev", name, "mtu", str(base_mtu() - 50)])  # IP20+UDP8+VXLAN8+innerEth14
+    must(["ip", "addr", "add", cfg["tunnel_ip"], "dev", name])
+    must(["ip", "link", "set", name, "up"])
+    run(["ip", "link", "set", "dev", name, "mtu", str(base_mtu(cfg.get("iface")) - 50)])  # IP20+UDP8+VXLAN8+innerEth14
 
 
 def build_gre(cfg):
@@ -340,21 +354,21 @@ def build_gre(cfg):
     _modprobe("ip_gre")   # `ip link add type gre` does not auto-load the module
     _purge_ovs(cfg)       # migrate: clear any OVS bridge/veth left by the old scheme so the name is free
     run(["ip", "link", "del", name])
-    run(["ip", "link", "add", name, "type", "gre",
+    must(["ip", "link", "add", name, "type", "gre",
          "local", cfg["local_ip"], "remote", cfg["remote_ip"], "key", str(cfg["id"])])
-    run(["ip", "addr", "add", cfg["tunnel_ip"], "dev", name])
-    run(["ip", "link", "set", name, "up"])
-    run(["ip", "link", "set", "dev", name, "mtu", str(base_mtu() - 28)])  # IP20+GRE4+key4
+    must(["ip", "addr", "add", cfg["tunnel_ip"], "dev", name])
+    must(["ip", "link", "set", name, "up"])
+    run(["ip", "link", "set", "dev", name, "mtu", str(base_mtu(cfg.get("iface")) - 28)])  # IP20+GRE4+key4
 
 
 def build_sit(cfg):
     name = cfg["name"]
     run(["ip", "link", "del", name])
-    run(["ip", "tunnel", "add", name, "mode", "sit", "remote", cfg["remote_ip"],
+    must(["ip", "tunnel", "add", name, "mode", "sit", "remote", cfg["remote_ip"],
          "local", cfg["local_ip"], "ttl", "255"])
-    run(["ip", "-6", "addr", "add", cfg["tunnel_ip"], "dev", name])
-    run(["ip", "link", "set", name, "up"])
-    run(["ip", "link", "set", "dev", name, "mtu", str(base_mtu() - 28 - 20)])
+    must(["ip", "-6", "addr", "add", cfg["tunnel_ip"], "dev", name])
+    must(["ip", "link", "set", name, "up"])
+    run(["ip", "link", "set", "dev", name, "mtu", str(base_mtu(cfg.get("iface")) - 28 - 20)])
 
 
 def build_ipip(cfg):
@@ -362,11 +376,11 @@ def build_ipip(cfg):
     name = cfg["name"]
     _modprobe("ipip")
     run(["ip", "link", "del", name])
-    run(["ip", "tunnel", "add", name, "mode", "ipip", "remote", cfg["remote_ip"],
+    must(["ip", "tunnel", "add", name, "mode", "ipip", "remote", cfg["remote_ip"],
          "local", cfg["local_ip"], "ttl", "255"])
-    run(["ip", "addr", "add", cfg["tunnel_ip"], "dev", name])
-    run(["ip", "link", "set", name, "up"])
-    run(["ip", "link", "set", "dev", name, "mtu", str(base_mtu() - 20)])
+    must(["ip", "addr", "add", cfg["tunnel_ip"], "dev", name])
+    must(["ip", "link", "set", name, "up"])
+    run(["ip", "link", "set", "dev", name, "mtu", str(base_mtu(cfg.get("iface")) - 20)])
 
 
 def _l2tp_ids(cfg):
@@ -384,14 +398,14 @@ def build_l2tp(cfg):
     run(["ip", "l2tp", "del", "session", "tunnel_id", str(tid), "session_id", str(tid)])
     run(["ip", "l2tp", "del", "tunnel", "tunnel_id", str(tid)])
     run(["ip", "link", "del", name])
-    run(["ip", "l2tp", "add", "tunnel", "tunnel_id", str(tid), "peer_tunnel_id", str(tid),
+    must(["ip", "l2tp", "add", "tunnel", "tunnel_id", str(tid), "peer_tunnel_id", str(tid),
          "encap", "udp", "local", cfg["local_ip"], "remote", cfg["remote_ip"],
          "udp_sport", str(port), "udp_dport", str(port)])
-    run(["ip", "l2tp", "add", "session", "name", name, "tunnel_id", str(tid),
+    must(["ip", "l2tp", "add", "session", "name", name, "tunnel_id", str(tid),
          "session_id", str(tid), "peer_session_id", str(tid)])
-    run(["ip", "addr", "add", cfg["tunnel_ip"], "dev", name])
-    run(["ip", "link", "set", name, "up"])
-    run(["ip", "link", "set", "dev", name, "mtu", str(base_mtu() - 54)])
+    must(["ip", "addr", "add", cfg["tunnel_ip"], "dev", name])
+    must(["ip", "link", "set", name, "up"])
+    run(["ip", "link", "set", "dev", name, "mtu", str(base_mtu(cfg.get("iface")) - 54)])
 
 
 def _fou_port(cfg):
@@ -406,12 +420,12 @@ def build_fou(cfg):
     _modprobe("fou", "ipip")   # ipip is REQUIRED: `ip link add type ipip encap fou` won't auto-load it
     run(["ip", "link", "del", name])
     run(["ip", "fou", "add", "port", str(port), "ipproto", "4"])  # decap listener (harmless if already there)
-    run(["ip", "link", "add", "name", name, "type", "ipip", "remote", cfg["remote_ip"],
+    must(["ip", "link", "add", "name", name, "type", "ipip", "remote", cfg["remote_ip"],
          "local", cfg["local_ip"], "ttl", "255", "encap", "fou",
          "encap-sport", "auto", "encap-dport", str(port)])
-    run(["ip", "addr", "add", cfg["tunnel_ip"], "dev", name])
-    run(["ip", "link", "set", name, "up"])
-    run(["ip", "link", "set", "dev", name, "mtu", str(base_mtu() - 28)])
+    must(["ip", "addr", "add", cfg["tunnel_ip"], "dev", name])
+    must(["ip", "link", "set", name, "up"])
+    run(["ip", "link", "set", "dev", name, "mtu", str(base_mtu(cfg.get("iface")) - 28)])
 
 
 def _ipsec_params(cfg):
@@ -449,16 +463,16 @@ def build_ipsec(cfg):
     _ipsec_clear(cfg)
     common = ["proto", "esp", "mode", "tunnel", "reqid", str(tid),
               "enc", "cbc(aes)", "0x" + enc, "auth", "hmac(sha256)", "0x" + auth, "if_id", str(tid)]
-    run(["ip", "xfrm", "state", "add", "src", local, "dst", remote, "spi", hex(spi_out)] + common)
-    run(["ip", "xfrm", "state", "add", "src", remote, "dst", local, "spi", hex(spi_in)] + common)
+    must(["ip", "xfrm", "state", "add", "src", local, "dst", remote, "spi", hex(spi_out)] + common)
+    must(["ip", "xfrm", "state", "add", "src", remote, "dst", local, "spi", hex(spi_in)] + common)
     for dirn, s, dst in (("out", local, remote), ("in", remote, local), ("fwd", remote, local)):
-        run(["ip", "xfrm", "policy", "add", "dir", dirn, "if_id", str(tid),
+        must(["ip", "xfrm", "policy", "add", "dir", dirn, "if_id", str(tid),
              "tmpl", "src", s, "dst", dst, "proto", "esp", "reqid", str(tid), "mode", "tunnel"])
     phys = iface_for_ip(local) or default_iface()
-    run(["ip", "link", "add", name, "type", "xfrm", "dev", phys, "if_id", str(tid)])
-    run(["ip", "addr", "add", cfg["tunnel_ip"], "dev", name])
-    run(["ip", "link", "set", name, "up"])
-    run(["ip", "link", "set", "dev", name, "mtu", str(base_mtu() - 80)])
+    must(["ip", "link", "add", name, "type", "xfrm", "dev", phys, "if_id", str(tid)])
+    must(["ip", "addr", "add", cfg["tunnel_ip"], "dev", name])
+    must(["ip", "link", "set", name, "up"])
+    run(["ip", "link", "set", "dev", name, "mtu", str(base_mtu(cfg.get("iface")) - 80)])
 
 
 def _core_arch():
@@ -696,7 +710,8 @@ def _core_config(cfg):
                 corecfg["ws_edge_snis"] = [{"host": str(s["host"]).strip(),
                                          "ech": str(s.get("ech") or "").strip(),
                                          "path": str(s.get("path") or "").strip()} for s in snis]
-                corecfg["ws_rotate_secs"] = int(cfg.get("ws_rotate_secs") or 600)
+                _wrs = cfg.get("ws_rotate_secs")   # 0 = rotation OFF (failover-only); a truthiness `or 600` would wrongly force 600
+                corecfg["ws_rotate_secs"] = 600 if _wrs is None else max(0, min(28800, int(_wrs)))
                 corecfg["ws_auto_burn"] = bool(cfg.get("ws_auto_burn"))
                 corecfg["ws_warm_standby"] = bool(cfg.get("ws_warm_standby"))  # make-before-break failover
                 corecfg["ws_status_path"] = os.path.join(CONFIG_DIR, "core-" + name + ".status")
