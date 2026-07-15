@@ -2659,6 +2659,41 @@ def op_spoof_probe(d):
     return p
 
 
+def op_ech_update(d):
+    """Live ECH-key push: the panel fetched a freshly-rotated ECHConfigList and pushes it here so the
+    RUNNING pool core hot-swaps it (via the <status>.echcmd file the core polls every ~1s) — NO
+    rebuild, the TUN stays up. `snis` is {host: base64_ech}. No-op unless this is a ws edge-pool core."""
+    _require(d, ["name", "snis"])
+    name = str(d["name"])
+    if not NAME_RE.match(name):
+        raise ValueError("bad name")
+    if not _is_ws_pool(name):
+        return {"ok": False, "error": "این تونل استخرِ لبه ندارد"}
+    snis = d.get("snis") or {}
+    if not isinstance(snis, dict):
+        raise ValueError("bad snis")
+    clean = {}
+    for h, e in snis.items():
+        e = str(e or "").strip()
+        if e and len(e) <= 4096 and re.match(r"^[A-Za-z0-9+/=]+$", e):   # base64, same guard as op_tunnel
+            clean[str(h)[:255]] = e
+    if not clean:
+        return {"ok": False, "error": "no valid ech"}
+    path = os.path.join(CONFIG_DIR, "core-" + name + ".status.echcmd")
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump({"snis": clean}, f)
+        os.replace(tmp, path)
+    except OSError as e:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, "hosts": list(clean.keys())}
+
+
 OPS = {"ping": op_ping, "list": op_list, "check": op_check, "tunnel": op_tunnel,
        "portfw": op_portfw, "portfw-edit": op_portfw_edit, "portfw-next": op_portfw_next,
        "delete": op_delete, "apply": op_apply, "update": op_update, "wipe": op_wipe,
@@ -2666,6 +2701,7 @@ OPS = {"ping": op_ping, "list": op_list, "check": op_check, "tunnel": op_tunnel,
        "peer-status": op_peer_status,
        "peer-select": op_peer_select, "peer-probe-now": op_peer_probe_now,
        "pool-probe-now": op_pool_probe_now, "pool-select": op_pool_select,
+       "ech-update": op_ech_update,
        "core-install": op_core_install, "spoof-probe": op_spoof_probe,
        "set-update-key": op_set_update_key,
        "link-enable": op_link_enable}
