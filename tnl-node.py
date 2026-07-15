@@ -870,6 +870,18 @@ def _is_ws_pool(name):
     return bool(cc.get("ws_status_path") or cc.get("ws_edge_ips"))
 
 
+def _is_ws_single(name):
+    """True if the running core for `name` is a SINGLE ws/xhttp edge client — one fixed ws_host, no edge
+    pool. Such a core reads a live ECH push into b.wsECH from its dialLoop (same <status>.echcmd sidecar
+    a pool uses), so it can accept ech-update too. Needs a wired status_path for the sidecar to be read."""
+    try:
+        with open(os.path.join(CONFIG_DIR, "core-" + name + ".json")) as f:
+            cc = json.load(f)
+    except (OSError, ValueError):
+        return False
+    return bool(cc.get("ws_host") and cc.get("status_path")) and not (cc.get("ws_status_path") or cc.get("ws_edge_ips"))
+
+
 def _is_peer_pool(name):
     """True if the running core for `name` is a direct-transport pool client (a destination and/or
     source rotation pool). Such a core installs a SIGHUP handler (probe-now) exactly like the ws pool,
@@ -2661,14 +2673,16 @@ def op_spoof_probe(d):
 
 def op_ech_update(d):
     """Live ECH-key push: the panel fetched a freshly-rotated ECHConfigList and pushes it here so the
-    RUNNING pool core hot-swaps it (via the <status>.echcmd file the core polls every ~1s) — NO
-    rebuild, the TUN stays up. `snis` is {host: base64_ech}. No-op unless this is a ws edge-pool core."""
+    RUNNING ws core hot-swaps it (via the <status>.echcmd file the core polls) — NO rebuild, the TUN
+    stays up. `snis` is {host: base64_ech}. Works for BOTH a ws edge-pool (retestLoop reads it into the
+    pool) and a single ws edge (dialLoop reads it into b.wsECH); the sidecar path is the same for both.
+    No-op unless this is a ws core (pool or single edge)."""
     _require(d, ["name", "snis"])
     name = str(d["name"])
     if not NAME_RE.match(name):
         raise ValueError("bad name")
-    if not _is_ws_pool(name):
-        return {"ok": False, "error": "این تونل استخرِ لبه ندارد"}
+    if not (_is_ws_pool(name) or _is_ws_single(name)):
+        return {"ok": False, "error": "این تونل ws نیست"}
     snis = d.get("snis") or {}
     if not isinstance(snis, dict):
         raise ValueError("bad snis")
