@@ -323,23 +323,11 @@ def enable_ip_forward():
         pass
 
 
-def _purge_ovs(cfg):
-    """One-time migration from the old OpenvSwitch scheme: an already-provisioned node may still have an OVS
-    bridge named like the tunnel plus its veth pair, which would squat the netdev name. Best-effort removal —
-    ovs-vsctl is gone on fresh nodes (run() just returns 127), harmless on nodes that still have it."""
-    name, tid = cfg.get("name", ""), str(cfg.get("id", ""))
-    run(["ovs-vsctl", "--if-exists", "del-br", name])
-    if tid.isdigit():
-        run(["ip", "link", "del", f"veth{tid}a"])
-        run(["ip", "link", "del", f"veth{tid}b"])
-
-
 def build_vxlan(cfg):
     """Native kernel VXLAN (UDP 4789) — point-to-point to the peer, tunnel IP assigned directly.
     No OpenvSwitch/veth: one netdev per tunnel, same as ipip/sit. VNI == tunnel id (symmetric both ends)."""
     name = cfg["name"]
     _modprobe("vxlan")   # `ip link add type vxlan` does not auto-load the module
-    _purge_ovs(cfg)      # migrate: clear any OVS bridge/veth left by the old scheme so the name is free
     run(["ip", "link", "del", name])
     dstport = int(cfg.get("port") or 4789)   # UDP port is now settable (default 4789) — e.g. to dodge a filter
     must(["ip", "link", "add", name, "type", "vxlan", "id", str(cfg["id"]),
@@ -353,7 +341,6 @@ def build_gre(cfg):
     """Native kernel GRE (proto 47) — point-to-point, tunnel IP assigned directly. GRE key == tunnel id."""
     name = cfg["name"]
     _modprobe("ip_gre")   # `ip link add type gre` does not auto-load the module
-    _purge_ovs(cfg)       # migrate: clear any OVS bridge/veth left by the old scheme so the name is free
     run(["ip", "link", "del", name])
     must(["ip", "link", "add", name, "type", "gre",
          "local", cfg["local_ip"], "remote", cfg["remote_ip"], "key", str(cfg["id"])])
@@ -1120,8 +1107,6 @@ def teardown_config(cfg):
         return
     if ttype in ("vxlan", "gre", "sit", "ipip"):
         run(["ip", "link", "del", name])
-        if ttype in ("vxlan", "gre"):
-            _purge_ovs(cfg)   # also clear a pre-migration OVS bridge/veth, if this node still has one
     elif ttype == "l2tpv3":
         if tid.isdigit():
             run(["ip", "l2tp", "del", "session", "tunnel_id", tid, "session_id", tid])
@@ -2860,13 +2845,13 @@ def service_active():
 
 
 def install_deps():
-    # Native tunnels only need iproute2 (already present) + iptables for port-forwards. VXLAN/GRE/… are
-    # kernel modules loaded on demand; OpenvSwitch is no longer required.
-    print("[*] Installing dependencies (iptables)...")
+    # Native tunnels only need iproute2 (already present) + iptables for port-forwards; openssl verifies
+    # signed agent updates. VXLAN/GRE/… are kernel modules loaded on demand — no OpenvSwitch.
+    print("[*] Installing dependencies (iptables, openssl)...")
     env = dict(os.environ, DEBIAN_FRONTEND="noninteractive")
     try:
         subprocess.run(["apt-get", "update", "-qq"], env=env, timeout=300)
-        subprocess.run(["apt-get", "install", "-yqq", "iptables"], env=env, timeout=600)
+        subprocess.run(["apt-get", "install", "-yqq", "iptables", "openssl"], env=env, timeout=600)
     except Exception as e:
         print(f"[!] apt failed: {e}")
     print("[✔] dependencies ready (native tunnels — no OpenvSwitch needed).")
