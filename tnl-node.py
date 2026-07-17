@@ -583,6 +583,11 @@ def _core_config(cfg):
     # small underlay (PPPoE 1492 / IPv6-min 1280): floor 1280 could hand out MORE than base-overhead.
     # Sample the tunnel's own egress iface, and clamp only at a safe small minimum, never raising above budget.
     mtu = max(576, base_mtu(cfg.get("iface")) - overhead)
+    if transport == "dns":
+        # The dns carrier rides a reliable KCP stream that fragments internally across many tiny DNS
+        # datagrams, so the per-datagram DNS/AEAD overhead is NOT a per-packet header to subtract. A
+        # fixed, conservative MTU keeps each L3 packet to a few datagrams and avoids underlay issues.
+        mtu = 1280
     corecfg = {
         "role": cfg.get("role"),
         "mode": "packet",
@@ -640,6 +645,13 @@ def _core_config(cfg):
             _rp = 0
         if raw_profile == "bip" and 1 <= _rp <= 255:
             corecfg["raw_proto"] = _rp
+    if transport == "dns":
+        # DNS-tunnel carrier: the delegated zone (server is its authoritative NS) and, on the
+        # client, the recursive resolvers to query (typically DOMESTIC resolvers so the client
+        # never sends a packet to the server IP). Crypto is mandatory (validated in the core).
+        corecfg["dns_zone"] = str(cfg.get("dns_zone") or "").strip().lower()
+        if cfg.get("role") == "client":
+            corecfg["dns_resolvers"] = [str(x).strip() for x in (cfg.get("dns_resolvers") or []) if str(x).strip()]
     if transport == "flux":
         # flux is a distinct transport (not a raw_profile): carrier, shape profile,
         # epoch length and a manual epoch offset are all it needs — both ends derive
@@ -802,11 +814,15 @@ def _core_config(cfg):
         # listen stays the first IP as a friendly anchor; listen_ips drives the actual binds. (raw/flux
         # receive via AF_PACKET regardless of dest IP, so pool_listen is a no-op there.)
         pool_ips = [str(x).strip() for x in (cfg.get("listen_ips") or []) if str(x).strip()]
-        if bool(cfg.get("pool_listen")) and transport in ("udp", "tcp") and pool_ips:
+        if transport == "dns":
+            corecfg["listen"] = f"{lip}:53"   # authoritative NS on :53 for the delegated zone
+        elif bool(cfg.get("pool_listen")) and transport in ("udp", "tcp") and pool_ips:
             corecfg["listen"] = f"{pool_ips[0]}:{port}"
             corecfg["listen_ips"] = [f"{ip}:{port}" for ip in pool_ips]
         else:
             corecfg["listen"] = f"{lip}:{port}"
+    elif transport == "dns":
+        pass  # dns client has no peer — the core queries dns_resolvers, never the server IP
     else:
         # The client dials the peer. For a ws link fronted through a CDN, edge_ip
         # overrides the dial target to the CDN edge (host or host:port) while ws_host
@@ -1677,9 +1693,22 @@ def op_tunnel(d):
             raise ValueError("bad core cipher")
         obj["cipher"] = cipher
         transport = str(d.get("transport") or "udp").strip().lower()
-        if transport not in ("udp", "tcp", "raw", "flux", "ws"):
+        if transport not in ("udp", "tcp", "raw", "flux", "ws", "dns"):
             raise ValueError("bad core transport")
         obj["transport"] = transport
+        if transport == "dns":        # DNS-tunnel carrier: delegated zone + client resolver list
+            zone = str(d.get("dns_zone") or "").strip().lower()
+            if not zone or len(zone) > 253 or not re.match(r"^(?!-)[A-Za-z0-9-]{1,63}(?:\.(?!-)[A-Za-z0-9-]{1,63})+$", zone):
+                raise ValueError("bad dns_zone")
+            obj["dns_zone"] = zone
+            resolvers = []
+            for r in (d.get("dns_resolvers") or []):
+                rs = str(r).strip()
+                host = rs.rsplit(":", 1)[0] if rs.count(":") == 1 else rs
+                if rs and is_ipv4(host):
+                    resolvers.append(rs)
+            if resolvers:
+                obj["dns_resolvers"] = resolvers
         if transport == "ws":         # WebSocket carrier (CDN-frontable): persist Host/path/TLS
             wh = str(d.get("ws_host") or "").strip()
             if wh:
