@@ -1704,9 +1704,23 @@ def op_tunnel(d):
             resolvers = []
             for r in (d.get("dns_resolvers") or []):
                 rs = str(r).strip()
-                host = rs.rsplit(":", 1)[0] if rs.count(":") == 1 else rs
-                if rs and is_ipv4(host):
-                    resolvers.append(rs)
+                if not rs:
+                    continue
+                if rs.count(":") == 1:                       # ip:port — validate both halves
+                    host, _, port = rs.partition(":")
+                    if not (port.isdigit() and 1 <= int(port) <= 65535):
+                        raise ValueError("bad dns_resolvers port (1..65535)")
+                else:
+                    host = rs
+                if not is_ipv4(host):
+                    raise ValueError("bad dns_resolvers entry (must be IPv4 or IPv4:port)")
+                resolvers.append(rs)
+            # crypto is mandatory (core rejects dns without it) and the client needs at least one
+            # resolver — reject here so the failure is precise, not "interface not created".
+            if not str(d.get("psk") or "").strip() or cipher == "none":
+                raise ValueError("ترنسپورت dns به رمزنگاری (psk) نیاز دارد — نشست داخلِ کوئری‌های DNS با AEAD رمز و احراز می‌شود")
+            if role == "client" and not resolvers:
+                raise ValueError("کلاینتِ dns به حداقل یک resolverِ معتبر (IPv4) نیاز دارد")
             if resolvers:
                 obj["dns_resolvers"] = resolvers
         if transport == "ws":         # WebSocket carrier (CDN-frontable): persist Host/path/TLS
