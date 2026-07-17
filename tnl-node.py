@@ -2,7 +2,7 @@
 # tnl-node — self-contained node agent for the tnl central control plane.
 #
 # Installed on every NODE server. It is FULLY self-contained: it builds tunnels itself
-# (VXLAN/GRE via OpenvSwitch, SIT, iptables port-forwards), re-applies them on boot,
+# (VXLAN/GRE/SIT native kernel netdevs, iptables port-forwards), re-applies them on boot,
 # and rotates port-forward destinations — all in-process. No tnl.sh, no reload.sh, no jq,
 # no menu. Every operation is driven by the central panel over a token-authenticated API.
 #
@@ -2166,7 +2166,7 @@ _WILD = ("0.0.0.0", "::", "*", "")
 
 def _decode_hexip(h):
     """Decode a /proc/net local address hex string to a dotted/normal IP for comparison.
-    IPv4 is 8 hex chars little-endian; the all-zero form (any length) is the wildcard '::'.
+    IPv4 is 8 hex chars little-endian; the all-zero form (any length) is the wildcard '0.0.0.0'.
     Returns None when it can't decode (caller then treats the socket conservatively)."""
     h = h.strip()
     if set(h) <= {"0"}:
