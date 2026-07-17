@@ -557,7 +557,7 @@ def _core_config(cfg):
     flux_carrier = str(cfg.get("flux_carrier") or "udp").lower()
     if transport == "raw":
         # IP20 + the profile's carrier header (bip/ipip add none; gre 4; icmp/udp 8; tcp 20).
-        outer = 20 + {"bip": 0, "ipip": 0, "gre": 4, "icmp": 8, "udp": 8, "tcp": 20}.get(raw_profile, 0)
+        outer = 20 + {"bip": 0, "ipip": 0, "gre": 4, "icmp": 8, "udp": 8, "tcp": 20, "esp": 8}.get(raw_profile, 0)
     elif transport == "flux":
         # IP20 + the carrier header: udp adds an 8-byte UDP header; stun adds UDP + a
         # 20-byte STUN header; the raw carrier adds none.
@@ -1779,7 +1779,7 @@ def op_tunnel(d):
                 obj["edge_ip"] = edge
         if transport == "raw":        # raw-IP carrier: which protocol the sealed frame is wrapped in
             profile = str(d.get("raw_profile") or "bip").strip().lower()
-            if profile not in ("bip", "ipip", "gre", "icmp", "udp", "tcp"):
+            if profile not in ("bip", "ipip", "gre", "icmp", "udp", "tcp", "esp"):
                 raise ValueError("bad raw_profile")
             obj["raw_profile"] = profile
             if profile == "bip":      # optional custom IP protocol number for the bare bip carrier
