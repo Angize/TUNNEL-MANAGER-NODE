@@ -632,6 +632,14 @@ def _core_config(cfg):
             corecfg["peer_src_ips"] = _psrc
     if transport == "raw":
         corecfg["raw_profile"] = raw_profile
+        # bip-only: override the outer IP protocol number (bare, no L4 header) to slip past a
+        # protocol whitelist — e.g. 58 (ICMPv6). 0/absent keeps bip's native 253.
+        try:
+            _rp = int(cfg.get("raw_proto") or 0)
+        except (TypeError, ValueError):
+            _rp = 0
+        if raw_profile == "bip" and 1 <= _rp <= 255:
+            corecfg["raw_proto"] = _rp
     if transport == "flux":
         # flux is a distinct transport (not a raw_profile): carrier, shape profile,
         # epoch length and a manual epoch offset are all it needs — both ends derive
@@ -1774,6 +1782,12 @@ def op_tunnel(d):
             if profile not in ("bip", "ipip", "gre", "icmp", "udp", "tcp"):
                 raise ValueError("bad raw_profile")
             obj["raw_profile"] = profile
+            if profile == "bip":      # optional custom IP protocol number for the bare bip carrier
+                rproto = int(d.get("raw_proto") or 0)
+                if rproto and not (1 <= rproto <= 255):
+                    raise ValueError("bad raw_proto")
+                if rproto:
+                    obj["raw_proto"] = rproto
         if transport == "flux":       # polymorphic moving-target carrier: persist carrier/shape/epoch
             carrier = str(d.get("flux_carrier") or "udp").strip().lower()
             if carrier not in ("udp", "raw", "stun"):
