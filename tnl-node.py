@@ -619,12 +619,13 @@ def _core_config(cfg):
         sni = str(cfg.get("cover_sni") or "").strip()
         if sni:
             corecfg["cover_sni"] = sni
-    # Datagram transports (udp/raw/flux) have no ws edge pool, but the CLIENT still writes a
-    # precise self-heal event ring (stale-detect / recovery) to a status file we expose back to the
-    # panel's system log — same file name the pool uses, so op_edge_status reads it unchanged. This
-    # is `status_path` (NOT `ws_status_path`), so _is_ws_pool keeps telling a pool core apart from a
-    # plain datagram core (only the pool has SIGHUP/SIGUSR handlers).
-    if transport in ("udp", "raw", "flux") and str(cfg.get("role")) == "client":
+    # Datagram (udp/raw/flux) and direct-stream (plain tcp / tcp+cover) transports have no ws edge pool,
+    # but the CLIENT still writes a precise self-heal event ring (stale-detect / recovery) PLUS a liveness
+    # heartbeat (`hb`, core v2.48.3) to a status file we expose back to the panel's system log — same file
+    # name the pool uses, so op_edge_status reads it unchanged. This is `status_path` (NOT `ws_status_path`),
+    # so _is_ws_pool keeps telling a pool core apart from a plain core (only the pool has SIGHUP/SIGUSR
+    # handlers). Single ws/xhttp gets its own status_path below; ws-pool uses ws_status_path.
+    if transport in ("udp", "tcp", "raw", "flux") and str(cfg.get("role")) == "client":
         corecfg["status_path"] = os.path.join(CONFIG_DIR, "core-" + name + ".status")
     # peer_src_ips (raw/flux SERVER): the client's source pool. These carriers receive via a raw/
     # AF_PACKET socket that sees every host and pre-filter by the learned peer source, so a rotated
