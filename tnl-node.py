@@ -1238,6 +1238,44 @@ def peer_of(tunnel_ip, ttype):
     return f"{base}.2" if last == "1" else f"{base}.1"
 
 
+# --- traffic-flow liveness: real bytes arriving on the tunnel iface prove it's delivering, whatever ICMP does ---
+LIVE_WINDOW = 30.0   # s: the iface must have RECEIVED new bytes within this window to count as flow-alive
+_flow_lock = threading.Lock()
+_flow_state = {}     # iface name -> {"rx": int, "progress": float|None} (last sample + monotonic time rx last advanced)
+
+
+def _iface_rx(name):
+    """Total received bytes on <name> from the kernel, or None if the counter can't be read."""
+    try:
+        with open("/sys/class/net/" + name + "/statistics/rx_bytes") as f:
+            return int(f.read().strip())
+    except Exception:
+        return None
+
+
+def _flow_alive(name):
+    """True when <name> has RECEIVED new bytes within LIVE_WINDOW — real inbound tunnel traffic, so the
+    tunnel is delivering regardless of whether ICMP is answered/filtered. None when undetermined: first
+    sample, no inbound seen yet, the counter is unreadable, or the iface was just recreated (rx reset).
+    Never a hard False — silence isn't proof of death for an idle tunnel; that's what the ICMP fallback is for."""
+    now = time.monotonic()
+    with _flow_lock:  # sample + compare + store atomically so concurrent same-name callers can't invert rx order
+        rx = _iface_rx(name)
+        if rx is None:
+            return None
+        prev = _flow_state.get(name)
+        progress = prev.get("progress") if prev else None
+        if prev is not None:
+            if rx > prev["rx"]:
+                progress = now      # new bytes arrived since the last sample
+            elif rx < prev["rx"]:
+                progress = None     # counter went backwards = iface was recreated; old progress is meaningless
+        _flow_state[name] = {"rx": rx, "progress": progress}
+    if progress is None:
+        return None
+    return (now - progress) <= LIVE_WINDOW
+
+
 def health_of(cfg, thorough=False):
     ttype, name = cfg.get("type"), cfg.get("name", "")
     if ttype == "portfw":
@@ -1276,12 +1314,18 @@ def health_of(cfg, thorough=False):
         rc, _, _ = run(["ip", "link", "show", name])   # mid-teardown gap as a transient false 'down'
     if rc == 0:
         up = True
+    # Real-state liveness: if authenticated tunnel traffic is actually arriving on the iface, the tunnel
+    # is alive no matter whether ICMP is answered or filtered. Only meaningful once the iface exists.
+    flow = _flow_alive(name) if up else None
     ping = None
     peer = rtt = loss = None
     tip = cfg.get("tunnel_ip", "")
-    if tip and tip != "N/A":
+    # Probe with ICMP only when it can add something: the on-demand (thorough) check ALWAYS pings; the
+    # passive sweep pings only when traffic-flow hasn't already proven the tunnel alive — so a filtered
+    # ICMP can't paint a busy tunnel half-open, while an idle tunnel still gets a real reachability probe.
+    if up and tip and tip != "N/A" and (thorough or flow is not True):
         peer = peer_of(tip, ttype)
-        cnt, wait = ("4", "2") if thorough else ("1", "1")  # on-demand check pings harder for accuracy
+        cnt, wait = ("4", "2") if thorough else ("2", "2")  # on-demand pings harder; passive uses 2 to ride out a single drop
         cmd = (["ping", "-6", "-c", cnt, "-W", wait, peer] if ttype == "sit"
                else ["ping", "-c", cnt, "-W", wait, peer])
         rc3, out3, _ = run(cmd, timeout=14)
@@ -1292,7 +1336,18 @@ def health_of(cfg, thorough=False):
         if mr:
             rtt = float(mr.group(1))
         ping = (loss < 100) if loss is not None else (rc3 == 0)
-    return {"up": up, "peer_ping": ping, "peer": peer, "rtt_ms": rtt, "loss_pct": loss}
+    # alive = the real-state verdict the panel colours the dot from: traffic flowing OR probe answered.
+    # None when neither could tell (idle + no probe run); the panel then falls back to its old ping logic.
+    if flow is True:
+        alive, src = True, "flow"
+    elif ping is True:
+        alive, src = True, "ping"
+    elif ping is False:
+        alive, src = False, "ping"
+    else:
+        alive, src = None, None
+    return {"up": up, "alive": alive, "live_src": src,
+            "peer_ping": ping, "peer": peer, "rtt_ms": rtt, "loss_pct": loss}
 
 
 def _cpu_snap():
