@@ -1318,23 +1318,47 @@ def health_of(cfg, thorough=False):
     # Real-state liveness: if authenticated tunnel traffic is actually arriving on the iface, the tunnel
     # is alive no matter whether ICMP is answered or filtered. Only meaningful once the iface exists.
     flow = _flow_alive(name) if up else None
-    # Core heartbeat: a udp/raw/flux client core writes its lastRx (hb, unix-seconds) into the status file
-    # every few seconds. A FRESH hb proves the encrypted session is alive even with zero user traffic and
-    # filtered ICMP (idle-green); a FROZEN hb is a positive DEATH signal (peer gone -> red). hb 0/absent =
-    # old core / tcp-ws / server side / pre-handshake -> fall through to flow + ICMP.
-    beat = None  # True = alive (fresh hb), False = confirmed dead (frozen hb), None = no heartbeat to judge by
+    # Core heartbeat: a client core writes its lastRx (hb, unix-seconds) + its RESOLVED dead-window (dw,
+    # seconds) into the status file every few seconds. A FRESH hb (age <= dw) proves the encrypted session
+    # is alive even with zero user traffic and filtered ICMP (idle-green); an aged-out hb, OR an unpaired
+    # real-death `down` event, is a positive DEATH signal (-> red). Using the core's own dw means the dot
+    # ages hb against the EXACT window the core self-heals on (no private multiplier); a rotation/pin `down`
+    # is NOT a death. hb 0/absent (old core / server side / pre-handshake) -> fall through to flow + ICMP.
+    beat = None  # True = alive, False = confirmed dead, None = no heartbeat to judge by
     if up and ttype == "core":
+        _hb = _dw = 0
+        _evs = []
         try:
             with open(os.path.join(CONFIG_DIR, "core-" + name + ".status")) as f:
                 _doc = json.load(f)
-            _hb = int(_doc.get("hb") or 0) if isinstance(_doc, dict) else 0
+            if isinstance(_doc, dict):
+                _hb, _dw, _evs = int(_doc.get("hb") or 0), int(_doc.get("dw") or 0), (_doc.get("events") or [])
         except (OSError, ValueError, TypeError):
-            _hb = 0
+            pass
         if _hb > 0:
-            _ka = max(5, min(120, int(cfg.get("keepalive") or 15)))
-            # tolerate ~2 keepalive gaps + publish lag so a single lost keepalive never false-reds a healthy
-            # tunnel; scales with keepalive, so lowering keepalive is what buys faster death detection.
-            beat = (time.time() - _hb) <= int(_ka * 2.5) + 5
+            _rot = ("src-rotate", "src-pin", "peer-rotate", "peer-pin")  # `down`s where the session SURVIVES
+            _dn = _up_seq = -1
+            if isinstance(_evs, list):
+                for _e in _evs:
+                    if not isinstance(_e, dict):
+                        continue
+                    try:
+                        _sq = int(_e.get("seq") or 0)
+                    except (ValueError, TypeError):
+                        continue
+                    _k = str(_e.get("kind"))
+                    if _k == "down" and str(_e.get("code")) not in _rot:
+                        _dn = max(_dn, _sq)
+                    elif _k == "up":
+                        _up_seq = max(_up_seq, _sq)
+            _age = time.time() - _hb
+            if _dn > _up_seq:                          # core fired a real-death down not yet recovered -> dead NOW (fast, esp. stream eof)
+                beat = False
+            elif _dw > 0:
+                beat = _age <= _dw                     # core-authoritative window: unifies the multiplier, honours the operator's tuning
+            else:
+                _ka = max(5, min(120, int(cfg.get("keepalive") or 15)))
+                beat = _age <= int(_ka * 2.5) + 5      # pre-v2.48.4 core (no dw): the old keepalive-derived fallback
     ping = None
     peer = rtt = loss = None
     tip = cfg.get("tunnel_ip", "")
