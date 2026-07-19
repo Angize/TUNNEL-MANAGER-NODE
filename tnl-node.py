@@ -1239,7 +1239,7 @@ def peer_of(tunnel_ip, ttype):
 
 
 # --- traffic-flow liveness: real bytes arriving on the tunnel iface prove it's delivering, whatever ICMP does ---
-LIVE_WINDOW = 30.0   # s: the iface must have RECEIVED new bytes within this window to count as flow-alive
+LIVE_WINDOW = 12.0   # s: the iface must have RECEIVED new bytes within this window to count as flow-alive (kept short so a busy tunnel that dies flips out of "flow-alive" quickly)
 _flow_lock = threading.Lock()
 _flow_state = {}     # iface name -> {"rx": int, "progress": float|None} (last sample + monotonic time rx last advanced)
 
@@ -1317,15 +1317,33 @@ def health_of(cfg, thorough=False):
     # Real-state liveness: if authenticated tunnel traffic is actually arriving on the iface, the tunnel
     # is alive no matter whether ICMP is answered or filtered. Only meaningful once the iface exists.
     flow = _flow_alive(name) if up else None
+    # Core heartbeat: a udp/raw/flux client core writes its lastRx (hb, unix-seconds) into the status file
+    # every few seconds. A FRESH hb proves the encrypted session is alive even with zero user traffic and
+    # filtered ICMP (idle-green); a FROZEN hb is a positive DEATH signal (peer gone -> red). hb 0/absent =
+    # old core / tcp-ws / server side / pre-handshake -> fall through to flow + ICMP.
+    beat = None  # True = alive (fresh hb), False = confirmed dead (frozen hb), None = no heartbeat to judge by
+    if up and ttype == "core":
+        try:
+            with open(os.path.join(CONFIG_DIR, "core-" + name + ".status")) as f:
+                _doc = json.load(f)
+            _hb = int(_doc.get("hb") or 0) if isinstance(_doc, dict) else 0
+        except (OSError, ValueError, TypeError):
+            _hb = 0
+        if _hb > 0:
+            _ka = max(5, min(120, int(cfg.get("keepalive") or 15)))
+            # tolerate ~2 keepalive gaps + publish lag so a single lost keepalive never false-reds a healthy
+            # tunnel; scales with keepalive, so lowering keepalive is what buys faster death detection.
+            beat = (time.time() - _hb) <= int(_ka * 2.5) + 5
     ping = None
     peer = rtt = loss = None
     tip = cfg.get("tunnel_ip", "")
     # Probe with ICMP only when it can add something: the on-demand (thorough) check ALWAYS pings; the
-    # passive sweep pings only when traffic-flow hasn't already proven the tunnel alive — so a filtered
-    # ICMP can't paint a busy tunnel half-open, while an idle tunnel still gets a real reachability probe.
-    if up and tip and tip != "N/A" and (thorough or flow is not True):
+    # passive sweep pings only when NEITHER the core heartbeat NOR traffic-flow has already settled the
+    # verdict — so a filtered ICMP can't paint a busy/idle-but-live tunnel half-open, while a tunnel with
+    # no heartbeat/flow still gets a real reachability probe.
+    if up and tip and tip != "N/A" and (thorough or (beat is None and flow is not True)):
         peer = peer_of(tip, ttype)
-        cnt, wait = ("4", "2") if thorough else ("2", "2")  # on-demand pings harder; passive uses 2 to ride out a single drop
+        cnt, wait = ("4", "2") if thorough else ("1", "2")  # on-demand pings harder; passive stays a single cheap packet (2s wait) so an idle-ICMP-heavy fleet doesn't pile up
         cmd = (["ping", "-6", "-c", cnt, "-W", wait, peer] if ttype == "sit"
                else ["ping", "-c", cnt, "-W", wait, peer])
         rc3, out3, _ = run(cmd, timeout=14)
@@ -1336,9 +1354,15 @@ def health_of(cfg, thorough=False):
         if mr:
             rtt = float(mr.group(1))
         ping = (loss < 100) if loss is not None else (rc3 == 0)
-    # alive = the real-state verdict the panel colours the dot from: traffic flowing OR probe answered.
-    # None when neither could tell (idle + no probe run); the panel then falls back to its old ping logic.
-    if flow is True:
+    # alive = the real-state verdict the panel colours the dot from. `dead` = a POSITIVE death signal
+    # (frozen core heartbeat) so the panel paints it RED at once; an unconfirmed miss stays amber. None
+    # (no signal at all) lets the panel fall back to its old ping logic.
+    dead = False
+    if beat is True:
+        alive, src = True, "beat"
+    elif beat is False:
+        alive, src, dead = False, "beat", True
+    elif flow is True:
         alive, src = True, "flow"
     elif ping is True:
         alive, src = True, "ping"
@@ -1346,7 +1370,7 @@ def health_of(cfg, thorough=False):
         alive, src = False, "ping"
     else:
         alive, src = None, None
-    return {"up": up, "alive": alive, "live_src": src,
+    return {"up": up, "alive": alive, "live_src": src, "dead": dead,
             "peer_ping": ping, "peer": peer, "rtt_ms": rtt, "loss_pct": loss}
 
 
@@ -1499,10 +1523,10 @@ def health_loop():
     ex = ThreadPoolExecutor(max_workers=HEALTH_WORKERS)  # persistent; stragglers can't block the loop
     while True:
         try:
-            health_refresh_once(ex)
+            health_refresh_once(ex)   # blocks up to HEALTH_DEADLINE, so rounds never overlap/pile up
         except Exception as e:
             logline(f"health loop: {e}")
-        time.sleep(8)
+        time.sleep(3)  # tighter sweep = faster status (the heartbeat/flow path is cheap; idle-ICMP stragglers keep last-known)
 
 # ----------------------------------------------------------------------------- API ops
 
