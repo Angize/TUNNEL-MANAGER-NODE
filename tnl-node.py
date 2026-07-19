@@ -509,7 +509,9 @@ def _core_port(cfg):
 
 _TUNING_INT_KEYS = ("dead_retest_secs", "pin_ttl_secs", "data_fail_threshold", "data_good_window_secs",
                     "idle_mult", "idle_min_secs", "session_stale_mult", "session_stale_min_secs",
-                    "ping_loss_threshold", "min_liveness_secs", "probe_timeout_secs", "flux_rotate_default_secs")
+                    # flux_rotate_default_secs intentionally omitted: every flux tunnel carries an explicit
+                    # flux_rotate_secs, so the core's tuned default is unreachable; the panel offers no knob either.
+                    "ping_loss_threshold", "min_liveness_secs", "probe_timeout_secs")
 
 
 def _core_tuning(tn):
@@ -658,7 +660,10 @@ def _core_config(cfg):
         # epoch length and a manual epoch offset are all it needs — both ends derive
         # the rotating shape from the PSK + clock (+ offset), no on-wire negotiation.
         corecfg["flux_carrier"] = flux_carrier
-        corecfg["flux_rotate_secs"] = int(cfg.get("flux_rotate_secs") or 600)
+        # Clamp to the same 10..86400 range op_tunnel validation enforces, so a value reaching the
+        # core is always in-range even if op_tunnel was bypassed (the core only rejects <0). The
+        # clamp also neutralizes a stored negative that `... or 600` would pass through as truthy.
+        corecfg["flux_rotate_secs"] = max(10, min(86400, int(cfg.get("flux_rotate_secs") or 600)))
         corecfg["flux_shape"] = str(cfg.get("flux_shape") or "random").lower()
         off = int(cfg.get("flux_epoch_offset") or 0)
         if off:
@@ -1844,10 +1849,15 @@ def op_tunnel(d):
             # to a plain WebSocket, which the WS-block rule then kills).
             if _as_bool(d.get("ws_xhttp")):
                 obj["ws_xhttp"] = True
-                # xhttp upstream style: packet-up (default), stream-one, or grpc. Whitelist it so
-                # the choice survives persistence (dropping = silently reverts to packet-up).
+                # xhttp upstream style: packet-up (default) or grpc. "stream" is a legacy alias for
+                # grpc (the core runs the identical full-duplex path for both), so fold it to grpc
+                # BEFORE storing — this matches the panel, which also canonicalizes and stores grpc,
+                # so both write paths persist one string for identical behavior. Whitelist it so the
+                # choice survives persistence (dropping = silently reverts to packet-up).
                 xm = str(d.get("ws_xhttp_mode") or "").strip().lower()
-                if xm in ("packet", "stream", "grpc"):
+                if xm == "stream":
+                    xm = "grpc"
+                if xm in ("packet", "grpc"):
                     obj["ws_xhttp_mode"] = xm
             if _as_bool(d.get("ws_tls")):
                 obj["ws_tls"] = True
@@ -1893,10 +1903,19 @@ def op_tunnel(d):
                 if pips or psnis:
                     if len(pips) > 64 or len(psnis) > 64:
                         raise ValueError("ws edge pool too large")
+                    # The core dials each edge as a literal ip:port with no DNS step (config.go
+                    # validatePoolEndpoint, needPort=true): the host MUST be an IPv4 and a port is
+                    # REQUIRED. Reject hostnames/IPv6 and default a port-less IPv4 to :443 so the
+                    # normalized ip:port we forward always loads (a domain or a bare IP passed here
+                    # but failed the core config load — panel/node/core now agree on IPv4:port).
+                    npips = []
                     for ip in pips:
-                        h = ip.rpartition(":")[0] or ip
-                        if not re.match(r"^[A-Za-z0-9.\-]{1,253}$", h):
-                            raise ValueError("bad ws_edge_ip")
+                        h = ip.rpartition(":")[0] if ":" in ip else ip
+                        p = ip.rpartition(":")[2] if ":" in ip else "443"
+                        if not is_ipv4(h) or not (p.isdigit() and 1 <= int(p) <= 65535):
+                            raise ValueError("bad ws_edge_ip (must be IPv4:port)")
+                        npips.append("%s:%s" % (h, p))
+                    pips = npips
                     clean_snis = []
                     for s in psnis:
                         if not isinstance(s, dict):
