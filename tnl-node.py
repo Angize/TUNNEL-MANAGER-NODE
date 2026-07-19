@@ -1248,6 +1248,10 @@ def peer_of(tunnel_ip, ttype):
 LIVE_WINDOW = 12.0   # s: the iface must have RECEIVED new bytes within this window to count as flow-alive (kept short so a busy tunnel that dies flips out of "flow-alive" quickly)
 _flow_lock = threading.Lock()
 _flow_state = {}     # iface name -> {"rx": int, "progress": float|None} (last sample + monotonic time rx last advanced)
+# --- never-connected detection: a v2.48.4+ core publishes `dw` from startup but only stamps `hb` once it has
+# actually received an authenticated frame, so dw>0 with hb==0 means this client has NEVER been answered.
+_nohb_lock = threading.Lock()
+_nohb_state = {}     # iface name -> monotonic time we first saw "modern core running, still no inbound frame"
 
 
 def _iface_rx(name):
@@ -1330,8 +1334,8 @@ def health_of(cfg, thorough=False):
     # ages hb against the EXACT window the core self-heals on (no private multiplier); a rotation/pin `down`
     # is NOT a death. hb 0/absent (old core / server side / pre-handshake) -> fall through to flow + ICMP.
     beat = None  # True = alive, False = confirmed dead, None = no heartbeat to judge by
+    _hb = _dw = 0    # published heartbeat + resolved dead-window; kept in scope for the never-connected check below
     if up and ttype == "core":
-        _hb = _dw = 0
         _evs = []
         try:
             with open(os.path.join(CONFIG_DIR, "core-" + name + ".status")) as f:
@@ -1387,6 +1391,24 @@ def health_of(cfg, thorough=False):
     # alive = the real-state verdict the panel colours the dot from. `dead` = a POSITIVE death signal
     # (frozen core heartbeat) so the panel paints it RED at once; an unconfirmed miss stays amber. None
     # (no signal at all) lets the panel fall back to its old ping logic.
+    # NEVER-CONNECTED = dead, not "unknown". A v2.48.4+ core publishes `dw` the moment it starts but only
+    # stamps `hb` once a genuine authenticated frame has arrived, so dw>0 with hb==0 means this client has
+    # never been answered even once. Together with no traffic and a FAILED probe that is a dead tunnel.
+    # Without this it could only ever go amber: `dead` was reachable solely through the heartbeat path, and a
+    # tunnel that never connects produces no heartbeat to age out — so a permanently-broken tunnel (e.g. a
+    # pooled ws/xhttp client whose edge accepts TLS but never carries a frame) sat amber forever. Held for the
+    # core's own dead-window so a freshly (re)built tunnel can't flash red before its first frame lands. A
+    # pre-v2.48.4 core publishes no `dw`, so it keeps the old amber behaviour (its ICMP may just be filtered).
+    nohb_dead = False
+    if up and ttype == "core" and _dw > 0 and _hb <= 0 and flow is not True and ping is False:
+        with _nohb_lock:
+            _t0 = _nohb_state.get(name)
+            if _t0 is None:
+                _t0 = _nohb_state[name] = time.monotonic()
+        nohb_dead = (time.monotonic() - _t0) >= max(_dw, 20)
+    else:
+        with _nohb_lock:
+            _nohb_state.pop(name, None)   # condition no longer holds -> restart the grace next time
     dead = False
     if beat is True:
         alive, src = True, "beat"
@@ -1397,7 +1419,8 @@ def health_of(cfg, thorough=False):
     elif ping is True:
         alive, src = True, "ping"
     elif ping is False:
-        alive, src = False, "ping"
+        alive, src = False, ("nohb" if nohb_dead else "ping")
+        dead = nohb_dead
     else:
         alive, src = None, None
     return {"up": up, "alive": alive, "live_src": src, "dead": dead,
