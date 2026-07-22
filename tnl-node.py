@@ -628,7 +628,7 @@ def _core_config(cfg):
     # so _is_ws_pool keeps telling a pool core apart from a plain core (only the pool has SIGHUP/SIGUSR
     # handlers). Single ws/xhttp gets its own status_path below; ws-pool uses ws_status_path.
     if transport in ("udp", "tcp", "raw", "flux") and str(cfg.get("role")) == "client":
-        corecfg["status_path"] = os.path.join(CONFIG_DIR, "core-" + name + ".status")
+        corecfg["status_path"] = _cfg_path(name, ".status")
     # peer_src_ips (raw/flux SERVER): the client's source pool. These carriers receive via a raw/
     # AF_PACKET socket that sees every host and pre-filter by the learned peer source, so a rotated
     # client source is otherwise dropped pre-crypto and never re-learned (the tunnel dies on a source
@@ -732,7 +732,7 @@ def _core_config(cfg):
                 corecfg["ws_rotate_secs"] = 600 if _wrs is None else max(0, min(28800, int(_wrs)))
                 corecfg["ws_auto_burn"] = bool(cfg.get("ws_auto_burn"))
                 corecfg["ws_warm_standby"] = bool(cfg.get("ws_warm_standby"))  # make-before-break failover
-                corecfg["ws_status_path"] = os.path.join(CONFIG_DIR, "core-" + name + ".status")
+                corecfg["ws_status_path"] = _cfg_path(name, ".status")
     # FEC (forward error correction): reconstructs lost carrier datagrams from parity so a
     # throttled/high-loss link stays usable. Datagram carriers only (udp/raw/flux) — on
     # tcp/ws it's wasted (TCP is already reliable), so it's only forwarded for those three.
@@ -787,7 +787,7 @@ def _core_config(cfg):
             corecfg["peer_ips"] = [f"{ip}:{port}" if transport in ("udp", "tcp") else ip for ip in ordered]
             corecfg["peer_rotate_secs"] = max(0, int(cfg.get("peer_rotate_secs") or 0))
             corecfg["peer_auto_burn"] = bool(cfg.get("peer_auto_burn"))
-            corecfg["peer_status_path"] = os.path.join(CONFIG_DIR, "core-" + name + ".peerpool")
+            corecfg["peer_status_path"] = _cfg_path(name, ".peerpool")
         # Source rotation pool (client): this node's OWN IPs to send FROM, cycled alongside peer_ips.
         # Prepend local_ip so the pool's start matches the client's default source; bare IPv4 for every
         # carrier (a source is never "ip:port"). A pool of >=2 activates source rotation in the core.
@@ -804,7 +804,7 @@ def _core_config(cfg):
             corecfg.setdefault("peer_auto_burn", bool(cfg.get("peer_auto_burn")))
             # The source pool writes its own live state / pin cmd file so the panel can show and pin both
             # sides (destination = .peerpool, source = .srcpool).
-            corecfg["src_status_path"] = os.path.join(CONFIG_DIR, "core-" + name + ".srcpool")
+            corecfg["src_status_path"] = _cfg_path(name, ".srcpool")
     if cfg.get("role") == "server":
         # Bind to THIS node's physical IP for the tunnel, not 0.0.0.0. With multiple IPs on the
         # host this is required for the raw transport: a raw (portless) socket bound to 0.0.0.0
@@ -856,7 +856,7 @@ def _core_config(cfg):
     # single-edge ws core installs no SIGHUP/SIGUSR handlers, so a pool-only signal would kill it).
     if (transport == "ws" and str(cfg.get("role")) == "client"
             and "ws_status_path" not in corecfg):
-        corecfg["status_path"] = os.path.join(CONFIG_DIR, "core-" + name + ".status")
+        corecfg["status_path"] = _cfg_path(name, ".status")
     return corecfg
 
 
@@ -864,14 +864,38 @@ def _core_unit(name):
     return "tnl-cor-" + name
 
 
+def _cfg_path(name, suffix=""):
+    """Path of a core sidecar file for tunnel `name` in CONFIG_DIR (e.g. suffix=\".status\",
+    \".peerpool\", \".status.cmd\"). Centralizes the core-<name><suffix> naming used across the agent."""
+    return os.path.join(CONFIG_DIR, "core-" + name + suffix)
+
+
+def _atomic_write_json(path, obj):
+    """Write obj as JSON to path atomically (tmp + os.replace). The core polls these command files
+    once per second and deletes them, so a half-written file would be read+deleted and the command
+    SILENTLY LOST. Returns None on success, or the OSError string on failure."""
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(obj, f)
+        os.replace(tmp, path)
+    except OSError as e:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return str(e)
+    return None
+
+
 def _core_status_paths(name):
     """The core's live status files for tunnel `name`: the self-heal/ws-pool status and its select-edge
     command sidecar, plus the direct-transport destination and source pool status files and their own pin
     command sidecars. Callers only iterate to clean them up, so listing all of them here means a rebuild/
     teardown never leaves stale pool state — or a leftover pin command — behind."""
-    base = os.path.join(CONFIG_DIR, "core-" + name + ".status")
-    peer = os.path.join(CONFIG_DIR, "core-" + name + ".peerpool")
-    src = os.path.join(CONFIG_DIR, "core-" + name + ".srcpool")
+    base = _cfg_path(name, ".status")
+    peer = _cfg_path(name, ".peerpool")
+    src = _cfg_path(name, ".srcpool")
     return base, base + ".cmd", peer, peer + ".cmd", src, src + ".cmd"
 
 
@@ -880,7 +904,7 @@ def _is_ws_pool(name):
     SIGHUP/SIGUSR handlers. Signaling any other core falls through to Go's default signal
     disposition and TERMINATES the tunnel, so pool-only ops (probe-now / rotate) must guard on this."""
     try:
-        with open(os.path.join(CONFIG_DIR, "core-" + name + ".json")) as f:
+        with open(_cfg_path(name, ".json")) as f:
             cc = json.load(f)
     except (OSError, ValueError):
         return False
@@ -892,7 +916,7 @@ def _is_ws_single(name):
     pool. Such a core reads a live ECH push into b.wsECH from its dialLoop (same <status>.echcmd sidecar
     a pool uses), so it can accept ech-update too. Needs a wired status_path for the sidecar to be read."""
     try:
-        with open(os.path.join(CONFIG_DIR, "core-" + name + ".json")) as f:
+        with open(_cfg_path(name, ".json")) as f:
             cc = json.load(f)
     except (OSError, ValueError):
         return False
@@ -905,7 +929,7 @@ def _is_peer_pool(name):
     so pool-only ops must guard on this — signaling a plain core would fall through to Go's default
     disposition and TERMINATE the tunnel."""
     try:
-        with open(os.path.join(CONFIG_DIR, "core-" + name + ".json")) as f:
+        with open(_cfg_path(name, ".json")) as f:
             cc = json.load(f)
     except (OSError, ValueError):
         return False
@@ -925,7 +949,7 @@ def build_core(cfg):
         except OSError:
             pass
     corecfg = _core_config(cfg)
-    path = os.path.join(CONFIG_DIR, "core-" + name + ".json")
+    path = _cfg_path(name, ".json")
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
         json.dump(corecfg, f, indent=2)
@@ -951,7 +975,7 @@ def _core_teardown(cfg):
     run(["systemctl", "stop", unit])       # kills the core -> its non-persistent TUN disappears
     run(["systemctl", "reset-failed", unit])
     try:
-        os.remove(os.path.join(CONFIG_DIR, "core-" + name + ".json"))
+        os.remove(_cfg_path(name, ".json"))
     except OSError:
         pass
     for p in _core_status_paths(name):   # don't leave a dead tunnel's pool state as "live"
@@ -1338,7 +1362,7 @@ def health_of(cfg, thorough=False):
     if up and ttype == "core":
         _evs = []
         try:
-            with open(os.path.join(CONFIG_DIR, "core-" + name + ".status")) as f:
+            with open(_cfg_path(name, ".status")) as f:
                 _doc = json.load(f)
             if isinstance(_doc, dict):
                 _hb, _dw, _evs = int(_doc.get("hb") or 0), int(_doc.get("dw") or 0), (_doc.get("events") or [])
@@ -2469,7 +2493,7 @@ def op_edge_status(d):
     name = str(d["name"])
     if not NAME_RE.match(name):
         raise ValueError("bad name")
-    path = os.path.join(CONFIG_DIR, "core-" + name + ".status")
+    path = _cfg_path(name, ".status")
     try:
         with open(path) as f:
             st = json.load(f)
@@ -2520,7 +2544,7 @@ def _read_peer_pool(name, suffix):
     (but well-formed) when the file is missing — the pool doesn't exist or the core hasn't written yet."""
     empty = {"active": "", "addrs": [], "burned": [], "health": [], "pin": "", "ts": 0}
     try:
-        with open(os.path.join(CONFIG_DIR, "core-" + name + suffix)) as f:
+        with open(_cfg_path(name, suffix)) as f:
             st = json.load(f)
     except (OSError, ValueError):
         return empty
@@ -2585,20 +2609,12 @@ def op_peer_select(d):
     if not key or len(key) > 64:
         raise ValueError("مقدارِ آی‌پی نامعتبر است")
     suffix = ".srcpool" if str(d.get("side")) == "src" else ".peerpool"
-    path = os.path.join(CONFIG_DIR, "core-" + name + suffix + ".cmd")
+    path = _cfg_path(name, suffix + ".cmd")
     # Write atomically (tmp + replace): the core polls this file once per second and removes it, so a
     # half-written file would be read+deleted and the pin SILENTLY LOST. os.replace is atomic.
-    tmp = path + ".tmp"
-    try:
-        with open(tmp, "w") as f:
-            json.dump({"key": key}, f)
-        os.replace(tmp, path)
-    except OSError as e:
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
-        return {"ok": False, "error": str(e)}
+    err = _atomic_write_json(path, {"key": key})
+    if err:
+        return {"ok": False, "error": err}
     return {"ok": True}
 
 
@@ -2632,20 +2648,12 @@ def op_pool_select(d):
     key = str(d.get("key") or "").strip()
     if not key or len(key) > 255:
         raise ValueError("مقدارِ لبه نامعتبر است")
-    path = os.path.join(CONFIG_DIR, "core-" + name + ".status.cmd")
+    path = _cfg_path(name, ".status.cmd")
     # Write atomically (tmp + replace): the core polls this file once per second and removes it,
     # so a half-written file would be read+deleted and the pin SILENTLY LOST. os.replace is atomic.
-    tmp = path + ".tmp"
-    try:
-        with open(tmp, "w") as f:
-            json.dump({"kind": kind, "key": key}, f)
-        os.replace(tmp, path)
-    except OSError as e:
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
-        return {"ok": False, "error": str(e)}
+    err = _atomic_write_json(path, {"kind": kind, "key": key})
+    if err:
+        return {"ok": False, "error": err}
     return {"ok": True}
 
 
@@ -2881,18 +2889,10 @@ def op_ech_update(d):
             clean[str(h)[:255]] = e
     if not clean:
         return {"ok": False, "error": "no valid ech"}
-    path = os.path.join(CONFIG_DIR, "core-" + name + ".status.echcmd")
-    tmp = path + ".tmp"
-    try:
-        with open(tmp, "w") as f:
-            json.dump({"snis": clean}, f)
-        os.replace(tmp, path)
-    except OSError as e:
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
-        return {"ok": False, "error": str(e)}
+    path = _cfg_path(name, ".status.echcmd")
+    err = _atomic_write_json(path, {"snis": clean})
+    if err:
+        return {"ok": False, "error": err}
     return {"ok": True, "hosts": list(clean.keys())}
 
 
