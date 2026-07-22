@@ -539,6 +539,19 @@ def _core_tuning(tn):
     return out
 
 
+def _ordered_pool(primary, extras):
+    """Build a rotation pool: `primary` first, then `extras`, each reduced to a bare IPv4 (any
+    accidental :port stripped), de-duplicated preserving first-seen order, blanks dropped. Used for
+    both the destination pool (remote_ip + peer_ips) and the source pool (local_ip + src_ips)."""
+    seen, ordered = set(), []
+    for x in [primary] + [str(v) for v in (extras or [])]:
+        ip = str(x).strip().split(":", 1)[0].strip()
+        if ip and ip not in seen:
+            seen.add(ip)
+            ordered.append(ip)
+    return ordered
+
+
 def _core_config(cfg):
     """Pure: build the JSON the core binary consumes from a stored tunnel config. The tun device is
     named after the config so /proc/net/dev accounting and `ip link show <name>` health work unchanged.
@@ -771,13 +784,7 @@ def _core_config(cfg):
     # address a bare IP (the core ignores any port there). A pool of >=2 overrides the single peer;
     # the core writes its live active/burned state to a dedicated file we expose via op_peer_status.
     if transport in ("udp", "tcp", "raw", "flux") and str(cfg.get("role")) == "client":
-        prim = str(cfg.get("remote_ip") or "").strip()
-        seen, ordered = set(), []
-        for x in [prim] + [str(v) for v in (cfg.get("peer_ips") or [])]:
-            ip = x.strip().split(":", 1)[0].strip()   # bare IPv4 (drop any accidental :port)
-            if ip and ip not in seen:
-                seen.add(ip)
-                ordered.append(ip)
+        ordered = _ordered_pool(str(cfg.get("remote_ip") or ""), cfg.get("peer_ips"))
         if len(ordered) >= 2:
             corecfg["peer_ips"] = [f"{ip}:{port}" if transport in ("udp", "tcp") else ip for ip in ordered]
             corecfg["peer_rotate_secs"] = max(0, int(cfg.get("peer_rotate_secs") or 0))
@@ -786,13 +793,7 @@ def _core_config(cfg):
         # Source rotation pool (client): this node's OWN IPs to send FROM, cycled alongside peer_ips.
         # Prepend local_ip so the pool's start matches the client's default source; bare IPv4 for every
         # carrier (a source is never "ip:port"). A pool of >=2 activates source rotation in the core.
-        sprim = str(cfg.get("local_ip") or "").strip()
-        sseen, sord = set(), []
-        for x in [sprim] + [str(v) for v in (cfg.get("src_ips") or [])]:
-            ip = x.strip().split(":", 1)[0].strip()
-            if ip and ip not in sseen:
-                sseen.add(ip)
-                sord.append(ip)
+        sord = _ordered_pool(str(cfg.get("local_ip") or ""), cfg.get("src_ips"))
         if len(sord) >= 2:
             corecfg["src_ips"] = sord
             corecfg.setdefault("peer_rotate_secs", max(0, int(cfg.get("peer_rotate_secs") or 0)))
@@ -894,15 +895,23 @@ def _core_status_paths(name):
     return base, base + ".cmd", peer, peer + ".cmd", src, src + ".cmd"
 
 
-def _is_ws_pool(name):
-    """True if the running core for `name` is a ws edge-pool client — the ONLY core that installs
-    SIGHUP/SIGUSR handlers. Signaling any other core falls through to Go's default signal
-    disposition and TERMINATES the tunnel, so pool-only ops (probe-now / rotate) must guard on this."""
+def _read_core_cfg(name):
+    """The on-disk core config dict for `name`, or `{}` if it is missing / unreadable / not a JSON
+    object. Backs the _is_* core-shape predicates below; returning `{}` (not None) on failure lets
+    each caller `.get(...)` unconditionally."""
     try:
         with open(_cfg_path(name, ".json")) as f:
             cc = json.load(f)
     except (OSError, ValueError):
-        return False
+        return {}
+    return cc if isinstance(cc, dict) else {}
+
+
+def _is_ws_pool(name):
+    """True if the running core for `name` is a ws edge-pool client — the ONLY core that installs
+    SIGHUP/SIGUSR handlers. Signaling any other core falls through to Go's default signal
+    disposition and TERMINATES the tunnel, so pool-only ops (probe-now / rotate) must guard on this."""
+    cc = _read_core_cfg(name)
     return bool(cc.get("ws_status_path") or cc.get("ws_edge_ips"))
 
 
@@ -910,11 +919,7 @@ def _is_ws_single(name):
     """True if the running core for `name` is a SINGLE ws/xhttp edge client — one fixed ws_host, no edge
     pool. Such a core reads a live ECH push into b.wsECH from its dialLoop (same <status>.echcmd sidecar
     a pool uses), so it can accept ech-update too. Needs a wired status_path for the sidecar to be read."""
-    try:
-        with open(_cfg_path(name, ".json")) as f:
-            cc = json.load(f)
-    except (OSError, ValueError):
-        return False
+    cc = _read_core_cfg(name)
     return bool(cc.get("ws_host") and cc.get("status_path")) and not (cc.get("ws_status_path") or cc.get("ws_edge_ips"))
 
 
@@ -923,11 +928,7 @@ def _is_peer_pool(name):
     source rotation pool). Such a core installs a SIGHUP handler (probe-now) exactly like the ws pool,
     so pool-only ops must guard on this — signaling a plain core would fall through to Go's default
     disposition and TERMINATE the tunnel."""
-    try:
-        with open(_cfg_path(name, ".json")) as f:
-            cc = json.load(f)
-    except (OSError, ValueError):
-        return False
+    cc = _read_core_cfg(name)
     return bool(cc.get("peer_status_path") or cc.get("src_status_path"))
 
 
@@ -1036,26 +1037,37 @@ def _pf_acct_rules(cfg):
     return out
 
 
+def _ipt_add_missing(table, chain, rule):
+    """Append `rule` to `chain` in `table` only if an identical rule isn't already there (-C probes,
+    -A adds). Idempotent, so a per-rotation rebuild never stacks duplicates."""
+    rc, _, _ = run(["iptables", "-t", table, "-C", chain] + rule)
+    if rc != 0:
+        run(["iptables", "-t", table, "-A", chain] + rule)
+
+
+def _ipt_del_all(table, chain, rule, tries=64):
+    """Delete EVERY copy of `rule` from `chain` in `table`: -C probes, break when a check misses (no
+    copies left), else -D removes one. iptables deletes a single matching rule per -D, so N stale
+    duplicates need N deletes; `tries` bounds the loop so a pathological case can't spin forever."""
+    for _ in range(tries):
+        rc, _, _ = run(["iptables", "-t", table, "-C", chain] + rule)
+        if rc != 0:
+            break
+        run(["iptables", "-t", table, "-D", chain] + rule)
+
+
 def _pf_acct_build(cfg):
     """(Re)ensure this forward's accounting rules exist — idempotent, so the per-rotation build_portfw
     call never resets the counters. Rules live in a dedicated PFACCT chain hung off mangle PREROUTING."""
     run(["iptables", "-t", "mangle", "-N", "PFACCT"])  # create once; errors harmlessly if it exists
-    rc, _, _ = run(["iptables", "-t", "mangle", "-C", "PREROUTING", "-j", "PFACCT"])
-    if rc != 0:
-        run(["iptables", "-t", "mangle", "-A", "PREROUTING", "-j", "PFACCT"])
+    _ipt_add_missing("mangle", "PREROUTING", ["-j", "PFACCT"])
     for r in _pf_acct_rules(cfg):
-        rc, _, _ = run(["iptables", "-t", "mangle", "-C", "PFACCT"] + r)
-        if rc != 0:
-            run(["iptables", "-t", "mangle", "-A", "PFACCT"] + r)
+        _ipt_add_missing("mangle", "PFACCT", r)
 
 
 def _pf_acct_teardown(cfg):
     for r in _pf_acct_rules(cfg):
-        for _ in range(64):
-            rc, _, _ = run(["iptables", "-t", "mangle", "-C", "PFACCT"] + r)
-            if rc != 0:
-                break
-            run(["iptables", "-t", "mangle", "-D", "PFACCT"] + r)
+        _ipt_del_all("mangle", "PFACCT", r)
 
 
 def _read_pf_net(cfgs):
@@ -1096,31 +1108,17 @@ def build_portfw(cfg):
     for proto in ("tcp", "udp"):   # forward BOTH protocols — VPN endpoints (WireGuard/OpenVPN-UDP) are UDP
         match = _pf_match(cfg, iface, proto, lp)
         for ip in ips:  # flush every candidate rule first
-            for _ in range(64):
-                rc, _, _ = run(["iptables", "-t", "nat", "-C", "PREROUTING"] + match
-                               + ["-j", "DNAT", "--to-destination", f"{ip}:{dp}"])
-                if rc != 0:
-                    break
-                run(["iptables", "-t", "nat", "-D", "PREROUTING"] + match
-                    + ["-j", "DNAT", "--to-destination", f"{ip}:{dp}"])
+            _ipt_del_all("nat", "PREROUTING", match + ["-j", "DNAT", "--to-destination", f"{ip}:{dp}"])
         run(["iptables", "-t", "nat", "-A", "PREROUTING"] + match
             + ["-j", "DNAT", "--to-destination", f"{active}:{dp}"])
     for proto in ("tcp", "udp"):   # SNAT ONLY the forwarded flow (dst+port), not all egress on the iface
         for ip in ips:             # flush every candidate first so a rotation leaves no stale masq rule
-            for _ in range(64):
-                rc, _, _ = run(["iptables", "-t", "nat", "-C", "POSTROUTING", "-d", ip, "-p", proto,
-                               "--dport", dp, "-o", iface, "-j", "MASQUERADE"])
-                if rc != 0:
-                    break
-                run(["iptables", "-t", "nat", "-D", "POSTROUTING", "-d", ip, "-p", proto,
-                    "--dport", dp, "-o", iface, "-j", "MASQUERADE"])
+            _ipt_del_all("nat", "POSTROUTING",
+                         ["-d", ip, "-p", proto, "--dport", dp, "-o", iface, "-j", "MASQUERADE"])
         run(["iptables", "-t", "nat", "-A", "POSTROUTING", "-d", active, "-p", proto,
             "--dport", dp, "-o", iface, "-j", "MASQUERADE"])
-    for _ in range(16):   # remove any legacy broad `-o iface MASQUERADE` this forward may have left (now per-flow)
-        rc, _, _ = run(["iptables", "-t", "nat", "-C", "POSTROUTING", "-o", iface, "-j", "MASQUERADE"])
-        if rc != 0:
-            break
-        run(["iptables", "-t", "nat", "-D", "POSTROUTING", "-o", iface, "-j", "MASQUERADE"])
+    # remove any legacy broad `-o iface MASQUERADE` this forward may have left (now per-flow)
+    _ipt_del_all("nat", "POSTROUTING", ["-o", iface, "-j", "MASQUERADE"], tries=16)
     _pf_acct_build(cfg)   # idempotent byte counters (rx/tx) that survive rotation
 
 
@@ -1181,24 +1179,14 @@ def teardown_config(cfg):
                 for ip in cfg.get("dst_ips", []):
                     if not is_ipv4(ip):
                         continue
-                    for _ in range(64):
-                        rc, _, _ = run(["iptables", "-t", "nat", "-C", "PREROUTING"] + match
-                                       + ["-j", "DNAT", "--to-destination", f"{ip}:{dp}"])
-                        if rc != 0:
-                            break
-                        run(["iptables", "-t", "nat", "-D", "PREROUTING"] + match
-                            + ["-j", "DNAT", "--to-destination", f"{ip}:{dp}"])
+                    _ipt_del_all("nat", "PREROUTING",
+                                 match + ["-j", "DNAT", "--to-destination", f"{ip}:{dp}"])
             for proto in ("tcp", "udp"):   # remove the per-flow MASQUERADE rules this forward installed
                 for ip in cfg.get("dst_ips", []):   # (each is scoped to its own dst+port, so no cross-forward guard needed)
                     if not is_ipv4(ip):
                         continue
-                    for _ in range(64):
-                        rc, _, _ = run(["iptables", "-t", "nat", "-C", "POSTROUTING", "-d", ip, "-p", proto,
-                                       "--dport", dp, "-o", iface, "-j", "MASQUERADE"])
-                        if rc != 0:
-                            break
-                        run(["iptables", "-t", "nat", "-D", "POSTROUTING", "-d", ip, "-p", proto,
-                            "--dport", dp, "-o", iface, "-j", "MASQUERADE"])
+                    _ipt_del_all("nat", "POSTROUTING",
+                                 ["-d", ip, "-p", proto, "--dport", dp, "-o", iface, "-j", "MASQUERADE"])
 
 
 def apply_all():
