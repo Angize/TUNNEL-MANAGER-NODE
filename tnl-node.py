@@ -323,6 +323,15 @@ def enable_ip_forward():
         pass
 
 
+def _up_netdev(name, cfg, overhead, v6=False):
+    """Shared tail of every kernel-tunnel builder: assign the tunnel IP (v6 for a SIT 6in4
+    tunnel), bring the interface up, and set the MTU = base minus this carrier's header overhead."""
+    addr = ["ip", "-6", "addr", "add", cfg["tunnel_ip"], "dev", name] if v6 else ["ip", "addr", "add", cfg["tunnel_ip"], "dev", name]
+    must(addr)
+    must(["ip", "link", "set", name, "up"])
+    run(["ip", "link", "set", "dev", name, "mtu", str(base_mtu(cfg.get("iface")) - overhead)])
+
+
 def build_vxlan(cfg):
     """Native kernel VXLAN (UDP 4789) — point-to-point to the peer, tunnel IP assigned directly.
     No OpenvSwitch/veth: one netdev per tunnel, same as ipip/sit. VNI == tunnel id (symmetric both ends)."""
@@ -332,9 +341,7 @@ def build_vxlan(cfg):
     dstport = int(cfg.get("port") or 4789)   # UDP port is now settable (default 4789) — e.g. to dodge a filter
     must(["ip", "link", "add", name, "type", "vxlan", "id", str(cfg["id"]),
          "local", cfg["local_ip"], "remote", cfg["remote_ip"], "dstport", str(dstport)])
-    must(["ip", "addr", "add", cfg["tunnel_ip"], "dev", name])
-    must(["ip", "link", "set", name, "up"])
-    run(["ip", "link", "set", "dev", name, "mtu", str(base_mtu(cfg.get("iface")) - 50)])  # IP20+UDP8+VXLAN8+innerEth14
+    _up_netdev(name, cfg, 50)  # IP20+UDP8+VXLAN8+innerEth14
 
 
 def build_gre(cfg):
@@ -344,9 +351,7 @@ def build_gre(cfg):
     run(["ip", "link", "del", name])
     must(["ip", "link", "add", name, "type", "gre",
          "local", cfg["local_ip"], "remote", cfg["remote_ip"], "key", str(cfg["id"])])
-    must(["ip", "addr", "add", cfg["tunnel_ip"], "dev", name])
-    must(["ip", "link", "set", name, "up"])
-    run(["ip", "link", "set", "dev", name, "mtu", str(base_mtu(cfg.get("iface")) - 28)])  # IP20+GRE4+key4
+    _up_netdev(name, cfg, 28)  # IP20+GRE4+key4
 
 
 def build_sit(cfg):
@@ -354,9 +359,7 @@ def build_sit(cfg):
     run(["ip", "link", "del", name])
     must(["ip", "tunnel", "add", name, "mode", "sit", "remote", cfg["remote_ip"],
          "local", cfg["local_ip"], "ttl", "255"])
-    must(["ip", "-6", "addr", "add", cfg["tunnel_ip"], "dev", name])
-    must(["ip", "link", "set", name, "up"])
-    run(["ip", "link", "set", "dev", name, "mtu", str(base_mtu(cfg.get("iface")) - 20)])  # SIT = 6in4 (proto 41): outer IPv4 header only, 20 bytes
+    _up_netdev(name, cfg, 20, v6=True)  # SIT = 6in4 (proto 41): outer IPv4 header only, 20 bytes
 
 
 def build_ipip(cfg):
@@ -366,9 +369,7 @@ def build_ipip(cfg):
     run(["ip", "link", "del", name])
     must(["ip", "tunnel", "add", name, "mode", "ipip", "remote", cfg["remote_ip"],
          "local", cfg["local_ip"], "ttl", "255"])
-    must(["ip", "addr", "add", cfg["tunnel_ip"], "dev", name])
-    must(["ip", "link", "set", name, "up"])
-    run(["ip", "link", "set", "dev", name, "mtu", str(base_mtu(cfg.get("iface")) - 20)])
+    _up_netdev(name, cfg, 20)
 
 
 def _l2tp_ids(cfg):
@@ -391,9 +392,7 @@ def build_l2tp(cfg):
          "udp_sport", str(port), "udp_dport", str(port)])
     must(["ip", "l2tp", "add", "session", "name", name, "tunnel_id", str(tid),
          "session_id", str(tid), "peer_session_id", str(tid)])
-    must(["ip", "addr", "add", cfg["tunnel_ip"], "dev", name])
-    must(["ip", "link", "set", name, "up"])
-    run(["ip", "link", "set", "dev", name, "mtu", str(base_mtu(cfg.get("iface")) - 54)])
+    _up_netdev(name, cfg, 54)
 
 
 def _fou_port(cfg):
@@ -411,9 +410,7 @@ def build_fou(cfg):
     must(["ip", "link", "add", "name", name, "type", "ipip", "remote", cfg["remote_ip"],
          "local", cfg["local_ip"], "ttl", "255", "encap", "fou",
          "encap-sport", "auto", "encap-dport", str(port)])
-    must(["ip", "addr", "add", cfg["tunnel_ip"], "dev", name])
-    must(["ip", "link", "set", name, "up"])
-    run(["ip", "link", "set", "dev", name, "mtu", str(base_mtu(cfg.get("iface")) - 28)])
+    _up_netdev(name, cfg, 28)
 
 
 def _ipsec_params(cfg):
@@ -458,9 +455,7 @@ def build_ipsec(cfg):
              "tmpl", "src", s, "dst", dst, "proto", "esp", "reqid", str(tid), "mode", "tunnel"])
     phys = iface_for_ip(local) or default_iface()
     must(["ip", "link", "add", name, "type", "xfrm", "dev", phys, "if_id", str(tid)])
-    must(["ip", "addr", "add", cfg["tunnel_ip"], "dev", name])
-    must(["ip", "link", "set", name, "up"])
-    run(["ip", "link", "set", "dev", name, "mtu", str(base_mtu(cfg.get("iface")) - 80)])
+    _up_netdev(name, cfg, 80)
 
 
 def _core_arch():
