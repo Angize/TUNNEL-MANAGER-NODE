@@ -963,22 +963,29 @@ def build_core(cfg):
         time.sleep(0.1)
 
 
-def _core_teardown(cfg):
-    name = cfg.get("name", "")
-    if not NAME_RE.match(name):
-        return
+def _core_stop(name):
+    """Stop the core unit for `name` and clear its live status/pool files (so a stopped tunnel's state is
+    never rendered as "live", and no leftover pin command survives). The shared body of a full teardown
+    and a disable; it does NOT remove the config .json — the caller decides whether to keep it."""
     unit = _core_unit(name)
     run(["systemctl", "stop", unit])       # kills the core -> its non-persistent TUN disappears
     run(["systemctl", "reset-failed", unit])
-    try:
-        os.remove(_cfg_path(name, ".json"))
-    except OSError:
-        pass
-    for p in _core_status_paths(name):   # don't leave a dead tunnel's pool state as "live"
+    for p in _core_status_paths(name):
         try:
             os.remove(p)
         except OSError:
             pass
+
+
+def _core_teardown(cfg):
+    name = cfg.get("name", "")
+    if not NAME_RE.match(name):
+        return
+    _core_stop(name)
+    try:
+        os.remove(_cfg_path(name, ".json"))   # full teardown also drops the config (disable keeps it)
+    except OSError:
+        pass
 
 
 def _set_link_state(cfg, enabled):
@@ -992,14 +999,7 @@ def _set_link_state(cfg, enabled):
         if enabled:
             build_core(cfg)
         else:
-            unit = _core_unit(name)
-            run(["systemctl", "stop", unit])
-            run(["systemctl", "reset-failed", unit])
-            for p in _core_status_paths(name):   # a stopped core has no live pool state -> don't leave stale
-                try:                              # status the panel would render as "live" (and never a leftover pin cmd)
-                    os.remove(p)
-                except OSError:
-                    pass
+            _core_stop(name)   # stop the unit + clear stale pool status/pin files, but keep the config
     else:
         run(["ip", "link", "set", name, "up" if enabled else "down"])
 
@@ -1596,6 +1596,17 @@ def _require(d, keys):
             raise ValueError(f"missing field: {k}")
 
 
+def _req_name(d):
+    """Require+validate the tunnel name — the require/str/NAME_RE preamble the name-only ops all share.
+    Only for ops that require nothing but "name"; ops needing extra keys keep their own _require so the
+    missing-field error ordering is preserved."""
+    _require(d, ["name"])
+    name = str(d["name"])
+    if not NAME_RE.match(name):
+        raise ValueError("bad name")
+    return name
+
+
 def _self_sha():
     """sha256 of the on-disk agent this process is running — computed once at startup."""
     try:
@@ -1802,8 +1813,8 @@ def op_tunnel(d):
     tunnel_ip = derive_tunnel_ip(ttype, self_ip, peer_ip, subnet)
     obj = {"name": name, "type": ttype, "id": tid, "iface": iface,
            "remote_ip": peer_ip, "tunnel_ip": tunnel_ip, "local_ip": self_ip}
-    _prev = read_config(name)   # preserve the operator's on/off across a rebuild that doesn't restate it
-    obj["enabled"] = _as_bool(d.get("enabled", (_prev or {}).get("enabled", True)))
+    old = read_config(name)   # snapshot the prior build ONCE (serialized under _apply_lock, no write until below):
+    obj["enabled"] = _as_bool(d.get("enabled", (old or {}).get("enabled", True)))   # drives the on/off carry-forward here AND the in-place teardown/rollback further down
     if ttype == "core" and d.get("keepalive") not in (None, ""):   # optional; whitelist so a set value survives (else _core_config falls back to 15)
         obj["keepalive"] = max(5, min(120, int(d["keepalive"])))
     # dead_after_secs (core, optional): per-tunnel self-heal deadline. Whitelist so a set value survives;
@@ -2127,7 +2138,7 @@ def op_tunnel(d):
                 if not is_ipv4(sd):
                     raise ValueError("bad spoof_dst")
                 obj["spoof_dst"] = sd
-    old = read_config(name)   # in-place rebuild: fully tear the previous build down first so nothing tied to a
+    # in-place rebuild: fully tear the previous build (read once above) down first so nothing tied to a
     if old and old.get("type") != "portfw":   # now-overwritten field (e.g. FOU's old UDP-port decap listener) leaks
         teardown_config(old)
     write_config(name, obj)
@@ -2472,10 +2483,7 @@ def op_edge_status(d):
     """READ_ONLY: return the ws edge pool's live status (active edge + auto-burned IP/SNI
     lists) the core writes for tunnel {name}, so the panel can surface and persist the burns.
     Empty status when the tunnel has no pool or the core hasn't written the file yet."""
-    _require(d, ["name"])
-    name = str(d["name"])
-    if not NAME_RE.match(name):
-        raise ValueError("bad name")
+    name = _req_name(d)
     path = _cfg_path(name, ".status")
     try:
         with open(path) as f:
@@ -2566,10 +2574,7 @@ def op_peer_status(d):
     and any manual pin. Empty sections when the tunnel has no such pool or the core hasn't written yet.
     The core stamps next_retest_unix on the NODE's clock, so `now` is returned for the panel to count
     down against (and to flag a stale file as offline)."""
-    _require(d, ["name"])
-    name = str(d["name"])
-    if not NAME_RE.match(name):
-        raise ValueError("bad name")
+    name = _req_name(d)
     dst = _read_peer_pool(name, ".peerpool")
     src = _read_peer_pool(name, ".srcpool")
     # Top-level fields mirror the destination pool for backward compatibility with the old reader.
@@ -2605,10 +2610,7 @@ def op_peer_probe_now(d):
     """Live 'probe now' for a direct-transport pool: SIGHUP tells the running core to retest EVERY
     suspect/dead endpoint immediately (re-admit it to the live rotation) instead of waiting out the
     backoff, so a lifted block heals at once. No rebuild, TUN stays up."""
-    _require(d, ["name"])
-    name = str(d["name"])
-    if not NAME_RE.match(name):
-        raise ValueError("bad name")
+    name = _req_name(d)
     if not _is_peer_pool(name):   # a non-pool core has no SIGHUP handler -> the signal would kill it
         return {"ok": False, "error": "این تونل استخرِ آی‌پی ندارد"}
     rc, out, err = run(["systemctl", "kill", "-s", "SIGHUP", _core_unit(name)])
@@ -2644,10 +2646,7 @@ def op_pool_probe_now(d):
     """Live 'probe now' for a ws edge pool: SIGHUP tells the running core to retest EVERY
     suspect/dead edge immediately (cheap TLS-only probes) instead of waiting out the backoff,
     so a lifted block heals at once. No rebuild, TUN stays up."""
-    _require(d, ["name"])
-    name = str(d["name"])
-    if not NAME_RE.match(name):
-        raise ValueError("bad name")
+    name = _req_name(d)
     if not _is_ws_pool(name):   # a non-pool core has no SIGHUP handler -> the signal would kill it
         return {"ok": False, "error": "این تونل استخرِ لبه ندارد"}
     rc, out, err = run(["systemctl", "kill", "-s", "SIGHUP", _core_unit(name)])
@@ -3062,14 +3061,20 @@ WantedBy=multi-user.target
     run(["systemctl", "daemon-reload"])
 
 
-def do_install():
+def _prepare_install():
+    """Shared install prefix: ensure the config dir (0700), copy self to the stable INSTALLED path so the
+    unit never breaks if the invoked file moves, and load any existing conf. Returns the conf dict."""
     os.makedirs(CONFIG_DIR, exist_ok=True)
     os.chmod(CONFIG_DIR, 0o700)
     if os.path.realpath(SELF_PATH) != INSTALLED:  # copy to a stable path so the unit never breaks if moved
         shutil.copy2(SELF_PATH, INSTALLED)
         os.chmod(INSTALLED, 0o755)
-    conf = load_conf() if os.path.isfile(NODE_CONF) else {}
-    conf["port"] = int(input(f"Agent port [{conf.get('port', 8099)}]: ").strip() or conf.get("port", 8099))
+    return load_conf() if os.path.isfile(NODE_CONF) else {}
+
+
+def _finish_install(conf):
+    """Shared install suffix: mint a token if missing, persist the conf, install deps + the systemd unit,
+    then enable and (re)start it."""
     if not conf.get("token"):
         conf["token"] = secrets.token_urlsafe(32)
     save_conf(conf)
@@ -3078,32 +3083,26 @@ def do_install():
     svc("enable")
     svc("restart")
     print("[✔] node agent installed and started.")
+
+
+def do_install():
+    conf = _prepare_install()
+    conf["port"] = int(input(f"Agent port [{conf.get('port', 8099)}]: ").strip() or conf.get("port", 8099))
+    _finish_install(conf)
     do_show()
 
 
 def do_auto_install(port):
     """Non-interactive install for the central panel's SSH auto-provisioning.
     Prints machine-parseable markers the panel greps for (token/port)."""
-    os.makedirs(CONFIG_DIR, exist_ok=True)
-    os.chmod(CONFIG_DIR, 0o700)
-    if os.path.realpath(SELF_PATH) != INSTALLED:
-        shutil.copy2(SELF_PATH, INSTALLED)
-        os.chmod(INSTALLED, 0o755)
-    conf = load_conf() if os.path.isfile(NODE_CONF) else {}
+    conf = _prepare_install()
     try:
         conf["port"] = int(str(port).strip())
     except Exception:
         conf["port"] = conf.get("port", 8099)
     if not 1 <= conf["port"] <= 65535:
         conf["port"] = 8099
-    if not conf.get("token"):
-        conf["token"] = secrets.token_urlsafe(32)
-    save_conf(conf)
-    install_deps()
-    write_service()
-    svc("enable")
-    svc("restart")
-    print("[✔] node agent installed and started.")
+    _finish_install(conf)
     print("TNL_INSTALL_OK")
     print(f"TNL_NODE_PORT={conf['port']}")
     print(f"TNL_NODE_TOKEN={conf['token']}")
