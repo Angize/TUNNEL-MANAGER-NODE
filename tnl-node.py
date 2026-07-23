@@ -1846,6 +1846,20 @@ def op_tunnel(d):
         if transport not in ("udp", "tcp", "raw", "flux", "ws", "dns"):
             raise ValueError("bad core transport")
         obj["transport"] = transport
+
+        def _clean_pool(key):
+            """Strip+drop-blanks the IPv4 pool at d[key], cap it at 64, and reject any non-IPv4 entry.
+            One reference for every core IP pool: peer_ips/src_ips (client), listen_ips + peer_src_ips
+            (server). A config is only ever client OR server, so this being in scope for all branches
+            changes no path."""
+            out = [str(x).strip() for x in (d.get(key) or []) if str(x).strip()]
+            if len(out) > 64:
+                raise ValueError(key + " pool too large (>64)")
+            for ip in out:
+                if not is_ipv4(ip):
+                    raise ValueError("bad " + key + " entry (must be an IPv4 address)")
+            return out
+
         if transport == "dns":        # DNS-tunnel carrier: delegated zone + client resolver list
             zone = str(d.get("dns_zone") or "").strip().lower()
             if not zone or len(zone) > 253 or not re.match(r"^(?!-)[A-Za-z0-9-]{1,63}(?:\.(?!-)[A-Za-z0-9-]{1,63})+$", zone):
@@ -2028,14 +2042,6 @@ def op_tunnel(d):
         # Meaningless on ws (its own edge pool) or a server (it listens), so restrict to a direct
         # client. Stored as bare IPs; _core_config appends the port for udp/tcp and leaves raw/flux bare.
         if transport in ("udp", "tcp", "raw", "flux") and role == "client":
-            def _clean_pool(key):
-                out = [str(x).strip() for x in (d.get(key) or []) if str(x).strip()]
-                if len(out) > 64:
-                    raise ValueError(key + " pool too large (>64)")
-                for ip in out:
-                    if not is_ipv4(ip):
-                        raise ValueError("bad " + key + " entry (must be an IPv4 address)")
-                return out
             pips = _clean_pool("peer_ips")   # destination pool: the SERVER's IPs the client dials
             sips = _clean_pool("src_ips")     # source pool: this client node's OWN IPs to send FROM
             if pips or sips:
@@ -2054,12 +2060,7 @@ def op_tunnel(d):
         # raw/flux receive via AF_PACKET (every dest IP already), so the flag is a no-op there.
         if transport in ("udp", "tcp") and role == "server" and _as_bool(d.get("pool_listen")):
             obj["pool_listen"] = True
-            lips = [str(x).strip() for x in (d.get("listen_ips") or []) if str(x).strip()]
-            if len(lips) > 64:
-                raise ValueError("listen_ips pool too large (>64)")
-            for ip in lips:
-                if not is_ipv4(ip):
-                    raise ValueError("bad listen_ips entry (must be an IPv4 address)")
+            lips = _clean_pool("listen_ips")
             if lips:
                 obj["listen_ips"] = lips
         # peer_src_ips (server side, raw/flux): the client's SOURCE pool. raw/flux servers see every host
@@ -2067,12 +2068,7 @@ def op_tunnel(d):
         # crypto and never re-learned without this. Whitelisting is mandatory (un-whitelisted keys are
         # dropped and never reach the core). udp/tcp bind per-source and re-learn naturally.
         if transport in ("raw", "flux") and role == "server":
-            psrc = [str(x).strip() for x in (d.get("peer_src_ips") or []) if str(x).strip()]
-            if len(psrc) > 64:
-                raise ValueError("peer_src_ips pool too large (>64)")
-            for ip in psrc:
-                if not is_ipv4(ip):
-                    raise ValueError("bad peer_src_ips entry (must be an IPv4 address)")
+            psrc = _clean_pool("peer_src_ips")
             if psrc:
                 obj["peer_src_ips"] = psrc
         psk = str(d.get("psk") or "").strip()
@@ -2606,17 +2602,23 @@ def op_peer_select(d):
     return {"ok": True}
 
 
-def op_peer_probe_now(d):
-    """Live 'probe now' for a direct-transport pool: SIGHUP tells the running core to retest EVERY
-    suspect/dead endpoint immediately (re-admit it to the live rotation) instead of waiting out the
-    backoff, so a lifted block heals at once. No rebuild, TUN stays up."""
-    name = _req_name(d)
-    if not _is_peer_pool(name):   # a non-pool core has no SIGHUP handler -> the signal would kill it
-        return {"ok": False, "error": "این تونل استخرِ آی‌پی ندارد"}
+def _pool_sighup(name, is_pool, no_pool_msg):
+    """SIGHUP the running core for `name` — the shared body of the two 'probe now' ops (retest every
+    suspect/dead pool entry at once). Guards that the core actually installs a SIGHUP handler first
+    (is_pool): signaling a plain core would fall through to Go's default disposition and kill the tunnel."""
+    if not is_pool(name):
+        return {"ok": False, "error": no_pool_msg}
     rc, out, err = run(["systemctl", "kill", "-s", "SIGHUP", _core_unit(name)])
     if rc != 0:
         return {"ok": False, "error": (err or out or "").strip() or ("سیگنال به هسته نرسید (" + name + ")")}
     return {"ok": True}
+
+
+def op_peer_probe_now(d):
+    """Live 'probe now' for a direct-transport pool: SIGHUP tells the running core to retest EVERY
+    suspect/dead endpoint immediately (re-admit it to the live rotation) instead of waiting out the
+    backoff, so a lifted block heals at once. No rebuild, TUN stays up."""
+    return _pool_sighup(_req_name(d), _is_peer_pool, "این تونل استخرِ آی‌پی ندارد")
 
 
 def op_pool_select(d):
@@ -2646,13 +2648,7 @@ def op_pool_probe_now(d):
     """Live 'probe now' for a ws edge pool: SIGHUP tells the running core to retest EVERY
     suspect/dead edge immediately (cheap TLS-only probes) instead of waiting out the backoff,
     so a lifted block heals at once. No rebuild, TUN stays up."""
-    name = _req_name(d)
-    if not _is_ws_pool(name):   # a non-pool core has no SIGHUP handler -> the signal would kill it
-        return {"ok": False, "error": "این تونل استخرِ لبه ندارد"}
-    rc, out, err = run(["systemctl", "kill", "-s", "SIGHUP", _core_unit(name)])
-    if rc != 0:
-        return {"ok": False, "error": (err or out or "").strip() or ("سیگنال به هسته نرسید (" + name + ")")}
-    return {"ok": True}
+    return _pool_sighup(_req_name(d), _is_ws_pool, "این تونل استخرِ لبه ندارد")
 
 
 CORE_VER_RE = re.compile(r"^(?!.*\.\.)[A-Za-z0-9._-]{1,40}$")  # negative-lookahead rejects any '..' → no path traversal in the release URL
