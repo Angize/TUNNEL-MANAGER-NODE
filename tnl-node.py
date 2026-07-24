@@ -323,6 +323,132 @@ def enable_ip_forward():
         pass
 
 
+# --- Host network tuning (part ب of the throughput work; the core-side SO_*BUF is part الف) ---
+# OPT-IN, operator-triggered from the panel (a button beside the other node actions) — NOT run
+# at install/startup, because it mutates host-wide network behaviour and the operator may not
+# want it. BBR + fq + larger socket-buffer ceilings: BBR does not collapse on the packet loss /
+# high RTT of the Iran path the way the default CUBIC does, so it lifts throughput on the
+# TCP-family carriers (direct-tcp / ws / xhttp); fq gives BBR its pacing. The raised
+# tcp_rmem/tcp_wmem + core rmem_max/wmem_max ceilings let those TCP carriers autotune up to the
+# bandwidth-delay product, and also raise the ceiling for the datagram carriers' non-privileged
+# SO_*BUF fallback (the core prefers SO_*BUFFORCE, which needs no sysctl). Every knob is
+# best-effort — one the kernel rejects is skipped, never fatal. NOTE on fq: net.core.default_qdisc
+# only sets the qdisc for netdevs created AFTER the write (tunnel devices, and every device at the
+# next reboot) — it does not re-attach a qdisc to an already-up uplink; BBR self-paces regardless
+# (kernel ≥4.13), so live throughput does not depend on it. apply() records the prior
+# congestion-control + qdisc into TUNING_PREV so revert() can restore exactly them; TUNING_PREV is
+# also the single source of truth for "is tuning on" (written before any live change, removed only
+# by revert), which keeps apply idempotent and revert a no-op when nothing was applied.
+TUNING_DROPIN = "/etc/sysctl.d/99-angize-tuning.conf"
+TUNING_PREV = os.path.join(CONFIG_DIR, "tuning_prev.json")  # original CC+qdisc, for a faithful revert
+KERNEL_TUNING = [
+    ("net.core.default_qdisc", "fq"),
+    ("net.core.rmem_max", "16777216"),
+    ("net.core.wmem_max", "16777216"),
+    ("net.core.netdev_max_backlog", "16384"),
+    ("net.ipv4.tcp_rmem", "4096 131072 16777216"),
+    ("net.ipv4.tcp_wmem", "4096 65536 16777216"),
+    ("net.ipv4.tcp_mtu_probing", "1"),  # PLPMTUD: survive an ICMP-black-holed path without a stall
+]
+
+
+def _sysctl_get(key):
+    """Read a sysctl value (whitespace-normalised) or '' on failure."""
+    try:
+        with open("/proc/sys/" + key.replace(".", "/")) as f:
+            return " ".join(f.read().split())
+    except Exception:
+        return ""
+
+
+def _bbr_available():
+    """tcp_bbr may be built in or a loadable module. Try to load it, then confirm the kernel
+    actually lists bbr as an available congestion control before we select it."""
+    run(["modprobe", "tcp_bbr"])
+    return "bbr" in _sysctl_get("net.ipv4.tcp_available_congestion_control").split()
+
+
+def tuning_active():
+    """True when tuning is currently applied. Keyed on the saved-originals file (TUNING_PREV), not
+    the persist drop-in: TUNING_PREV is written before any live change and removed only by revert,
+    so it is a reliable 'is on' marker even if the drop-in failed to write or was deleted by hand."""
+    return os.path.isfile(TUNING_PREV)
+
+
+def tuning_status():
+    """Snapshot for the panel button: whether tuning is on, the live CC+qdisc, and whether bbr
+    can be selected. bbr_available goes through _bbr_available() (which modprobes tcp_bbr first) so
+    the button reflects what apply would actually achieve — otherwise a box whose bbr module is not
+    yet loaded would report false and the panel would wrongly disable an enable that would succeed."""
+    return {
+        "active": tuning_active(),
+        "cc": _sysctl_get("net.ipv4.tcp_congestion_control"),
+        "qdisc": _sysctl_get("net.core.default_qdisc"),
+        "bbr_available": _bbr_available(),
+    }
+
+
+def apply_kernel_tuning():
+    """Apply the host tuning live and persist it for reboot. Idempotent. Returns the selected
+    (key, value) list (bbr appended only when available)."""
+    if not tuning_active():  # first enable: remember the originals so revert is faithful
+        try:
+            prev = {"cc": _sysctl_get("net.ipv4.tcp_congestion_control"),
+                    "qdisc": _sysctl_get("net.core.default_qdisc")}
+            with open(TUNING_PREV, "w") as f:
+                json.dump(prev, f)
+        except Exception as e:
+            logline(f"kernel tuning save-prev: {e}")
+    knobs = list(KERNEL_TUNING)
+    if _bbr_available():
+        knobs.append(("net.ipv4.tcp_congestion_control", "bbr"))
+    else:
+        logline("kernel tuning: bbr unavailable — leaving the default congestion control")
+    for k, v in knobs:
+        run(["sysctl", "-w", f"{k}={v}"])  # spaces in v (tcp_rmem) stay in one argv element = OK
+    try:
+        body = ["# Angize node tuning (part ب) — managed by tnl-node; toggle from the panel to revert.\n"]
+        body += [f"{k} = {v}\n" for k, v in knobs]
+        with open(TUNING_DROPIN, "w") as f:
+            f.writelines(body)
+    except Exception as e:
+        logline(f"kernel tuning persist: {e}")
+    return knobs
+
+
+def revert_kernel_tuning():
+    """Turn tuning off: restore the originally-recorded congestion control + qdisc live and remove
+    the persisted drop-in so a reboot stays reverted. A no-op when nothing was applied (no
+    TUNING_PREV) so a stray/double revert can NOT clobber a box the admin tuned by hand down to some
+    invented default. Only the exact recorded values are pushed. The raised buffer CEILINGS are left
+    in place — a larger ceiling is harmless (nothing forces a socket to use it) and we cannot know
+    the box's original values, so restoring them would be a guess."""
+    if not tuning_active():  # nothing recorded to restore — never invent defaults over a live box
+        try:
+            if os.path.isfile(TUNING_DROPIN):
+                os.remove(TUNING_DROPIN)  # defensive: clear any orphan drop-in
+        except Exception:
+            pass
+        return
+    prev = {}
+    try:
+        with open(TUNING_PREV) as f:
+            prev = json.load(f)
+    except Exception:
+        prev = {}
+    cc, qdisc = prev.get("cc"), prev.get("qdisc")
+    if cc:
+        run(["sysctl", "-w", f"net.ipv4.tcp_congestion_control={cc}"])
+    if qdisc:
+        run(["sysctl", "-w", f"net.core.default_qdisc={qdisc}"])
+    for p in (TUNING_DROPIN, TUNING_PREV):
+        try:
+            if os.path.isfile(p):
+                os.remove(p)
+        except Exception as e:
+            logline(f"kernel tuning revert rm {p}: {e}")
+
+
 def _up_netdev(name, cfg, overhead, v6=False):
     """Shared tail of every kernel-tunnel builder: assign the tunnel IP (v6 for a SIT 6in4
     tunnel), bring the interface up, and set the MTU = base minus this carrier's header overhead."""
@@ -2874,6 +3000,23 @@ def op_ech_update(d):
     return {"ok": True, "hosts": list(clean.keys())}
 
 
+def op_kernel_tune(d):
+    """Operator-triggered host network tuning (part ب). action = apply | revert | status.
+    apply/revert mutate host-wide sysctls; status is a read-only snapshot for the panel button."""
+    action = str(d.get("action") or "status").lower()
+    if action == "apply":
+        knobs = apply_kernel_tuning()
+        st = tuning_status()
+        st["applied"] = [f"{k}={v}" for k, v in knobs]
+    elif action == "revert":
+        revert_kernel_tuning()
+        st = tuning_status()
+    else:
+        st = tuning_status()
+    st["ok"] = True
+    return st
+
+
 OPS = {"ping": op_ping, "list": op_list, "check": op_check, "tunnel": op_tunnel,
        "portfw": op_portfw, "portfw-edit": op_portfw_edit, "portfw-next": op_portfw_next,
        "delete": op_delete, "apply": op_apply, "update": op_update, "wipe": op_wipe,
@@ -2884,6 +3027,7 @@ OPS = {"ping": op_ping, "list": op_list, "check": op_check, "tunnel": op_tunnel,
        "ech-update": op_ech_update,
        "core-install": op_core_install, "spoof-probe": op_spoof_probe,
        "set-update-key": op_set_update_key,
+       "kernel-tune": op_kernel_tune,
        "link-enable": op_link_enable}
 READ_ONLY = {"ping", "list", "check", "portcheck", "spoof-probe", "edge-status", "peer-status"}
 
