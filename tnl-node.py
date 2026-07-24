@@ -340,6 +340,7 @@ def enable_ip_forward():
 # also the single source of truth for "is tuning on" (written before any live change, removed only
 # by revert), which keeps apply idempotent and revert a no-op when nothing was applied.
 TUNING_DROPIN = "/etc/sysctl.d/99-angize-tuning.conf"
+TUNING_MODLOAD = "/etc/modules-load.d/angize-bbr.conf"  # ensure tcp_bbr is loaded before systemd-sysctl at boot
 TUNING_PREV = os.path.join(CONFIG_DIR, "tuning_prev.json")  # original CC+qdisc, for a faithful revert
 KERNEL_TUNING = [
     ("net.core.default_qdisc", "fq"),
@@ -362,8 +363,11 @@ def _sysctl_get(key):
 
 
 def _bbr_available():
-    """tcp_bbr may be built in or a loadable module. Try to load it, then confirm the kernel
-    actually lists bbr as an available congestion control before we select it."""
+    """True if bbr can be selected. Reports from the kernel's available-CC list, loading the
+    tcp_bbr module first ONLY when it is not already present — so on a built-in / already-loaded
+    kernel this is a pure read (no fork), and a status poll stays cheap and side-effect-free."""
+    if "bbr" in _sysctl_get("net.ipv4.tcp_available_congestion_control").split():
+        return True
     run(["modprobe", "tcp_bbr"])
     return "bbr" in _sysctl_get("net.ipv4.tcp_available_congestion_control").split()
 
@@ -389,31 +393,40 @@ def tuning_status():
 
 
 def apply_kernel_tuning():
-    """Apply the host tuning live and persist it for reboot. Idempotent. Returns the selected
-    (key, value) list (bbr appended only when available)."""
-    if not tuning_active():  # first enable: remember the originals so revert is faithful
-        try:
-            prev = {"cc": _sysctl_get("net.ipv4.tcp_congestion_control"),
-                    "qdisc": _sysctl_get("net.core.default_qdisc")}
-            with open(TUNING_PREV, "w") as f:
-                json.dump(prev, f)
-        except Exception as e:
-            logline(f"kernel tuning save-prev: {e}")
+    """Apply the host tuning live and persist it for reboot. Idempotent. Returns None on success, or
+    an error string when the originals could NOT be recorded — in which case NOTHING is changed. The
+    invariant "TUNING_PREV exists iff tuning is applied" must hold or revert can't restore the box, so
+    the save is mandatory and atomic (a failed/partial write must not leave the host tuned-but-not-
+    recorded, nor let a later re-apply capture the already-tuned values as the 'original')."""
+    if not tuning_active():  # first enable: record the originals DURABLY before touching anything live
+        prev = {"cc": _sysctl_get("net.ipv4.tcp_congestion_control"),
+                "qdisc": _sysctl_get("net.core.default_qdisc")}
+        err = _atomic_write_json(TUNING_PREV, prev)
+        if err:
+            logline(f"kernel tuning: could not save originals, NOT applying: {err}")
+            return err  # abort — never mutate live sysctls without a restore point
     knobs = list(KERNEL_TUNING)
-    if _bbr_available():
+    bbr = _bbr_available()
+    if bbr:
         knobs.append(("net.ipv4.tcp_congestion_control", "bbr"))
     else:
         logline("kernel tuning: bbr unavailable — leaving the default congestion control")
     for k, v in knobs:
         run(["sysctl", "-w", f"{k}={v}"])  # spaces in v (tcp_rmem) stay in one argv element = OK
-    try:
-        body = ["# Angize node tuning (part ب) — managed by tnl-node; toggle from the panel to revert.\n"]
+    if bbr:  # systemd-sysctl won't modprobe at boot, so preload the CC module or the drop-in's bbr line is rejected
+        try:
+            with open(TUNING_MODLOAD, "w", encoding="utf-8") as f:
+                f.write("tcp_bbr\n")
+        except Exception as e:
+            logline(f"kernel tuning modules-load: {e}")
+    try:  # ASCII-only header + explicit utf-8: this file is written under the service's (C) locale
+        body = ["# Angize node tuning (part B) - managed by tnl-node; toggle from the panel to revert.\n"]
         body += [f"{k} = {v}\n" for k, v in knobs]
-        with open(TUNING_DROPIN, "w") as f:
+        with open(TUNING_DROPIN, "w", encoding="utf-8") as f:
             f.writelines(body)
     except Exception as e:
         logline(f"kernel tuning persist: {e}")
-    return knobs
+    return None
 
 
 def revert_kernel_tuning():
@@ -424,15 +437,16 @@ def revert_kernel_tuning():
     in place — a larger ceiling is harmless (nothing forces a socket to use it) and we cannot know
     the box's original values, so restoring them would be a guess."""
     if not tuning_active():  # nothing recorded to restore — never invent defaults over a live box
-        try:
-            if os.path.isfile(TUNING_DROPIN):
-                os.remove(TUNING_DROPIN)  # defensive: clear any orphan drop-in
-        except Exception:
-            pass
+        for p in (TUNING_DROPIN, TUNING_MODLOAD):
+            try:
+                if os.path.isfile(p):
+                    os.remove(p)  # defensive: clear any orphan persist files
+            except Exception:
+                pass
         return
     prev = {}
     try:
-        with open(TUNING_PREV) as f:
+        with open(TUNING_PREV, encoding="utf-8") as f:
             prev = json.load(f)
     except Exception:
         prev = {}
@@ -441,7 +455,7 @@ def revert_kernel_tuning():
         run(["sysctl", "-w", f"net.ipv4.tcp_congestion_control={cc}"])
     if qdisc:
         run(["sysctl", "-w", f"net.core.default_qdisc={qdisc}"])
-    for p in (TUNING_DROPIN, TUNING_PREV):
+    for p in (TUNING_DROPIN, TUNING_MODLOAD, TUNING_PREV):
         try:
             if os.path.isfile(p):
                 os.remove(p)
@@ -3005,9 +3019,10 @@ def op_kernel_tune(d):
     apply/revert mutate host-wide sysctls; status is a read-only snapshot for the panel button."""
     action = str(d.get("action") or "status").lower()
     if action == "apply":
-        knobs = apply_kernel_tuning()
+        err = apply_kernel_tuning()
+        if err:  # originals could not be recorded → nothing was changed; surface it, don't claim success
+            return {"ok": False, "error": "could not save tuning state; nothing changed"}
         st = tuning_status()
-        st["applied"] = [f"{k}={v}" for k, v in knobs]
     elif action == "revert":
         revert_kernel_tuning()
         st = tuning_status()
