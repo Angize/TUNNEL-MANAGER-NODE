@@ -1287,8 +1287,6 @@ def build_portfw(cfg):
                          ["-d", ip, "-p", proto, "--dport", dp, "-o", iface, "-j", "MASQUERADE"])
         run(["iptables", "-t", "nat", "-A", "POSTROUTING", "-d", active, "-p", proto,
             "--dport", dp, "-o", iface, "-j", "MASQUERADE"])
-    # remove any legacy broad `-o iface MASQUERADE` this forward may have left (now per-flow)
-    _ipt_del_all("nat", "POSTROUTING", ["-o", iface, "-j", "MASQUERADE"], tries=16)
     _pf_acct_build(cfg)   # idempotent byte counters (rx/tx) that survive rotation
 
 
