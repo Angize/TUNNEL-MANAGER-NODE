@@ -1970,6 +1970,16 @@ def op_tunnel(d):
     if ttype == "core" and d.get("dead_after_secs") not in (None, ""):
         _da = int(d["dead_after_secs"])
         obj["dead_after_secs"] = 0 if _da <= 0 else max(10, min(300, _da))
+    # tuning (core, optional): the fleet-wide operational-timing overrides the panel stamps onto EVERY
+    # core body (_apply_core_tuning). This whitelist entry is load-bearing — _core_config reads
+    # cfg["tuning"] from the PERSISTED config, so while the key was missing here it was dropped on the
+    # way in and every Settings knob except keepalive/dead_after_secs (which ride top-level, just above)
+    # was a silent fleet-wide no-op. Sanitize with the same helper _core_config uses so a malformed
+    # field can never reach disk; {} means "nothing to override" and is not stored.
+    if ttype == "core":
+        _tn = _core_tuning(d.get("tuning"))
+        if _tn:
+            obj["tuning"] = _tn
     if ttype in ("l2tpv3", "fou", "core", "vxlan"):   # optional UDP port; l2tp/fou/core blank->from id, vxlan blank->4789
         if d.get("port") not in (None, ""):
             port = int(d["port"])
