@@ -173,7 +173,6 @@ def public_configs():
     out = []
     for c in raw_configs():
         c = dict(c)
-        c.pop("remote_password", None)  # never expose secrets over the API
         c.pop("psk", None)              # IPsec pre-shared key stays on the node
         out.append(c)
     return out
@@ -752,7 +751,6 @@ def _core_config(cfg):
         "obfs": obfs,
         "tun_name": name,
         "tun_addr": cfg["tunnel_ip"],
-        "tun_peer": peer_of(cfg["tunnel_ip"], "core"),
         "mtu": mtu,
         "keepalive": max(5, min(120, int(cfg.get("keepalive") or 15))),   # honor a configured value (clamped 5..120s); 15 default
         "crypto": {"enabled": crypto_on, "psk": cfg.get("psk", ""), "cipher": cipher},
