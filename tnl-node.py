@@ -763,6 +763,12 @@ def _core_config(cfg):
     _tn = _core_tuning(cfg.get("tuning"))
     if _tn:
         corecfg["tuning"] = _tn
+    # Datagram socket-buffer size in bytes (udp/raw/flux only; the core ignores it elsewhere). Absent
+    # leaves the core's own 4 MiB default; a negative value is its "leave the kernel default" sentinel,
+    # so 0 is NOT a valid passthrough and is treated as "not set".
+    _sb = int(cfg.get("sock_buf") or 0)
+    if _sb:
+        corecfg["sock_buf"] = _sb
     # TLS cover (HTTPS camouflage) — TCP only; carries an optional SNI to present.
     if bool(cfg.get("cover")) and transport == "tcp" and crypto_on:
         corecfg["cover"] = True
@@ -1980,6 +1986,13 @@ def op_tunnel(d):
         _tn = _core_tuning(d.get("tuning"))
         if _tn:
             obj["tuning"] = _tn
+    # sock_buf (core, optional): datagram socket-buffer size in BYTES, stamped fleet-wide by the panel
+    # (which stores MiB and converts). Whitelist it or it is dropped like any un-whitelisted key and the
+    # operator's Settings value never reaches the core. Negative = the core's "leave the kernel default"
+    # sentinel, so it is passed through rather than floored; the upper bound matches the core's own clamp.
+    if ttype == "core" and d.get("sock_buf") not in (None, ""):
+        _sb = int(d["sock_buf"])
+        obj["sock_buf"] = -1 if _sb < 0 else min(_sb, 64 << 20)
     if ttype in ("l2tpv3", "fou", "core", "vxlan"):   # optional UDP port; l2tp/fou/core blank->from id, vxlan blank->4789
         if d.get("port") not in (None, ""):
             port = int(d["port"])
