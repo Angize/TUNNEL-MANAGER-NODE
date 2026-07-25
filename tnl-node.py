@@ -783,7 +783,7 @@ def _core_config(cfg):
             corecfg["cover_sni"] = sni
     # Datagram (udp/raw/flux) and direct-stream (plain tcp / tcp+cover) transports have no ws edge pool,
     # but the CLIENT still writes a precise self-heal event ring (stale-detect / recovery) PLUS a liveness
-    # heartbeat (`hb`, core v2.48.3) to a status file we expose back to the panel's system log — same file
+    # heartbeat (`hb`) to a status file we expose back to the panel's system log — same file
     # name the pool uses, so op_edge_status reads it unchanged. This is `status_path` (NOT `ws_status_path`),
     # so _is_ws_pool keeps telling a pool core apart from a plain core (only the pool has SIGHUP/SIGUSR
     # handlers). Single ws/xhttp gets its own status_path below; ws-pool uses ws_status_path.
@@ -843,12 +843,12 @@ def _core_config(cfg):
         if xhttp:
             corecfg["ws_xhttp"] = True
             # xhttp upstream style: "packet" (packet-up, default — many short POSTs, most
-            # CDN-compatible), "stream" (stream-one, a single full-duplex request; needs HTTP/2,
-            # hence ws_tls), or "grpc" (stream-one dressed as a real gRPC call so a CDN reaches the
-            # origin over h2c and streams instead of buffering; also needs ws_tls). Forward for both
-            # roles; the core server auto-detects the client's style but the client must be told.
+            # CDN-compatible) or "grpc" (a single full-duplex request dressed as a real gRPC call so
+            # a CDN reaches the origin over h2c and streams instead of buffering; needs ws_tls).
+            # Forward for both roles; the core server auto-detects the client's style but the client
+            # must be told.
             xmode = str(cfg.get("ws_xhttp_mode") or "").strip().lower()
-            if xmode in ("packet", "stream", "grpc"):
+            if xmode in ("packet", "grpc"):
                 corecfg["ws_xhttp_mode"] = xmode
         # Only the CLIENT speaks wss (TLS to the CDN edge); the server stays plain — the CDN
         # terminates TLS and forwards the WebSocket to the origin. Never emit ws_tls server-side.
@@ -977,10 +977,10 @@ def _core_config(cfg):
         # listen stays the first IP as a friendly anchor; listen_ips drives the actual binds.
         # raw: the core takes ONE listen address (main.go hands cfg.Listen to ListenRaw and ignores
         # cfg.ListenIPs), and a bound AF_INET raw socket is demuxed by DESTINATION, so 0.0.0.0 is the
-        # only correct value — the core then answers from the exact IP the client dialed via IP_PKTINFO
-        # (core >= v2.48.23). Binding the anchor here silently killed destination rotation: only the
-        # anchor ever completed a handshake and every other pool IP burned. The pre-v2.48.23 reason for
-        # the concrete bind (reply-from-primary) is now fixed in the core itself.
+        # only correct value — the core then answers from the exact IP the client dialed via IP_PKTINFO.
+        # Binding the anchor here silently killed destination rotation: only the anchor ever completed a
+        # handshake and every other pool IP burned. The reason a concrete bind once looked necessary
+        # (the reply egressing from the host's primary IP) is fixed in the core itself.
         # flux is exempt either way: ListenFlux ignores its listen argument and receives via AF_PACKET.
         pool_ips = [str(x).strip() for x in (cfg.get("listen_ips") or []) if str(x).strip()]
         pooled = bool(cfg.get("pool_listen"))
@@ -1425,7 +1425,7 @@ def peer_of(tunnel_ip, ttype):
 LIVE_WINDOW = 12.0   # s: the iface must have RECEIVED new bytes within this window to count as flow-alive (kept short so a busy tunnel that dies flips out of "flow-alive" quickly)
 _flow_lock = threading.Lock()
 _flow_state = {}     # iface name -> {"rx": int, "progress": float|None} (last sample + monotonic time rx last advanced)
-# --- never-connected detection: a v2.48.4+ core publishes `dw` from startup but only stamps `hb` once it has
+# --- never-connected detection: the core publishes `dw` from startup but only stamps `hb` once it has
 # actually received an authenticated frame, so dw>0 with hb==0 means this client has NEVER been answered.
 _nohb_lock = threading.Lock()
 _nohb_state = {}     # iface name -> monotonic time we first saw "modern core running, still no inbound frame"
@@ -1544,8 +1544,7 @@ def health_of(cfg, thorough=False):
                 beat = _age <= _dw                     # core-authoritative window: unifies the multiplier, honours the operator's tuning
             # no dw published -> leave beat None and fall through to flow + ICMP (the core always
             # publishes dw, so this is a malformed-status guard, not a version fallback)
-    ping = None
-    peer = rtt = loss = None
+    ping = rtt = loss = None
     tip = cfg.get("tunnel_ip", "")
     # Probe with ICMP only when it can add something: the on-demand (thorough) check ALWAYS pings; the
     # passive sweep pings only when NEITHER the core heartbeat NOR traffic-flow has already settled the
@@ -1566,8 +1565,8 @@ def health_of(cfg, thorough=False):
         ping = (loss < 100) if loss is not None else (rc3 == 0)
     # alive = the real-state verdict the panel colours the dot from. `dead` = a POSITIVE death signal
     # (frozen core heartbeat) so the panel paints it RED at once; an unconfirmed miss stays amber. None
-    # (no signal at all) lets the panel fall back to its old ping logic.
-    # NEVER-CONNECTED = dead, not "unknown". A v2.48.4+ core publishes `dw` the moment it starts but only
+    # (no signal at all) leaves the dot amber — the panel has no probe of its own to fall back to.
+    # NEVER-CONNECTED = dead, not "unknown". The core publishes `dw` the moment it starts but only
     # stamps `hb` once a genuine authenticated frame has arrived, so dw>0 with hb==0 means this client has
     # never been answered even once. Together with no traffic and a FAILED probe that is a dead tunnel.
     # Without this it could only ever go amber: `dead` was reachable solely through the heartbeat path, and a
@@ -1598,8 +1597,7 @@ def health_of(cfg, thorough=False):
         dead = nohb_dead
     else:
         alive, src = None, None
-    return {"up": up, "alive": alive, "live_src": src, "dead": dead,
-            "peer_ping": ping, "peer": peer, "rtt_ms": rtt, "loss_pct": loss}
+    return {"up": up, "alive": alive, "live_src": src, "dead": dead, "rtt_ms": rtt, "loss_pct": loss}
 
 
 def _cpu_snap():
@@ -2089,14 +2087,9 @@ def op_tunnel(d):
             # to a plain WebSocket, which the WS-block rule then kills).
             if _as_bool(d.get("ws_xhttp")):
                 obj["ws_xhttp"] = True
-                # xhttp upstream style: packet-up (default) or grpc. "stream" is a legacy alias for
-                # grpc (the core runs the identical full-duplex path for both), so fold it to grpc
-                # BEFORE storing — this matches the panel, which also canonicalizes and stores grpc,
-                # so both write paths persist one string for identical behavior. Whitelist it so the
-                # choice survives persistence (dropping = silently reverts to packet-up).
+                # xhttp upstream style: packet-up (default) or grpc. Whitelist it so the choice
+                # survives persistence (dropping = silently reverts to packet-up).
                 xm = str(d.get("ws_xhttp_mode") or "").strip().lower()
-                if xm == "stream":
-                    xm = "grpc"
                 if xm in ("packet", "grpc"):
                     obj["ws_xhttp_mode"] = xm
             if _as_bool(d.get("ws_tls")):
@@ -2666,16 +2659,16 @@ def op_portcheck(d):
 
 
 def op_edge_status(d):
-    """READ_ONLY: return the ws edge pool's live status (active edge + auto-burned IP/SNI
-    lists) the core writes for tunnel {name}, so the panel can surface and persist the burns.
-    Empty status when the tunnel has no pool or the core hasn't written the file yet."""
+    """READ_ONLY: return the ws edge pool's live status (active edge + the per-entry health FSM)
+    the core writes for tunnel {name}, so the panel can surface and drive the pool. Empty status
+    when the tunnel has no pool or the core hasn't written the file yet."""
     name = _req_name(d)
     path = _cfg_path(name, ".status")
     try:
         with open(path) as f:
             st = json.load(f)
     except (OSError, ValueError):
-        return {"ok": True, "active": "", "burned_ips": [], "burned_snis": [], "health": [], "ts": 0}
+        return {"ok": True, "active": "", "health": [], "ts": 0}
     health = []
     for h in (st.get("health") or [])[:256]:
         if not isinstance(h, dict):
@@ -2700,8 +2693,6 @@ def op_edge_status(d):
         })
     return {"ok": True,
             "active": str(st.get("active") or ""),
-            "burned_ips": [str(x) for x in (st.get("burned_ips") or [])][:64],
-            "burned_snis": [str(x) for x in (st.get("burned_snis") or [])][:64],
             "health": health,
             "events": events,
             "ts": int(st.get("ts") or 0),
@@ -2716,10 +2707,10 @@ _PEER_ADDR_RE = re.compile(r"^[0-9A-Fa-f:.]{1,64}$")  # a pool endpoint is only 
 
 def _read_peer_pool(name, suffix):
     """Parse one direct-transport pool status file (suffix '.peerpool' = destination, '.srcpool' =
-    source) into the normalized shape the panel reads: active endpoint, the full list, the flat burned
-    list, the per-endpoint health FSM (state / fails / retest countdown), and any operator pin. Empty
+    source) into the normalized shape the panel reads: active endpoint, the full list, the per-endpoint
+    health FSM (state / fails / retest countdown), and any operator pin. Empty
     (but well-formed) when the file is missing — the pool doesn't exist or the core hasn't written yet."""
-    empty = {"active": "", "addrs": [], "burned": [], "health": [], "pin": "", "ts": 0}
+    empty = {"active": "", "addrs": [], "health": [], "pin": "", "ts": 0}
     try:
         with open(_cfg_path(name, suffix)) as f:
             st = json.load(f)
@@ -2746,7 +2737,6 @@ def _read_peer_pool(name, suffix):
     return {
         "active": active if ok(active) else "",
         "addrs": [x for x in (str(v) for v in (st.get("addrs") or [])) if ok(x)][:64],
-        "burned": [x for x in (str(v) for v in (st.get("burned") or [])) if ok(x)][:64],
         "health": health,
         "pin": pin if ok(pin) else "",
         "ts": int(st.get("updated_unix") or 0),
@@ -2763,9 +2753,7 @@ def op_peer_status(d):
     name = _req_name(d)
     dst = _read_peer_pool(name, ".peerpool")
     src = _read_peer_pool(name, ".srcpool")
-    # Top-level fields mirror the destination pool for backward compatibility with the old reader.
-    return {"ok": True, "now": int(time.time()), "dst": dst, "src": src,
-            "active": dst["active"], "addrs": dst["addrs"], "burned": dst["burned"], "ts": dst["ts"]}
+    return {"ok": True, "now": int(time.time()), "dst": dst, "src": src}
 
 
 def op_peer_select(d):
