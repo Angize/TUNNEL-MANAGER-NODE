@@ -939,8 +939,16 @@ def _core_config(cfg):
         # Source rotation pool (client): this node's OWN IPs to send FROM, cycled alongside peer_ips.
         # Prepend local_ip so the pool's start matches the client's default source; bare IPv4 for every
         # carrier (a source is never "ip:port"). A pool of >=2 activates source rotation in the core.
-        sord = _ordered_pool(str(cfg.get("local_ip") or ""), cfg.get("src_ips"))
-        if len(sord) >= 2:
+        # The core gate is >=1, not >=2, and deliberately so: a LONE src_ip is a fixed source that
+        # supersedes bind_ip (which is TCP-family-only, so on udp/raw/flux nothing else can pin it).
+        # Emitting only at >=2 made that unreachable — the panel ships a 1-entry src_ips whenever the
+        # OTHER side is the one with >=2 selected, and the node dropped it, so the kernel picked the
+        # egress IP and the operator's chosen node address was silently not used. Gate on the operator
+        # having actually chosen sources, not on the pool length: a bare [local_ip] (what _ordered_pool
+        # returns when nothing was configured) is not a choice and still emits nothing.
+        _src_sel = [str(x).strip() for x in (cfg.get("src_ips") or []) if str(x).strip()]
+        sord = _ordered_pool(str(cfg.get("local_ip") or ""), _src_sel)
+        if _src_sel and sord:
             corecfg["src_ips"] = sord
             corecfg.setdefault("peer_rotate_secs", max(0, int(cfg.get("peer_rotate_secs") or 0)))
             corecfg.setdefault("peer_auto_burn", bool(cfg.get("peer_auto_burn")))
