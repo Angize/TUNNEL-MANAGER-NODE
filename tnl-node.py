@@ -709,9 +709,15 @@ def _core_config(cfg):
         # IP20 + the profile's carrier header (bip/ipip add none; gre 4; icmp/udp 8; tcp 20).
         outer = 20 + {"bip": 0, "ipip": 0, "gre": 4, "icmp": 8, "udp": 8, "tcp": 20, "esp": 8}.get(raw_profile, 0)
     elif transport == "flux":
-        # IP20 + the carrier header: udp adds an 8-byte UDP header; stun adds UDP + a
-        # 20-byte STUN header; the raw carrier adds none.
-        outer = 20 + {"udp": 8, "stun": 28}.get(flux_carrier, 0)
+        # IP20 + the carrier header. udp adds an 8-byte UDP header. The raw carrier adds none.
+        # stun is NOT 8+20: buildSTUN wraps the frame as a STUN attribute, so the real cost is
+        #   UDP 8 + STUN header 20 + attribute header 4 + the attribute's 4-byte alignment pad (0..3)
+        # = 32..35. Budgeting 28 (UDP + the STUN header only) under-counted by 4..7 bytes on every
+        # FULL-SIZE packet, so the crafted IPv4 packet exceeded the egress MTU: the kernel refuses an
+        # oversize IP_HDRINCL send with EMSGSIZE, and until core #157 that error was discarded — a
+        # textbook MTU black hole where keepalives pass and any bulk transfer stalls. Budget the WORST
+        # case (pad 3): a 4-aligned payload merely leaves 3 bytes unused, which is the safe direction.
+        outer = 20 + {"udp": 8, "stun": 8 + 20 + 4 + 3}.get(flux_carrier, 0)
     elif transport == "ws":
         outer = 40 + 14        # IP20 + TCP20 + up to a 14-byte WebSocket frame header
     else:
