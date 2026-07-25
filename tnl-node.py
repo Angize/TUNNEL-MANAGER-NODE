@@ -1062,7 +1062,10 @@ def _core_status_paths(name):
     base = _cfg_path(name, ".status")
     peer = _cfg_path(name, ".peerpool")
     src = _cfg_path(name, ".srcpool")
-    return base, base + ".cmd", peer, peer + ".cmd", src, src + ".cmd"
+    # base + ".echcmd" is the live-ECH push sidecar (op ech-update writes it, the core polls it). It was
+    # missing here, so it alone survived rebuild/disable/delete — and a stale key file outliving the core
+    # that was meant to consume it is exactly the kind of leftover this list exists to prevent.
+    return base, base + ".cmd", base + ".echcmd", peer, peer + ".cmd", src, src + ".cmd"
 
 
 def _read_core_cfg(name):
@@ -2532,6 +2535,14 @@ def op_wipe(d):
             os.remove(os.path.join(CONFIG_DIR, c["name"] + ".json"))
         except Exception:
             pass
+    # Undo the host kernel tuning FIRST. The drop-in and the modules-load file live in /etc, which the
+    # rm -rf below never touches, while TUNING_PREV — the only record of the box's ORIGINAL cc/qdisc —
+    # sits inside CONFIG_DIR and is destroyed by it. Wiping without this left the host permanently on
+    # BBR+fq at every boot with the undo button deleted, which flatly contradicts "nothing remains".
+    try:
+        revert_kernel_tuning()
+    except Exception as e:
+        logline(f"wipe: kernel tuning revert failed: {e}")
     _restart_pending.set()  # reject any new mutating op during the shutdown window
     script = ("sleep 1; systemctl stop tnl-node 2>/dev/null; systemctl disable tnl-node 2>/dev/null; "
               "rm -f " + SERVICE_FILE + "; systemctl daemon-reload 2>/dev/null; rm -rf " + CONFIG_DIR)
