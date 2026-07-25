@@ -1489,7 +1489,7 @@ def health_of(cfg, thorough=False):
     # is alive even with zero user traffic and filtered ICMP (idle-green); an aged-out hb, OR an unpaired
     # real-death `down` event, is a positive DEATH signal (-> red). Using the core's own dw means the dot
     # ages hb against the EXACT window the core self-heals on (no private multiplier); a rotation/pin `down`
-    # is NOT a death. hb 0/absent (old core / server side / pre-handshake) -> fall through to flow + ICMP.
+    # is NOT a death. hb 0/absent (server side / pre-handshake) -> fall through to flow + ICMP.
     beat = None  # True = alive, False = confirmed dead, None = no heartbeat to judge by
     _hb = _dw = 0    # published heartbeat + resolved dead-window; kept in scope for the never-connected check below
     if up and ttype == "core":
@@ -1502,7 +1502,7 @@ def health_of(cfg, thorough=False):
         except (OSError, ValueError, TypeError):
             pass
         if _hb > 0:
-            _rot = ("src-rotate", "src-pin", "peer-rotate", "peer-pin")  # `down`s where the session SURVIVES
+            _rot = ("src-rotate", "peer-rotate")  # `down`s where the session SURVIVES
             _dn = _up_seq = -1
             if isinstance(_evs, list):
                 for _e in _evs:
@@ -1522,9 +1522,8 @@ def health_of(cfg, thorough=False):
                 beat = False
             elif _dw > 0:
                 beat = _age <= _dw                     # core-authoritative window: unifies the multiplier, honours the operator's tuning
-            else:
-                _ka = max(5, min(120, int(cfg.get("keepalive") or 15)))
-                beat = _age <= int(_ka * 2.5) + 5      # pre-v2.48.4 core (no dw): the old keepalive-derived fallback
+            # no dw published -> leave beat None and fall through to flow + ICMP (the core always
+            # publishes dw, so this is a malformed-status guard, not a version fallback)
     ping = None
     peer = rtt = loss = None
     tip = cfg.get("tunnel_ip", "")
@@ -1554,8 +1553,7 @@ def health_of(cfg, thorough=False):
     # Without this it could only ever go amber: `dead` was reachable solely through the heartbeat path, and a
     # tunnel that never connects produces no heartbeat to age out — so a permanently-broken tunnel (e.g. a
     # pooled ws/xhttp client whose edge accepts TLS but never carries a frame) sat amber forever. Held for the
-    # core's own dead-window so a freshly (re)built tunnel can't flash red before its first frame lands. A
-    # pre-v2.48.4 core publishes no `dw`, so it keeps the old amber behaviour (its ICMP may just be filtered).
+    # core's own dead-window so a freshly (re)built tunnel can't flash red before its first frame lands.
     nohb_dead = False
     if up and ttype == "core" and _dw > 0 and _hb <= 0 and flow is not True and ping is False:
         with _nohb_lock:
