@@ -949,18 +949,28 @@ def _core_config(cfg):
         # exact listen IP makes the reply source correct and also cleanly demuxes by destination IP.
         lip = cfg.get("local_ip") or "0.0.0.0"
         # EXCEPTION — under a destination rotation pool the client dials THIS server across several of
-        # its selected IPs. Bind EACH one explicitly (the core opens one socket/listener per IP) instead
-        # of 0.0.0.0, for two reasons: (1) a UDP reply then egresses from the exact IP the client dialed
+        # its selected IPs, so a single concrete bind makes the server DEAF to every other pool IP.
+        # udp/tcp: bind EACH one explicitly (the core opens one socket/listener per IP) instead of
+        # 0.0.0.0, for two reasons: (1) a UDP reply then egresses from the exact IP the client dialed
         # — a single 0.0.0.0 socket would reply from the host's primary IP and the client, which filters
         # by peer IP, would drop it; (2) the server accepts only on the pool IPs, not every host IP.
-        # listen stays the first IP as a friendly anchor; listen_ips drives the actual binds. (raw/flux
-        # receive via AF_PACKET regardless of dest IP, so pool_listen is a no-op there.)
+        # listen stays the first IP as a friendly anchor; listen_ips drives the actual binds.
+        # raw: the core takes ONE listen address (main.go hands cfg.Listen to ListenRaw and ignores
+        # cfg.ListenIPs), and a bound AF_INET raw socket is demuxed by DESTINATION, so 0.0.0.0 is the
+        # only correct value — the core then answers from the exact IP the client dialed via IP_PKTINFO
+        # (core >= v2.48.23). Binding the anchor here silently killed destination rotation: only the
+        # anchor ever completed a handshake and every other pool IP burned. The pre-v2.48.23 reason for
+        # the concrete bind (reply-from-primary) is now fixed in the core itself.
+        # flux is exempt either way: ListenFlux ignores its listen argument and receives via AF_PACKET.
         pool_ips = [str(x).strip() for x in (cfg.get("listen_ips") or []) if str(x).strip()]
+        pooled = bool(cfg.get("pool_listen"))
         if transport == "dns":
             corecfg["listen"] = f"{lip}:53"   # authoritative NS on :53 for the delegated zone
-        elif bool(cfg.get("pool_listen")) and transport in ("udp", "tcp") and pool_ips:
+        elif pooled and transport in ("udp", "tcp") and pool_ips:
             corecfg["listen"] = f"{pool_ips[0]}:{port}"
             corecfg["listen_ips"] = [f"{ip}:{port}" for ip in pool_ips]
+        elif pooled and transport == "raw":
+            corecfg["listen"] = f"0.0.0.0:{port}"
         else:
             corecfg["listen"] = f"{lip}:{port}"
     elif transport == "dns":
@@ -2192,17 +2202,22 @@ def op_tunnel(d):
                 _prs = d.get("peer_rotate_secs")   # 0 = failover-only; a truthiness `or N` would wrongly force N
                 obj["peer_rotate_secs"] = max(0, min(86400, int(_prs))) if _prs is not None else 0
                 obj["peer_auto_burn"] = _as_bool(d.get("peer_auto_burn"))
-        # pool_listen (server side, udp/tcp): the client rotates the destination across THIS server's
-        # selected IPs, so the server binds EACH of them explicitly (one socket/listener per IP) rather
-        # than 0.0.0.0 — see _core_config for why (correct UDP reply source + accept only on pool IPs).
-        # listen_ips carries that selected set as bare IPv4 (the port is appended in _core_config).
-        # Whitelisting both keys is mandatory (an un-whitelisted key is dropped and never reaches core).
-        # raw/flux receive via AF_PACKET (every dest IP already), so the flag is a no-op there.
-        if transport in ("udp", "tcp") and role == "server" and _as_bool(d.get("pool_listen")):
+        # pool_listen (server side): the client rotates the destination across THIS server's selected IPs.
+        # udp/tcp bind EACH of them explicitly (one socket/listener per IP) rather than 0.0.0.0 — see
+        # _core_config for why (correct UDP reply source + accept only on pool IPs). listen_ips carries
+        # that selected set as bare IPv4 (the port is appended in _core_config).
+        # raw needs the FLAG too (but not listen_ips, which the core ignores for raw): the core takes a
+        # single listen address for raw and a concrete bind makes its AF_INET socket deaf to every other
+        # pool IP, so _core_config must bind 0.0.0.0 instead. Dropping the flag here is what silently
+        # broke raw destination rotation — only the anchor IP ever connected and the rest burned.
+        # flux is exempt: ListenFlux ignores its listen argument and receives via AF_PACKET.
+        # Whitelisting is mandatory (an un-whitelisted key is dropped and never reaches core).
+        if transport in ("udp", "tcp", "raw") and role == "server" and _as_bool(d.get("pool_listen")):
             obj["pool_listen"] = True
-            lips = _clean_pool("listen_ips")
-            if lips:
-                obj["listen_ips"] = lips
+            if transport in ("udp", "tcp"):
+                lips = _clean_pool("listen_ips")
+                if lips:
+                    obj["listen_ips"] = lips
         # peer_src_ips (server side, raw/flux): the client's SOURCE pool. raw/flux servers see every host
         # on the wire and pre-filter by the learned source, so a rotated client source is dropped pre-
         # crypto and never re-learned without this. Whitelisting is mandatory (un-whitelisted keys are
