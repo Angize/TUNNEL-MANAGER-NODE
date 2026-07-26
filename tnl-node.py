@@ -1005,7 +1005,13 @@ def _core_config(cfg):
             if sep and p.isdigit():
                 dial, dport = h, int(p)
             else:
-                dial = edge
+                # A bare edge address needs the EDGE's port, and `port` is not it: `port` is where the
+                # CDN connects to US (the origin listener, typically 80). The client is talking to the
+                # edge, which serves TLS on 443 and cleartext on 80. Inheriting the origin port meant a
+                # wss client sent its TLS ClientHello to a plain-HTTP :80 edge and the handshake died —
+                # so a CDN-fronted tunnel worked with wss OFF and broke the moment it was turned on,
+                # which reads as "the CDN doesn't support this" and is nothing of the sort.
+                dial, dport = edge, (443 if bool(cfg.get("ws_tls")) else 80)
         corecfg["peer"] = f"{dial}:{dport}"
         # Pin the client's outbound source to THIS node's own IP (local_ip is validated to be a
         # local address in op_tunnel). On a host with several IPs the kernel would otherwise egress
