@@ -327,7 +327,7 @@ def enable_ip_forward():
 # at install/startup, because it mutates host-wide network behaviour and the operator may not
 # want it. BBR + fq + larger socket-buffer ceilings: BBR does not collapse on the packet loss /
 # high RTT of the Iran path the way the default CUBIC does, so it lifts throughput on the
-# TCP-family carriers (direct-tcp / ws / xhttp); fq gives BBR its pacing. The raised
+# TCP-family carriers (direct-tcp / ws / http); fq gives BBR its pacing. The raised
 # tcp_rmem/tcp_wmem + core rmem_max/wmem_max ceilings let those TCP carriers autotune up to the
 # bandwidth-delay product, and also raise the ceiling for the datagram carriers' non-privileged
 # SO_*BUF fallback (the core prefers SO_*BUFFORCE, which needs no sysctl). Every knob is
@@ -784,7 +784,7 @@ def _core_config(cfg):
     # heartbeat (`hb`) to a status file we expose back to the panel's system log — same file
     # name the pool uses, so op_edge_status reads it unchanged. This is `status_path` (NOT `ws_status_path`),
     # so _is_ws_pool keeps telling a pool core apart from a plain core (only the pool has SIGHUP/SIGUSR
-    # handlers). Single ws/xhttp gets its own status_path below; ws-pool uses ws_status_path.
+    # handlers). Single ws/http gets its own status_path below; ws-pool uses ws_status_path.
     if transport in ("udp", "tcp", "raw", "flux") and str(cfg.get("role")) == "client":
         corecfg["status_path"] = _cfg_path(name, ".status")
     # peer_src_ips (raw/flux SERVER): the client's source pool. These carriers receive via a raw/
@@ -833,26 +833,26 @@ def _core_config(cfg):
             corecfg["ws_host"] = str(cfg["ws_host"])
         if cfg.get("ws_path"):
             corecfg["ws_path"] = str(cfg["ws_path"])
-        # xhttp mode: carry the stream over a GET(down)+POST(up) HTTP request pair instead
+        # the HTTP carrier: carry the stream over a GET(down)+POST(up) request pair instead
         # of a WebSocket upgrade, so it passes a CDN/account that blocks WebSocket. Both
-        # roles need the flag (server serves the xhttp endpoint, client dials it); the same
+        # roles need it (the server serves the endpoint, the client dials it); the same
         # fronting fields (ws_host/ws_tls/ws_ech/ws_path) apply. Not combined with the pool.
-        xhttp = bool(cfg.get("ws_xhttp"))
-        if xhttp:
-            corecfg["ws_xhttp"] = True
-            # xhttp upstream style: "packet" (packet-up, default — many short POSTs, most
+        # One field for the SHAPE this CDN-frontable carrier takes: ws | http | grpc. It replaced a
+        # boolean plus a mode string, which could describe states that do not exist.
+        cdn = str(cfg.get("cdn_carrier") or "ws").strip().lower()
+        if cdn in ("http", "grpc"):
+            corecfg["cdn_carrier"] = cdn
+            # http = packet-up: many short POSTs, most
             # CDN-compatible) or "grpc" (a single full-duplex request dressed as a real gRPC call so
             # a CDN reaches the origin over h2c and streams instead of buffering; needs ws_tls).
             # Forward for both roles; the core server auto-detects the client's style but the client
             # must be told.
-            xmode = str(cfg.get("ws_xhttp_mode") or "").strip().lower()
-            if xmode in ("packet", "grpc"):
-                corecfg["ws_xhttp_mode"] = xmode
+
             # Upstream shape — the packet-up CLIENT only. The server never POSTs, and the core
             # REJECTS these on a server or in grpc mode, so emitting them there would refuse to
             # build the tunnel rather than be ignored.
-            if cfg.get("role") == "client" and xmode != "grpc":
-                for _k in ("xh_up_workers", "xh_up_batch_kb", "xh_up_rate"):
+            if cfg.get("role") == "client" and cdn == "http":
+                for _k in ("http_up_workers", "http_up_batch_kb", "http_up_rate"):
                     try:
                         _v = int(cfg.get(_k) or 0)
                     except (TypeError, ValueError):
@@ -865,7 +865,7 @@ def _core_config(cfg):
             corecfg["ws_tls"] = True
             # SNI fragmentation: split the wss ClientHello so the cleartext SNI crosses a TCP segment
             # boundary — a stateless SNI-blocklist DPI can't match the full hostname. Cheap complement
-            # to ECH (which hides the SNI entirely). Applies to both single-edge and pool ws/xhttp.
+            # to ECH (which hides the SNI entirely). Applies to both single-edge and pool ws/http.
             # split_pos is the byte offset into the ClientHello (0 = auto: middle of the hostname).
             if bool(cfg.get("sni_split")):
                 corecfg["sni_split"] = True
@@ -892,7 +892,7 @@ def _core_config(cfg):
             # writing its live state to a status file we expose back to the panel.
             ips = [str(x).strip() for x in (cfg.get("ws_edge_ips") or []) if str(x).strip()]
             snis = [s for s in (cfg.get("ws_edge_snis") or []) if isinstance(s, dict) and str(s.get("host") or "").strip()]
-            if ips and snis:  # rotating pool — works for both the ws and xhttp carriers
+            if ips and snis:  # rotating pool — works for both the ws and http carriers
                 corecfg["ws_edge_ips"] = ips
                 corecfg["ws_edge_snis"] = [{"host": str(s["host"]).strip(),
                                          "ech": str(s.get("ech") or "").strip(),
@@ -1027,11 +1027,11 @@ def _core_config(cfg):
         # Pin the client's outbound source to THIS node's own IP (local_ip is validated to be a
         # local address in op_tunnel). On a host with several IPs the kernel would otherwise egress
         # from its primary IP; binding makes the peer/CDN see this node's registered IP. The core
-        # applies it only for the TCP-family carriers (tcp/ws/xhttp) and ignores it otherwise.
+        # applies it only for the TCP-family carriers (tcp/ws/http) and ignores it otherwise.
         lip = str(cfg.get("local_ip") or "").strip()
         if lip:
             corecfg["bind_ip"] = lip
-    # Single-edge ws/xhttp (not a pool): the CLIENT core writes the same self-heal event ring the
+    # Single-edge ws/http (not a pool): the CLIENT core writes the same self-heal event ring the
     # datagram carriers do — e.g. an in-band ECH self-heal — to a status file we expose to the panel.
     # Use status_path (NOT ws_status_path) so _is_ws_pool keeps treating it as a non-pool core (a
     # single-edge ws core installs no SIGHUP/SIGUSR handlers, so a pool-only signal would kill it).
@@ -1104,7 +1104,7 @@ def _is_ws_pool(name):
 
 
 def _is_ws_single(name):
-    """True if the running core for `name` is a SINGLE ws/xhttp edge client — one fixed ws_host, no edge
+    """True if the running core for `name` is a SINGLE ws/http edge client — one fixed ws_host, no edge
     pool. Such a core reads a live ECH push into b.wsECH from its dialLoop (same <status>.echcmd sidecar
     a pool uses), so it can accept ech-update too. Needs a wired status_path for the sidecar to be read."""
     cc = _read_core_cfg(name)
@@ -1587,7 +1587,7 @@ def health_of(cfg, thorough=False):
     # never been answered even once. Together with no traffic and a FAILED probe that is a dead tunnel.
     # Without this it could only ever go amber: `dead` was reachable solely through the heartbeat path, and a
     # tunnel that never connects produces no heartbeat to age out — so a permanently-broken tunnel (e.g. a
-    # pooled ws/xhttp client whose edge accepts TLS but never carries a frame) sat amber forever. Held for the
+    # pooled ws/http client whose edge accepts TLS but never carries a frame) sat amber forever. Held for the
     # core's own dead-window so a freshly (re)built tunnel can't flash red before its first frame lands.
     nohb_dead = False
     if up and ttype == "core" and _dw > 0 and _hb <= 0 and flow is not True and ping is False:
@@ -2097,24 +2097,23 @@ def op_tunnel(d):
                 if len(wp) > 1024 or not re.match(r"^/[\x21-\x7e]*$", wp):   # start with /, printable, no CR/LF/space/ctrl
                     raise ValueError("bad ws_path")
                 obj["ws_path"] = wp
-            # xhttp mode (GET-down + POST-up instead of a WebSocket upgrade) — passes a CDN
+            # the CDN carrier shape (ws | http | grpc) — http passes a CDN
             # that blocks WebSocket. Independent of ws_tls (server side is plain HTTP either
             # way); whitelist it here so it survives persistence (dropping = silently reverts
             # to a plain WebSocket, which the WS-block rule then kills).
-            if _as_bool(d.get("ws_xhttp")):
-                obj["ws_xhttp"] = True
-                # xhttp upstream style: packet-up (default) or grpc. Whitelist it so the choice
-                # survives persistence (dropping = silently reverts to packet-up).
-                xm = str(d.get("ws_xhttp_mode") or "").strip().lower()
-                if xm in ("packet", "grpc"):
-                    obj["ws_xhttp_mode"] = xm
+            _cdn = str(d.get("cdn_carrier") or "").strip().lower()
+            if _cdn:
+                if _cdn not in ("ws", "http", "grpc"):
+                    raise ValueError("bad cdn_carrier")
+                if _cdn != "ws":
+                    obj["cdn_carrier"] = _cdn
                 # Packet-up upstream shape, chosen per CDN by the panel: workers x batch is the
                 # window, and the rate cap is a ceiling on POSTs/sec that a worker count cannot
                 # express (workers/RTT differs per path). The core clamps and validates; we only
                 # have to keep them, because a key that is not whitelisted here is dropped in
                 # SILENCE and the tunnel quietly rebuilds on the default Cloudflare shape — which
                 # on a WAF-protected CDN means the source IP gets blocked.
-                for _k in ("xh_up_workers", "xh_up_batch_kb", "xh_up_rate"):
+                for _k in ("http_up_workers", "http_up_batch_kb", "http_up_rate"):
                     if _k in d:
                         try:
                             _v = int(d.get(_k) or 0)
