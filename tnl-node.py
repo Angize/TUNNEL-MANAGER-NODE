@@ -848,6 +848,17 @@ def _core_config(cfg):
             xmode = str(cfg.get("ws_xhttp_mode") or "").strip().lower()
             if xmode in ("packet", "grpc"):
                 corecfg["ws_xhttp_mode"] = xmode
+            # Upstream shape — the packet-up CLIENT only. The server never POSTs, and the core
+            # REJECTS these on a server or in grpc mode, so emitting them there would refuse to
+            # build the tunnel rather than be ignored.
+            if cfg.get("role") == "client" and xmode != "grpc":
+                for _k in ("xh_up_workers", "xh_up_batch_kb", "xh_up_rate"):
+                    try:
+                        _v = int(cfg.get(_k) or 0)
+                    except (TypeError, ValueError):
+                        _v = 0
+                    if _v > 0:
+                        corecfg[_k] = _v
         # Only the CLIENT speaks wss (TLS to the CDN edge); the server stays plain — the CDN
         # terminates TLS and forwards the WebSocket to the origin. Never emit ws_tls server-side.
         if bool(cfg.get("ws_tls")) and cfg.get("role") == "client":
@@ -2097,6 +2108,22 @@ def op_tunnel(d):
                 xm = str(d.get("ws_xhttp_mode") or "").strip().lower()
                 if xm in ("packet", "grpc"):
                     obj["ws_xhttp_mode"] = xm
+                # Packet-up upstream shape, chosen per CDN by the panel: workers x batch is the
+                # window, and the rate cap is a ceiling on POSTs/sec that a worker count cannot
+                # express (workers/RTT differs per path). The core clamps and validates; we only
+                # have to keep them, because a key that is not whitelisted here is dropped in
+                # SILENCE and the tunnel quietly rebuilds on the default Cloudflare shape — which
+                # on a WAF-protected CDN means the source IP gets blocked.
+                for _k in ("xh_up_workers", "xh_up_batch_kb", "xh_up_rate"):
+                    if _k in d:
+                        try:
+                            _v = int(d.get(_k) or 0)
+                        except (TypeError, ValueError):
+                            raise ValueError("bad %s" % _k)
+                        if _v < 0 or _v > 100000:
+                            raise ValueError("bad %s" % _k)
+                        if _v:
+                            obj[_k] = _v
             if _as_bool(d.get("ws_tls")):
                 obj["ws_tls"] = True
                 # The core rejects ws_tls on a single-edge client without ws_host (it is the TLS
