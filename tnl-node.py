@@ -842,13 +842,13 @@ def _core_config(cfg):
         cdn = str(cfg.get("cdn_carrier") or "ws").strip().lower()
         if cdn in ("http", "grpc"):
             corecfg["cdn_carrier"] = cdn
-            # http = packet-up: many short POSTs, most
+            # The CDN carrier shape: "http" (a POST ladder — many short POSTs, most
             # CDN-compatible) or "grpc" (a single full-duplex request dressed as a real gRPC call so
             # a CDN reaches the origin over h2c and streams instead of buffering; needs ws_tls).
             # Forward for both roles; the core server auto-detects the client's style but the client
             # must be told.
 
-            # Upstream shape — the packet-up CLIENT only. The server never POSTs, and the core
+            # Upstream shape — the http-carrier CLIENT only. The server never POSTs, and the core
             # REJECTS these on a server or in grpc mode, so emitting them there would refuse to
             # build the tunnel rather than be ignored.
             if cfg.get("role") == "client" and cdn == "http":
@@ -2147,7 +2147,7 @@ def op_tunnel(d):
                     raise ValueError("bad cdn_carrier")
                 if _cdn != "ws":
                     obj["cdn_carrier"] = _cdn
-                # Packet-up upstream shape, chosen per CDN by the panel: workers x batch is the
+                # Upstream POST-ladder shape, chosen per CDN by the panel: workers x batch is the
                 # window, and the rate cap is a ceiling on POSTs/sec that a worker count cannot
                 # express (workers/RTT differs per path). The core clamps and validates; we only
                 # have to keep them, because a key that is not whitelisted here is dropped in
