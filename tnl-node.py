@@ -1456,6 +1456,19 @@ def _iface_rx(name):
         return None
 
 
+def _prune_iface_state(names):
+    """Drop per-iface liveness bookkeeping for tunnels that no longer exist. Both dicts are keyed by
+    config name and nothing removed their entries on delete, so a node churned by create/delete grew
+    them forever — and a recreated tunnel inherited a stale rx baseline until the counter-went-backwards
+    reset in _flow_alive cost it one extra sweep."""
+    with _flow_lock:
+        for nm in [n for n in _flow_state if n not in names]:
+            _flow_state.pop(nm, None)
+    with _nohb_lock:
+        for nm in [n for n in _nohb_state if n not in names]:
+            _nohb_state.pop(nm, None)
+
+
 def _flow_alive(name):
     """True when <name> has RECEIVED new bytes within LIVE_WINDOW — real inbound tunnel traffic, so the
     tunnel is delivering regardless of whether ICMP is answered/filtered. None when undetermined: first
@@ -1512,11 +1525,12 @@ def health_of(cfg, thorough=False):
             except Exception:      # (normal for a UDP forward: WireGuard/OpenVPN-UDP). timeout/other -> unreachable
                 reachable = False
         return {"active": active, "rule": rule, "reachable": reachable, "up": rule}
-    up = False
     with _apply_lock:  # serialize with a rebuild (mutations hold this) so we don't read the brief
-        rc, _, _ = run(["ip", "link", "show", name])   # mid-teardown gap as a transient false 'down'
-    if rc == 0:
-        up = True
+        # A netdev exists iff /sys/class/net/<name> does — one stat(2), no fork. `ip link show` spawned
+        # a process per tunnel per 3s sweep AND held the global mutation lock for the whole fork+exec,
+        # so on a hub the health sweep alone owned that lock a large fraction of the time and every
+        # rebuild queued behind it. _flow_alive four lines down already reads this same directory.
+        up = os.path.exists("/sys/class/net/" + name)   # mid-teardown gap as a transient false 'down'
     # Real-state liveness: if authenticated tunnel traffic is actually arriving on the iface, the tunnel
     # is alive no matter whether ICMP is answered or filtered. Only meaningful once the iface exists.
     flow = _flow_alive(name) if up else None
@@ -1736,6 +1750,30 @@ HEALTH_WORKERS = 64   # sized so even a hub node with hundreds of tunnels sweeps
 HEALTH_DEADLINE = 12  # a sweep never blocks past this; slow probes keep their last-known value
 _health_cache = {}
 _health_lock = threading.Lock()
+# name -> the Future of a probe that has not been harvested yet. Touched only by the health thread.
+_health_inflight = {}
+
+
+def _health_harvest(names):
+    """Publish every FINISHED probe into the snapshot and prune tunnels that no longer exist.
+
+    A straggler from an EARLIER round lands here too. The old code waited on one round's futures and
+    then rebuilt the snapshot from that round alone, so a probe that overran HEALTH_DEADLINE had its
+    answer thrown away — and since the next round immediately queued another one for the same tunnel,
+    a consistently-slow probe left that tunnel's health frozen at its last value indefinitely."""
+    with _health_lock:
+        for nm in names:
+            f = _health_inflight.get(nm)
+            if f is None or not f.done():
+                _health_cache.setdefault(nm, {"up": None})  # nothing yet -> unknown, never a fake down
+                continue
+            _health_inflight.pop(nm, None)
+            try:
+                _health_cache[nm] = f.result()
+            except Exception:
+                _health_cache.setdefault(nm, {"up": None})
+        for nm in [n for n in _health_cache if n not in names]:
+            _health_cache.pop(nm, None)
 
 
 def health_refresh_once(ex):
@@ -1743,22 +1781,24 @@ def health_refresh_once(ex):
     if not cfgs:
         with _health_lock:
             _health_cache.clear()
+        _health_inflight.clear()
+        _prune_iface_state(set())
         return
-    futs = {ex.submit(health_of, c): c["name"] for c in cfgs}
-    done, _ = futures_wait(set(futs), timeout=HEALTH_DEADLINE)
-    with _health_lock:
-        prev = dict(_health_cache)
-        newc = {}
-        for f, name in futs.items():
-            if f in done:
-                try:
-                    newc[name] = f.result()
-                except Exception:
-                    newc[name] = prev.get(name, {"up": None})
-            else:
-                newc[name] = prev.get(name, {"up": None})  # probe too slow this round: keep last-known
-        _health_cache.clear()
-        _health_cache.update(newc)
+    names = {c["name"] for c in cfgs}
+    _health_harvest(names)                       # whatever finished since the last round, including stragglers
+    for nm in [n for n in _health_inflight if n not in names]:
+        _health_inflight.pop(nm, None)           # tunnel deleted while its probe was running
+    # ONE probe per tunnel in flight, never two. A round used to submit a full fresh batch every 3s no
+    # matter what, so a sweep that overran the deadline stacked another N tasks onto the executor's
+    # unbounded queue behind its own stragglers — the pile-up the panel's poller has always guarded
+    # against with its `inflight` set. Worst case that is any mutating op: health_of takes _apply_lock,
+    # a core build holds it for 8-16s, so all 64 workers park and zero futures complete.
+    for c in cfgs:
+        if c["name"] not in _health_inflight:
+            _health_inflight[c["name"]] = ex.submit(health_of, c)
+    futures_wait(set(_health_inflight.values()), timeout=HEALTH_DEADLINE)
+    _health_harvest(names)
+    _prune_iface_state(names)
 
 
 def health_loop():
