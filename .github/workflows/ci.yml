@@ -1,0 +1,40 @@
+name: ci
+
+# The agent runs as root on every node in the fleet and it is pushed there by a button in the panel —
+# there is no staging step between "merged" and "installed on every server". Until now nothing checked
+# that it even parses.
+#
+# `-W error::SyntaxWarning` is deliberate rather than paranoid: an invalid escape sequence in a non-raw
+# string is a warning today and a SyntaxError in a future Python, which for this file means an agent that
+# refuses to start on every node at once. The panel had exactly one of these hiding in a JS regex.
+#
+# The tuning-knob roster in `_TUNING_INT_KEYS` is checked against core and the panel by
+# `tools/tuning_consistency.py`, which lives in the panel repository (private, so it cannot be run from
+# here without a PAT). That workflow runs it on every panel pull request and once a day on a schedule, so
+# drift introduced from THIS side is caught within a day rather than never.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: py_compile (warnings are errors)
+        run: python -W error::SyntaxWarning -m py_compile tnl-node.py
