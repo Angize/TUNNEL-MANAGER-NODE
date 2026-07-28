@@ -29,6 +29,7 @@ import re
 import secrets
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -3128,6 +3129,210 @@ def op_spoof_probe(d):
     return p
 
 
+# --------------------------------------------------------------------------- spoof egress probe
+#
+# The core's --probe-spoof is a LOCAL capability check only (can the raw sockets be opened). It cannot
+# answer the question that actually decides whether the spoof carrier works: does the upstream network
+# FORWARD a forged source, and does a decoy destination ROUTE to the server? That is directional and
+# per-provider — measured 2026-07-28, a forged source is dropped by both our datacenters' anti-spoofing,
+# and a decoy only arrives when it routes to the receiving server. This probe measures it end to end:
+# one node forges packets carrying a nonce, the other listens off the wire (AF_PACKET, so it sees a
+# decoy-dst frame the kernel would otherwise drop) and reports which arrived. Root-only (raw sockets).
+#
+# Two roles, orchestrated by the panel: the RECEIVER starts a background capture (returns a token
+# immediately), the SENDER forges the packets, then the panel reads the verdict by token.
+
+_EGRESS = {}                       # token -> {"done": bool, "saw": {...}, "observed": {...}}
+_EGRESS_LOCK = threading.Lock()
+_EGRESS_MAX = 32                   # cap the result map so a caller can't grow it unbounded
+_PROBE_TAGS = (b"BAS", b"SRC", b"DST")   # baseline / forged-source / decoy-destination
+
+
+def _egress_checksum(b):
+    """16-bit one's-complement checksum (RFC 1071) over b, for the forged IPv4 header."""
+    if len(b) % 2:
+        b += b"\x00"
+    s = 0
+    for i in range(0, len(b), 2):
+        s += (b[i] << 8) | b[i + 1]
+    while s >> 16:
+        s = (s & 0xffff) + (s >> 16)
+    return (~s) & 0xffff
+
+
+def _egress_build_ip4(src, dst, proto, payload, ttl=64):
+    """Assemble a full IPv4 packet (for an IP_HDRINCL send) with a valid header checksum."""
+    total = 20 + len(payload)
+    h = bytearray(total)
+    h[0] = 0x45
+    struct.pack_into("!H", h, 2, total)
+    h[8] = ttl
+    h[9] = proto
+    h[12:16] = socket.inet_aton(src)
+    h[16:20] = socket.inet_aton(dst)
+    struct.pack_into("!H", h, 10, _egress_checksum(bytes(h[:20])))
+    h[20:] = payload
+    return bytes(h)
+
+
+def _egress_payload(tag, nonce):
+    """A probe payload the receiver can recognise: TAG(3) + nonce bytes. Kept short and fixed."""
+    return tag + nonce.encode("ascii", "ignore")[:32]
+
+
+def _egress_route_local(peer):
+    """The local IPv4 the kernel would send toward peer FROM (no packet sent; a connected UDP socket
+    just resolves the route). Returns None on failure. Used as the default forged-header source."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect((peer, 9))
+            ip = s.getsockname()[0]
+        finally:
+            s.close()
+        return ip if is_ipv4(ip) else None
+    except OSError:
+        return None
+
+
+def op_spoof_egress_listen(d):
+    """RECEIVER role: start a bounded background AF_PACKET capture for a spoof egress probe and return a
+    token immediately (the capture runs in a daemon thread; read the verdict with spoof-egress-result).
+    Watches for our nonce tagged BAS/SRC/DST — baseline reachability, a forged source arriving, and a
+    decoy-destination frame arriving. proto is the outer IP protocol number the real tunnel would use."""
+    nonce = str(d.get("nonce") or "").strip()
+    if not re.match(r"^[0-9a-f]{8,32}$", nonce):
+        raise ValueError("bad nonce")
+    proto = int(d.get("proto") or 253)
+    if not 1 <= proto <= 255:
+        raise ValueError("bad proto")
+    decoy = str(d.get("decoy") or "").strip()
+    if decoy and not is_ipv4(decoy):
+        raise ValueError("bad decoy")
+    window = min(20, max(2, int(d.get("window") or 8)))
+    token = secrets.token_hex(8)
+
+    def capture():
+        saw = {"baseline": False, "src": False, "dst": False}
+        observed = {}
+        fd = None
+        try:
+            fd = socket.socket(socket.AF_PACKET, socket.SOCK_DGRAM, socket.htons(0x0800))  # ETH_P_IP
+            fd.settimeout(1.0)
+            end = time.time() + window
+            nb = nonce.encode("ascii")
+            while time.time() < end:
+                try:
+                    pkt, addr = fd.recvfrom(2048)
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+                if len(addr) >= 3 and addr[2] == 4:   # PACKET_OUTGOING — ignore our own transmits
+                    continue
+                if len(pkt) < 20 or (pkt[0] >> 4) != 4 or pkt[9] != proto:
+                    continue
+                ihl = (pkt[0] & 0x0f) * 4
+                body = pkt[ihl:ihl + 3 + len(nb)]
+                if len(body) < 3 + len(nb) or body[3:3 + len(nb)] != nb:
+                    continue
+                tag = body[:3]
+                src = socket.inet_ntoa(pkt[12:16])
+                dst = socket.inet_ntoa(pkt[16:20])
+                if tag == b"BAS":
+                    saw["baseline"] = True
+                elif tag == b"SRC":
+                    saw["src"] = True
+                    observed["src_seen_from"] = src   # the forged source, as it survived the path
+                elif tag == b"DST" and (not decoy or dst == decoy):
+                    saw["dst"] = True
+                    observed["dst_seen"] = dst
+                if saw["baseline"] and saw["src"] and (saw["dst"] or not decoy):
+                    break   # everything expected has arrived; no need to wait out the window
+        except OSError as e:
+            observed["error"] = str(e)
+        finally:
+            if fd is not None:
+                fd.close()
+            with _EGRESS_LOCK:
+                _EGRESS[token] = {"done": True, "saw": saw, "observed": observed}
+
+    with _EGRESS_LOCK:
+        if len(_EGRESS) >= _EGRESS_MAX:   # evict the oldest-ish finished entries
+            for k in [k for k, v in list(_EGRESS.items()) if v.get("done")][: _EGRESS_MAX // 2]:
+                _EGRESS.pop(k, None)
+        _EGRESS[token] = {"done": False}
+    threading.Thread(target=capture, daemon=True).start()
+    return {"ok": True, "token": token, "window": window}
+
+
+def op_spoof_egress_send(d):
+    """SENDER role: forge the probe packets toward the receiver. `peer` is the receiver's REAL IP (the
+    routing target for every packet). Always sends a BASELINE (real src -> real dst) so the panel can
+    tell "the whole path/proto is blocked" from "the forge specifically was dropped"; sends a forged
+    SOURCE when `forged_src` is set, and a decoy DESTINATION when `decoy_dst` is set. Root-only."""
+    nonce = str(d.get("nonce") or "").strip()
+    if not re.match(r"^[0-9a-f]{8,32}$", nonce):
+        raise ValueError("bad nonce")
+    proto = int(d.get("proto") or 253)
+    if not 1 <= proto <= 255:
+        raise ValueError("bad proto")
+    peer = str(d.get("peer") or "").strip()
+    if not is_ipv4(peer):
+        raise ValueError("bad peer")
+    real_src = str(d.get("real_src") or "").strip()
+    if not real_src:                              # default to the route-local source toward the peer
+        real_src = _egress_route_local(peer) or ""
+    if not real_src or real_src not in local_ips_flat():
+        raise ValueError("real_src must be one of this node's own IPs (route-local lookup failed)")
+    forged_src = str(d.get("forged_src") or "").strip()
+    if forged_src and not is_ipv4(forged_src):
+        raise ValueError("bad forged_src")
+    decoy_dst = str(d.get("decoy_dst") or "").strip()
+    if decoy_dst and not is_ipv4(decoy_dst):
+        raise ValueError("bad decoy_dst")
+
+    plan = [("BAS", real_src, peer)]                         # baseline: real -> real
+    if forged_src:
+        plan.append(("SRC", forged_src, peer))              # forged source -> real dst
+    if decoy_dst:
+        plan.append(("DST", real_src, decoy_dst))           # real source -> decoy dst (routed to peer)
+
+    fd = None
+    sent = []
+    try:
+        fd = socket.socket(socket.AF_INET, socket.SOCK_RAW, proto)
+        fd.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+        fd.settimeout(2.0)
+        sa = (peer, 0)                                       # sendto address is ALWAYS the real peer
+        for tag, s, dstip in plan:
+            pkt = _egress_build_ip4(s, dstip, proto, _egress_payload(tag.encode(), nonce))
+            for _ in range(3):                               # a few copies to ride out single-packet loss
+                try:
+                    fd.sendto(pkt, sa)
+                except OSError as e:
+                    return {"ok": False, "error": "send failed (%s): %s" % (tag, e)}
+                time.sleep(0.05)
+            sent.append(tag.lower())
+    except OSError as e:
+        return {"ok": False, "error": "raw socket: %s (needs root / CAP_NET_RAW)" % e}
+    finally:
+        if fd is not None:
+            fd.close()
+    return {"ok": True, "sent": sent}
+
+
+def op_spoof_egress_result(d):
+    """Read the verdict of a background capture by its token. {done:false} while the window is still
+    open; once done, {saw:{baseline,src,dst}, observed:{...}}."""
+    token = str(d.get("token") or "").strip()
+    with _EGRESS_LOCK:
+        r = _EGRESS.get(token)
+    if r is None:
+        return {"ok": False, "error": "unknown or expired token"}
+    return {"ok": True, **r}
+
+
 def op_ech_update(d):
     """Live ECH-key push: the panel fetched a freshly-rotated ECHConfigList and pushes it here so the
     RUNNING ws core hot-swaps it (via the <status>.echcmd file the core polls) — NO rebuild, the TUN
@@ -3184,9 +3389,13 @@ OPS = {"ping": op_ping, "list": op_list, "check": op_check, "tunnel": op_tunnel,
        "pool-probe-now": op_pool_probe_now, "pool-select": op_pool_select,
        "ech-update": op_ech_update,
        "core-install": op_core_install, "spoof-probe": op_spoof_probe,
+       "spoof-egress-listen": op_spoof_egress_listen, "spoof-egress-send": op_spoof_egress_send,
+       "spoof-egress-result": op_spoof_egress_result,
        "set-update-key": op_set_update_key,
        "kernel-tune": op_kernel_tune,
        "link-enable": op_link_enable}
+# spoof-egress-* SEND packets / start a capture, so they are POST (not READ_ONLY) even though they
+# mutate no stored config — a forged-packet send is a side effect the CSRF guard should cover.
 READ_ONLY = {"ping", "list", "check", "portcheck", "spoof-probe", "edge-status", "peer-status"}
 
 # ----------------------------------------------------------------------------- HTTP
