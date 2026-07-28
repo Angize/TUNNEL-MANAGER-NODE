@@ -1062,6 +1062,36 @@ def _core_unit(name):
     return "tnl-cor-" + name
 
 
+def _core_last_error(name, lines=40):
+    """The core's OWN reason for not coming up, read from its unit journal.
+
+    build_core launches the core under a Restart=always unit and waits for its TUN. When the core
+    REJECTS the config it exits immediately, the TUN never appears, and op_tunnel's netdev check
+    fails — at which point the agent used to report «هستهٔ tnl-core روی این نود نصب/فعال نیست»,
+    which is false and is most misleading in exactly the case where the true reason was one line
+    away. config.go alone has ~68 distinct rejections, so mirroring them here would mean a guard per
+    combination that the core can add to at any time; quoting the core instead covers all of them,
+    including the ones it does not have yet.
+
+    Returns "" when there is nothing quotable — no journalctl, unit never ran, empty output — so the
+    caller keeps its old message for the case it was actually written for (the core NOT installed).
+    """
+    rc, out, _ = run(["journalctl", "-u", _core_unit(name), "-n", str(int(lines)),
+                      "--no-pager", "-o", "cat"], timeout=10)
+    if rc != 0 or not out:
+        return ""
+    # Go's logger prefixes a date+time; every core line is tagged "tnl-core: ". Walk backwards so a
+    # restart loop reports its LATEST attempt rather than the first.
+    tag = "tnl-core: "
+    for ln in reversed(out.splitlines()):
+        i = ln.find(tag)
+        if i >= 0:
+            msg = ln[i + len(tag):].strip()
+            if msg:
+                return msg[:300]
+    return ""
+
+
 def _cfg_path(name, suffix=""):
     """Path of a core sidecar file for tunnel `name` in CONFIG_DIR (e.g. suffix=\".status\",
     \".peerpool\", \".status.cmd\"). Centralizes the core-<name><suffix> naming used across the agent."""
@@ -2475,6 +2505,13 @@ def op_tunnel(d):
     # builds run `ip` via run() which never raises on failure, so verify the netdev really exists
     rc, _, _ = run(["ip", "link", "show", name])   # every type is a plain kernel netdev now
     if rc != 0:
+        # For a core tunnel the missing netdev has TWO very different causes, and the message below
+        # only ever described one of them. If the core ran and refused the config, it said why —
+        # quote it instead of guessing that it is not installed.
+        if ttype == "core":
+            why = _core_last_error(name)
+            if why:
+                return _fail("هستهٔ tnl-core بالا نیامد — پیامِ خودش: " + why)
         need = {"vxlan": "vxlan", "gre": "ip_gre", "sit": "sit", "ipip": "ipip",
                 "l2tpv3": "l2tp_eth", "fou": "fou و ipip", "ipsec": "xfrm_interface",
                 "core": "هستهٔ tnl-core"}[ttype]

@@ -50,3 +50,5 @@ jobs:
         env:
           CORE_REPO: ${{ github.workspace }}/core-checkout
         run: python tools/http_up_bounds_test.py
+      - name: a core that refuses its config says so
+        run: python tools/core_error_surfaced_test.py
