@@ -707,6 +707,9 @@ def _core_config(cfg):
     if transport == "raw":
         # IP20 + the profile's carrier header (bip/ipip add none; gre 4; icmp/udp 8; tcp 20).
         outer = 20 + {"bip": 0, "ipip": 0, "gre": 4, "icmp": 8, "udp": 8, "tcp": 20, "esp": 8}.get(raw_profile, 0)
+    elif transport == "spoof":
+        # Spoof forges the whole outer IPv4 header itself (IP_HDRINCL), bip-like: IP20, no L4 header.
+        outer = 20
     elif transport == "flux":
         # IP20 + the carrier header. udp adds an 8-byte UDP header. The raw carrier adds none.
         # stun is NOT 8+20: buildSTUN wraps the frame as a STUN attribute, so the real cost is
@@ -730,9 +733,9 @@ def _core_config(cfg):
     if crypto_on:
         # AEAD nonce+tag, plus the 12-byte per-frame mask salt the core prepends (v2 wire).
         overhead += (40 if cipher == "xchacha20-poly1305" else 28) + 12
-    # FEC (datagram carriers: udp/raw/flux) prepends an 11-byte block header + a 2-byte
+    # FEC (datagram carriers: udp/raw/flux/spoof) prepends an 11-byte block header + a 2-byte
     # shard-len to every data shard, so it costs 13 bytes of usable payload per packet.
-    if transport in ("udp", "raw", "flux") and bool(cfg.get("fec")):
+    if transport in ("udp", "raw", "flux", "spoof") and bool(cfg.get("fec")):
         overhead += 13
     # The TUN MTU must never EXCEED the carrier budget, or datagram carriers fragment/black-hole on a
     # small underlay (PPPoE 1492 / IPv6-min 1280): floor 1280 could hand out MORE than base-overhead.
@@ -785,7 +788,7 @@ def _core_config(cfg):
     # name the pool uses, so op_edge_status reads it unchanged. This is `status_path` (NOT `ws_status_path`),
     # so _is_ws_pool keeps telling a pool core apart from a plain core (only the pool has SIGHUP/SIGUSR
     # handlers). Single ws/http gets its own status_path below; ws-pool uses ws_status_path.
-    if transport in ("udp", "tcp", "raw", "flux") and str(cfg.get("role")) == "client":
+    if transport in ("udp", "tcp", "raw", "flux", "spoof") and str(cfg.get("role")) == "client":
         corecfg["status_path"] = _cfg_path(name, ".status")
     # peer_src_ips (raw/flux SERVER): the client's source pool. These carriers receive via a raw/
     # AF_PACKET socket that sees every host and pre-filter by the learned peer source, so a rotated
@@ -805,6 +808,15 @@ def _core_config(cfg):
         except (TypeError, ValueError):
             _rp = 0
         if raw_profile == "bip" and 1 <= _rp <= 255:
+            corecfg["raw_proto"] = _rp
+    if transport == "spoof":
+        # The spoof carrier is bip-like (no raw_profile — the core forces it); it only carries the
+        # optional outer IP protocol number override, exactly like a bip raw carrier.
+        try:
+            _rp = int(cfg.get("raw_proto") or 0)
+        except (TypeError, ValueError):
+            _rp = 0
+        if 1 <= _rp <= 255:
             corecfg["raw_proto"] = _rp
     if transport == "dns":
         # DNS-tunnel carrier: the delegated zone (server is its authoritative NS) and, on the
@@ -903,19 +915,19 @@ def _core_config(cfg):
                 corecfg["ws_warm_standby"] = bool(cfg.get("ws_warm_standby"))  # make-before-break failover
                 corecfg["ws_status_path"] = _cfg_path(name, ".status")
     # FEC (forward error correction): reconstructs lost carrier datagrams from parity so a
-    # throttled/high-loss link stays usable. Datagram carriers only (udp/raw/flux) — on
-    # tcp/ws it's wasted (TCP is already reliable), so it's only forwarded for those three.
-    if transport in ("udp", "raw", "flux") and bool(cfg.get("fec")):
+    # throttled/high-loss link stays usable. Datagram carriers only (udp/raw/flux/spoof) — on
+    # tcp/ws it's wasted (TCP is already reliable), so it's only forwarded for those.
+    if transport in ("udp", "raw", "flux", "spoof") and bool(cfg.get("fec")):
         corecfg["fec"] = True
         corecfg["fec_data"] = int(cfg.get("fec_data") or 10)
         corecfg["fec_parity"] = int(cfg.get("fec_parity") or 3)
     if bool(cfg.get("gso")):     # TUN segmentation offload — local throughput optimization
         corecfg["gso"] = True
-    # IP spoofing (raw bip + crypto only): forge the outer source and/or the destination (a decoy).
-    # The client puts the decoy in the header dst while still routing to the real server; the server
-    # then receives those frames via AF_PACKET and answers AS the decoy, so it must be told the
-    # client's real IP (remote_ip) to reply to — the forged source hides it from the wire.
-    if transport == "raw" and raw_profile == "bip" and crypto_on:
+    # IP spoofing (the spoof transport, crypto only): forge the outer source and/or the destination
+    # (a decoy). The client puts the decoy in the header dst while still routing to the real server;
+    # the server then receives those frames via AF_PACKET and answers AS the decoy, so it must be told
+    # the client's real IP (remote_ip) to reply to — the forged source hides it from the wire.
+    if transport == "spoof" and crypto_on:
         spoof_src = str(cfg.get("spoof_src") or "").strip()
         spoof_dst = str(cfg.get("spoof_dst") or "").strip()
         if cfg.get("role") == "client":
@@ -926,13 +938,14 @@ def _core_config(cfg):
         else:  # server
             if spoof_dst:
                 corecfg["spoof_dst_ip"] = spoof_dst
-            if spoof_src or spoof_dst:
-                corecfg["real_peer_ip"] = cfg["remote_ip"]
+            # The client's real IP is never on the wire (forged source, or a decoy dst), so the server
+            # is always told it — regardless of which field the client forged.
+            corecfg["real_peer_ip"] = cfg["remote_ip"]
     # Fake-packet desync (client): the core emits decoy packets to mis-sync a stateful DPI without
-    # touching the real session. raw/flux forge whole IPv4 packets; tcp/ws INJECT decoy TCP segments
-    # on the kernel connection's 4-tuple (AF_PACKET). Plain udp has no such hook. Decoys are separate
-    # packets, not extra per-frame overhead, so they cost no MTU budget.
-    if transport in ("raw", "flux", "tcp", "ws") and cfg.get("role") == "client" and bool(cfg.get("fake_desync")):
+    # touching the real session. raw/flux/spoof forge whole IPv4 packets; tcp/ws INJECT decoy TCP
+    # segments on the kernel connection's 4-tuple (AF_PACKET). Plain udp has no such hook. Decoys are
+    # separate packets, not extra per-frame overhead, so they cost no MTU budget.
+    if transport in ("raw", "flux", "spoof", "tcp", "ws") and cfg.get("role") == "client" and bool(cfg.get("fake_desync")):
         corecfg["fake_desync"] = True
         corecfg["fake_ttl"] = max(1, min(255, int(cfg.get("fake_ttl") or 4)))
         corecfg["fake_count"] = max(1, min(64, int(cfg.get("fake_count") or 2)))
@@ -2082,7 +2095,7 @@ def op_tunnel(d):
             raise ValueError("bad core cipher")
         obj["cipher"] = cipher
         transport = str(d.get("transport") or "udp").strip().lower()
-        if transport not in ("udp", "tcp", "raw", "flux", "ws", "dns"):
+        if transport not in ("udp", "tcp", "raw", "flux", "spoof", "ws", "dns"):
             raise ValueError("bad core transport")
         obj["transport"] = transport
 
@@ -2258,6 +2271,12 @@ def op_tunnel(d):
                     raise ValueError("bad raw_proto")
                 if rproto:
                     obj["raw_proto"] = rproto
+        if transport == "spoof":      # standalone IP-spoofing carrier: bip-like, so only the proto override (no profile)
+            rproto = int(d.get("raw_proto") or 0)
+            if rproto and not (1 <= rproto <= 255):
+                raise ValueError("bad raw_proto")
+            if rproto:
+                obj["raw_proto"] = rproto
         if transport == "flux":       # polymorphic moving-target carrier: persist carrier/shape/epoch
             carrier = str(d.get("flux_carrier") or "udp").strip().lower()
             if carrier not in ("udp", "raw", "stun"):
@@ -2273,9 +2292,9 @@ def op_tunnel(d):
             obj["flux_shape"] = shape
             obj["flux_epoch_offset"] = int(d.get("flux_epoch_offset") or 0)  # manual "rotate now" bump
         # FEC (forward error correction) — repairs lost carrier datagrams from parity, on the
-        # datagram carriers only (udp/raw/flux). Persisting these in the whitelist is mandatory:
+        # datagram carriers only (udp/raw/flux/spoof). Persisting these in the whitelist is mandatory:
         # an un-whitelisted key is silently dropped from the stored config and never reaches the core.
-        if transport in ("udp", "raw", "flux") and _as_bool(d.get("fec")):
+        if transport in ("udp", "raw", "flux", "spoof") and _as_bool(d.get("fec")):
             obj["fec"] = True
             fd = int(d.get("fec_data") or 10)
             fp = int(d.get("fec_parity") or 3)
@@ -2342,6 +2361,10 @@ def op_tunnel(d):
         # rejects it without crypto; validate here so the failure is precise, not "interface not created".
         if transport == "raw" and (not psk or cipher == "none"):
             raise ValueError("ترنسپورت raw به رمزنگاری (psk) نیاز دارد — هر فریم با AEAD رمز و احراز می‌شود")
+        # The spoof carrier is the same raw datapath with a forged IP header; crypto is likewise mandatory
+        # (the AEAD is the only integrity on a forged-header frame).
+        if transport == "spoof" and (not psk or cipher == "none"):
+            raise ValueError("ترنسپورت spoof به رمزنگاری (psk) نیاز دارد — هر فریمِ هدرجعلی با AEAD احراز می‌شود")
         # TLS cover (HTTPS camouflage) — persist it so _core_config can forward it to the core.
         if _as_bool(d.get("cover")) and transport == "tcp":
             obj["cover"] = True
@@ -2356,12 +2379,12 @@ def op_tunnel(d):
         if _as_bool(d.get("gso")):        # TUN segmentation offload (throughput); Linux only, harmless if unsupported
             obj["gso"] = True
         # Fake-packet desync: persist the decoy knobs so _core_config can forward them. Supported on
-        # raw/flux (forge IPv4) and tcp/ws (inject decoy TCP segments); not on plain udp. Whitelisting
+        # raw/flux/spoof (forge IPv4) and tcp/ws (inject decoy TCP segments); not on plain udp. Whitelisting
         # is mandatory — an un-whitelisted key is silently dropped from the stored config and never
         # reaches the core (this is exactly the bug spoofing hit).
         if _as_bool(d.get("fake_desync")):
-            if transport not in ("raw", "flux", "tcp", "ws"):
-                raise ValueError("fake_desync is supported on the raw, flux, tcp and ws carriers (not udp)")
+            if transport not in ("raw", "flux", "spoof", "tcp", "ws"):
+                raise ValueError("fake_desync is supported on the raw, flux, spoof, tcp and ws carriers (not udp)")
             obj["fake_desync"] = True
             ttl = int(d.get("fake_ttl") or 4)
             if ttl < 1 or ttl > 255:
@@ -2375,9 +2398,10 @@ def op_tunnel(d):
             if mode not in ("ttl", "badsum", "both"):
                 raise ValueError("bad fake_mode")
             obj["fake_mode"] = mode
-        # IP spoofing (raw bip only): persist the forged source and/or decoy destination so _core_config
-        # can wire them per role. Without this the fields never reach the stored cfg and spoofing is a no-op.
-        if transport == "raw" and obj.get("raw_profile") == "bip":
+        # IP spoofing (the spoof transport): persist the forged source and/or decoy destination so
+        # _core_config can wire them per role. Without this the fields never reach the stored cfg and
+        # spoofing is a no-op — the exact bug this whitelist exists to prevent.
+        if transport == "spoof":
             ss = str(d.get("spoof_src") or "").strip()
             sd = str(d.get("spoof_dst") or "").strip()
             if ss:
@@ -2388,6 +2412,8 @@ def op_tunnel(d):
                 if not is_ipv4(sd):
                     raise ValueError("bad spoof_dst")
                 obj["spoof_dst"] = sd
+            if not ss and not sd:
+                raise ValueError("ترنسپورت spoof حداقل به یکی از spoof_src / spoof_dst نیاز دارد")
     # in-place rebuild: fully tear the previous build (read once above) down first so nothing tied to a
     if old and old.get("type") != "portfw":   # now-overwritten field (e.g. FOU's old UDP-port decap listener) leaks
         teardown_config(old)
