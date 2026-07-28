@@ -885,7 +885,10 @@ def _core_config(cfg):
                 sp = int(cfg.get("split_pos") or 0)
                 if sp:
                     corecfg["split_pos"] = max(0, min(1400, sp))
-                # mode: "split" (in-order) or "disorder" (low-TTL head desyncs a reassembling DPI).
+                # mode: "split" (in-order, the default and so never forwarded), "disorder" (low-TTL head
+                # desyncs a reassembling DPI) or "fake" (a decoy ClientHello with a substituted SNI, killed
+                # before the server by a bad TCP checksum). The line below accepts all three non-default
+                # modes; the comment used to name only two, so "fake" read like something core-only.
                 mode = str(cfg.get("sni_mode") or "").strip().lower()
                 if mode in ("disorder", "fake"):
                     corecfg["sni_mode"] = mode
