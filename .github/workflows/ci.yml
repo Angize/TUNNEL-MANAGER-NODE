@@ -38,3 +38,15 @@ jobs:
 
       - name: py_compile (warnings are errors)
         run: python -W error::SyntaxWarning -m py_compile tnl-node.py
+
+      # The core is public, so this side CAN be checked cross-repo (the panel cannot — it is private).
+      - name: check out the core beside this repo
+        uses: actions/checkout@v5
+        with:
+          repository: Angize/TUNNEL-MANAGER-CORE
+          path: core-checkout
+
+      - name: http_up_* bounds match the core's
+        env:
+          CORE_REPO: ${{ github.workspace }}/core-checkout
+        run: python tools/http_up_bounds_test.py
