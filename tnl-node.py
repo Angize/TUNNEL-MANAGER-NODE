@@ -2170,14 +2170,20 @@ def op_tunnel(d):
                 # have to keep them, because a key that is not whitelisted here is dropped in
                 # SILENCE and the tunnel quietly rebuilds on the default Cloudflare shape — which
                 # on a WAF-protected CDN means the source IP gets blocked.
+                # The ceilings are the CORE's own (config.go validate()), not arbitrary numbers: the
+                # core REJECTS an out-of-range value rather than clamping it, so a wider bound here
+                # only moves the failure to a core that refuses to start, a TUN that never appears and
+                # a generic "the interface was not created". Every other combination the core rejects
+                # is pre-checked here for exactly that reason; these three were the gap.
+                _up_max = {"http_up_workers": 16, "http_up_batch_kb": 512, "http_up_rate": 1000}
                 for _k in ("http_up_workers", "http_up_batch_kb", "http_up_rate"):
                     if _k in d:
                         try:
                             _v = int(d.get(_k) or 0)
                         except (TypeError, ValueError):
                             raise ValueError("bad %s" % _k)
-                        if _v < 0 or _v > 100000:
-                            raise ValueError("bad %s" % _k)
+                        if _v < 0 or _v > _up_max[_k]:
+                            raise ValueError("%s باید بین ۰ و %d باشد (۰ = پیش‌فرض)" % (_k, _up_max[_k]))
                         if _v:
                             obj[_k] = _v
             if _as_bool(d.get("ws_tls")):
