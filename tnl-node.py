@@ -789,7 +789,11 @@ def _core_config(cfg):
     # name the pool uses, so op_edge_status reads it unchanged. This is `status_path` (NOT `ws_status_path`),
     # so _is_ws_pool keeps telling a pool core apart from a plain core (only the pool has SIGHUP/SIGUSR
     # handlers). Single ws/http gets its own status_path below; ws-pool uses ws_status_path.
-    if transport in ("udp", "tcp", "raw", "flux", "spoof") and str(cfg.get("role")) == "client":
+    # dns belongs here too: it was the ONE client carrier the core wrote no status file for, so the
+    # health sweep below found no hb/dw and fell through to traffic-flow + ICMP. That reads a healthy
+    # but idle dns tunnel as half-open, and never reports a dead one as dead (instant-red needs a
+    # published dw). The core publishes both now; withholding the path here would keep it inert.
+    if transport in ("udp", "tcp", "raw", "flux", "spoof", "dns") and str(cfg.get("role")) == "client":
         corecfg["status_path"] = _cfg_path(name, ".status")
     # peer_src_ips (raw/flux SERVER): the client's source pool. These carriers receive via a raw/
     # AF_PACKET socket that sees every host and pre-filter by the learned peer source, so a rotated
