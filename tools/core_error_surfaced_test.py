@@ -22,6 +22,12 @@ import os
 import sys
 import tempfile
 
+# Every message this guard prints quotes a Persian UI string, and it is run on a Windows console whose
+# default encoding is cp1252 — which cannot encode Persian at all. Without this the guard raises
+# UnicodeEncodeError while PRINTING the failure it correctly detected: it fires, and then says nothing.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 NODE = os.path.join(os.path.dirname(HERE), "tnl-node.py")
 
@@ -55,12 +61,13 @@ def base_req():
             "enabled": True}
 
 
-def drive(mod, tmpdir, journal, journal_rc=0, netdev_rc=1):
+def drive(mod, tmpdir, journal, journal_rc=0, netdev_rc=1, is_active="inactive", invocation=""):
     """Run the REAL op_tunnel to the netdev-verify tail and return its result dict.
 
     `run` is stubbed at the process boundary: `ip link show` reports the TUN missing (what a rejected
-    config looks like) and `journalctl` returns whatever the case under test wants. Everything else
-    the build would shell out to succeeds silently.
+    config looks like), `systemctl` answers whether the unit is up and which invocation it is on, and
+    `journalctl` returns whatever the case under test wants. Everything else the build would shell
+    out to succeeds silently.
     """
     calls = []
 
@@ -68,6 +75,10 @@ def drive(mod, tmpdir, journal, journal_rc=0, netdev_rc=1):
         calls.append(list(args))
         if args[:3] == ["ip", "link", "show"]:
             return netdev_rc, "", ""
+        if args[:2] == ["systemctl", "is-active"]:
+            return 0, is_active + "\n", ""
+        if args[:2] == ["systemctl", "show"]:
+            return 0, invocation + "\n", ""
         if args and args[0] == "journalctl":
             return journal_rc, journal, ""
         return 0, "", ""
@@ -128,10 +139,39 @@ def main():
         if any(c and c[0] == "journalctl" for c in calls):
             fail("read the journal on the success path")
 
+        # 5. A core that is RUNNING did not refuse anything. Its newest journal line is then the
+        #    SUCCESS line, and quoting that as «پیامِ خودش» told the operator that the reason the core
+        #    failed to come up was that it had come up. build_core documents this case: the TUN
+        #    appears asynchronously and the wait can legitimately run out on a slow cold start.
+        SUCCESS_LINE = ("2026/07/29 00:11:02 tnl-core 0.1.0-core: tun=cor1 mtu=1380 "
+                        "transport=ws role=client\n")
+        res, calls = drive(mod, tmp, SUCCESS_LINE, is_active="active")
+        msg = res.get("msg") or ""
+        if res.get("ok"):
+            fail("running core: a missing netdev was reported as success")
+        if "tun=cor1" in msg or "پیامِ خودش" in msg:
+            fail("running core: quoted the journal as the failure reason: %r" % msg)
+        if "نصب/فعال نیست" in msg:
+            fail("running core: claimed the core is not installed while its unit is active: %r" % msg)
+        if "در حال اجراست" not in msg:
+            fail("running core: does not say the core is up and the interface is not: %r" % msg)
+
+        # 6. The journal read is scoped to THIS invocation. Tunnel names are recycled (core<id> over
+        #    ids 1..254), so without the scope a long-dead tunnel's rejection is quoted as this one's
+        #    reason — and the true message is suppressed precisely because something was found.
+        res, calls = drive(mod, tmp, JOURNAL, invocation="cafe1234cafe1234cafe1234cafe1234")
+        jcalls = [c for c in calls if c and c[0] == "journalctl"]
+        if not jcalls:
+            fail("scoping: the journal was never read")
+        elif not any("_SYSTEMD_INVOCATION_ID=cafe1234cafe1234cafe1234cafe1234" in a for a in jcalls[0]):
+            fail("scoping: the journal read is not limited to this run: %r" % jcalls[0])
+        if CORE_REJECTION not in (res.get("msg") or ""):
+            fail("scoping: the scoped read lost the core's reason: %r" % res.get("msg"))
+
     if fails:
         print("\n%d failure(s)" % len(fails))
         return 1
-    print("OK: a core that refuses its config says so, and the not-installed message still covers its own case")
+    print("OK: the operator is told which of the three causes it is, read from THIS run of the unit")
     return 0
 
 
