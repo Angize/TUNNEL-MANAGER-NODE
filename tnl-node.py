@@ -1047,8 +1047,15 @@ def _core_config(cfg):
         corecfg["peer"] = f"{dial}:{dport}"
         # Pin the client's outbound source to THIS node's own IP (local_ip is validated to be a
         # local address in op_tunnel). On a host with several IPs the kernel would otherwise egress
-        # from its primary IP; binding makes the peer/CDN see this node's registered IP. The core
-        # applies it only for the TCP-family carriers (tcp/ws/http) and ignores it otherwise.
+        # from its primary IP; binding makes the peer/CDN see this node's registered IP.
+        #
+        # It used to say the core applies this only to the TCP-family carriers and ignores it
+        # otherwise. core #209 made that false: bind_ip is now turned into a ONE-ENTRY SOURCE POOL for
+        # every carrier that exposes SetSourcePool — udp, raw and flux included — and the core logs
+        # "binding outbound source IP to %s (pinned as a one-entry source pool)". So on raw/flux this
+        # key is exactly what pins the crafted header's source, and on the udp/tcp raw profiles an IP
+        # the host cannot send from is a silent blackout rather than a cosmetic mismatch. Anyone
+        # debugging "why does this raw tunnel leave from the wrong IP" reads this line first.
         lip = str(cfg.get("local_ip") or "").strip()
         if lip:
             corecfg["bind_ip"] = lip
@@ -1079,9 +1086,19 @@ def _core_last_error(name, lines=40):
 
     Returns "" when there is nothing quotable — no journalctl, unit never ran, empty output — so the
     caller keeps its old message for the case it was actually written for (the core NOT installed).
+
+    The read is scoped to the CURRENT invocation. Without that it spanned every run the unit ever had,
+    and tunnel names are recycled (core<id> over ids 1..254), so a long-dead tunnel's rejection could
+    be quoted as this one's reason — with the true message ("the core is not installed") suppressed
+    because something quotable was found.
     """
-    rc, out, _ = run(["journalctl", "-u", _core_unit(name), "-n", str(int(lines)),
-                      "--no-pager", "-o", "cat"], timeout=10)
+    unit = _core_unit(name)
+    args = ["journalctl", "-u", unit, "-n", str(int(lines)), "--no-pager", "-o", "cat"]
+    _, inv, _ = run(["systemctl", "show", "-p", "InvocationID", "--value", unit], timeout=10)
+    inv = inv.strip()
+    if inv:
+        args.append("_SYSTEMD_INVOCATION_ID=" + inv)   # this boot's run of this unit, nothing older
+    rc, out, _ = run(args, timeout=10)
     if rc != 0 or not out:
         return ""
     # Go's logger prefixes a date+time; every core line is tagged "tnl-core: ". Walk backwards so a
@@ -1094,6 +1111,19 @@ def _core_last_error(name, lines=40):
             if msg:
                 return msg[:300]
     return ""
+
+
+def _core_running(name):
+    """Is the core's unit actually up right now?
+
+    A running core did not refuse anything: op_tunnel's wait for the TUN simply ran out before the
+    interface appeared, which build_core documents as a real possibility on a slow cold start. The
+    journal's newest tagged line is then the core's SUCCESS line ("tnl-core 0.1.0-core: tun=… "), and
+    quoting it as «پیامِ خودش» told the operator the reason the core failed was that it had started.
+    Both of the other two messages are wrong here as well — it is neither missing nor refusing.
+    """
+    _, out, _ = run(["systemctl", "is-active", _core_unit(name)], timeout=10)
+    return out.strip() in ("active", "activating")
 
 
 def _cfg_path(name, suffix=""):
@@ -2509,10 +2539,15 @@ def op_tunnel(d):
     # builds run `ip` via run() which never raises on failure, so verify the netdev really exists
     rc, _, _ = run(["ip", "link", "show", name])   # every type is a plain kernel netdev now
     if rc != 0:
-        # For a core tunnel the missing netdev has TWO very different causes, and the message below
-        # only ever described one of them. If the core ran and refused the config, it said why —
-        # quote it instead of guessing that it is not installed.
+        # For a core tunnel the missing netdev has THREE very different causes and the message below
+        # only ever described one of them: the core is not installed, the core ran and REFUSED the
+        # config (it said why — quote it), or the core is running fine and its TUN has not appeared
+        # yet. The third has to be checked FIRST: a running core's newest journal line is its success
+        # line, and quoting that as «پیامِ خودش» reported the startup message as the failure reason.
         if ttype == "core":
+            if _core_running(name):
+                return _fail("هستهٔ tnl-core در حال اجراست ولی اینترفیسِ «" + name + "» هنوز بالا نیامده — "
+                             "احتمالاً استارتِ کند؛ چند لحظه بعد دوباره امتحان کن")
             why = _core_last_error(name)
             if why:
                 return _fail("هستهٔ tnl-core بالا نیامد — پیامِ خودش: " + why)
