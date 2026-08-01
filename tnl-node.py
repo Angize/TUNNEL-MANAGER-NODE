@@ -323,7 +323,7 @@ def enable_ip_forward():
         pass
 
 
-# --- Host network tuning (part ب of the throughput work; the core-side SO_*BUF is part الف) ---
+# --- Host network tuning; the core-side SO_*BUF is the other half of the throughput work ---
 # OPT-IN, operator-triggered from the panel (a button beside the other node actions) — NOT run
 # at install/startup, because it mutates host-wide network behaviour and the operator may not
 # want it. BBR + fq + larger socket-buffer ceilings: BBR does not collapse on the packet loss /
