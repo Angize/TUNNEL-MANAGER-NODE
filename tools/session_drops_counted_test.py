@@ -27,6 +27,10 @@ import time
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
+# The guard flips the source between runs, and a .pyc that survives one of those flips is loaded in
+# place of the file under test — a revert then still "passes". Never write bytecode for it.
+sys.dont_write_bytecode = True
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 NODE = os.path.join(os.path.dirname(HERE), "tnl-node.py")
 
@@ -64,7 +68,7 @@ def main():
     # The interface must look present, and the status file must be found where the node looks for it.
     mod.os.path.exists = lambda p: True if p.startswith("/sys/class/net/") else os.path.exists(p)
     mod._cfg_path = lambda name, ext: os.path.join(tmp, name + ext)
-    mod._flow_alive = lambda name: None
+    mod._flow_sample = lambda name: (None, None)
 
     if not hasattr(mod, "DROP_WINDOW"):
         fail("DROP_WINDOW is gone — THIS GUARD is out of date")

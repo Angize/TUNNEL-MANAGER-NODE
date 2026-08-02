@@ -1500,21 +1500,21 @@ def peer_of(tunnel_ip, ttype):
     return f"{base}.2" if last == "1" else f"{base}.1"
 
 
-# --- traffic-flow liveness: real bytes arriving on the tunnel iface prove it's delivering, whatever ICMP does ---
-LIVE_WINDOW = 12.0   # s: the iface must have RECEIVED new bytes within this window to count as flow-alive (kept short so a busy tunnel that dies flips out of "flow-alive" quickly)
+# --- directional liveness: bytes moving on the tunnel iface, counted per direction, whatever ICMP does ---
+LIVE_WINDOW = 12.0   # s: a direction counts as live only if its byte counter advanced within this window (short, so a busy tunnel that dies stops looking live quickly)
 DROP_WINDOW = 300.0  # s: how far back `drops` counts lost sessions. A dot only answers "up right now", which a tunnel reconnecting every 10s answers yes to every time it is asked.
 _flow_lock = threading.Lock()
-_flow_state = {}     # iface name -> {"rx": int, "progress": float|None} (last sample + monotonic time rx last advanced)
+_flow_state = {}     # iface name -> {"rx","tx": int, "rxp","txp": float|None} (last sample + monotonic time each direction last advanced)
 # --- never-connected detection: the core publishes `dw` from startup but only stamps `hb` once it has
 # actually received an authenticated frame, so dw>0 with hb==0 means this client has NEVER been answered.
 _nohb_lock = threading.Lock()
 _nohb_state = {}     # iface name -> monotonic time we first saw "modern core running, still no inbound frame"
 
 
-def _iface_rx(name):
-    """Total received bytes on <name> from the kernel, or None if the counter can't be read."""
+def _iface_ctr(name, which):
+    """Total rx_bytes/tx_bytes on <name> from the kernel, or None if the counter can't be read."""
     try:
-        with open("/sys/class/net/" + name + "/statistics/rx_bytes") as f:
+        with open("/sys/class/net/" + name + "/statistics/" + which + "_bytes") as f:
             return int(f.read().strip())
     except Exception:
         return None
@@ -1524,7 +1524,7 @@ def _prune_iface_state(names):
     """Drop per-iface liveness bookkeeping for tunnels that no longer exist. Both dicts are keyed by
     config name and nothing removed their entries on delete, so a node churned by create/delete grew
     them forever — and a recreated tunnel inherited a stale rx baseline until the counter-went-backwards
-    reset in _flow_alive cost it one extra sweep."""
+    reset in _flow_sample cost it one extra sweep."""
     with _flow_lock:
         for nm in [n for n in _flow_state if n not in names]:
             _flow_state.pop(nm, None)
@@ -1533,27 +1533,36 @@ def _prune_iface_state(names):
             _nohb_state.pop(nm, None)
 
 
-def _flow_alive(name):
-    """True when <name> has RECEIVED new bytes within LIVE_WINDOW — real inbound tunnel traffic, so the
-    tunnel is delivering regardless of whether ICMP is answered/filtered. None when undetermined: first
-    sample, no inbound seen yet, the counter is unreadable, or the iface was just recreated (rx reset).
-    Never a hard False — silence isn't proof of death for an idle tunnel; that's what the ICMP fallback is for."""
+def _flow_sample(name):
+    """Per-DIRECTION liveness on <name>, as (rx_live, tx_live), each True/False/None.
+
+    rx = bytes the tunnel DELIVERED to us, so the peer's traffic is arriving. tx = bytes we pushed INTO
+    the tunnel, so we are trying. They answer different questions and are never merged: a tunnel that is
+    sending into a hole has tx moving and rx still, which is exactly the state a single flag cannot say.
+
+    None = undetermined: first sample, nothing seen yet, unreadable counter, or the iface was recreated
+    (the counter went backwards). Never a hard False on silence alone — an idle tunnel is not a dead one;
+    that is what the probe is for."""
     now = time.monotonic()
-    with _flow_lock:  # sample + compare + store atomically so concurrent same-name callers can't invert rx order
-        rx = _iface_rx(name)
-        if rx is None:
-            return None
+    with _flow_lock:  # sample + compare + store atomically so concurrent same-name callers can't invert the order
+        rx, tx = _iface_ctr(name, "rx"), _iface_ctr(name, "tx")
+        if rx is None or tx is None:
+            return None, None
         prev = _flow_state.get(name)
-        progress = prev.get("progress") if prev else None
+        rxp = prev.get("rxp") if prev else None
+        txp = prev.get("txp") if prev else None
         if prev is not None:
             if rx > prev["rx"]:
-                progress = now      # new bytes arrived since the last sample
+                rxp = now
             elif rx < prev["rx"]:
-                progress = None     # counter went backwards = iface was recreated; old progress is meaningless
-        _flow_state[name] = {"rx": rx, "progress": progress}
-    if progress is None:
-        return None
-    return (now - progress) <= LIVE_WINDOW
+                rxp = None      # counter went backwards = iface recreated; old progress is meaningless
+            if tx > prev["tx"]:
+                txp = now
+            elif tx < prev["tx"]:
+                txp = None
+        _flow_state[name] = {"rx": rx, "tx": tx, "rxp": rxp, "txp": txp}
+    fresh = lambda p: None if p is None else (now - p) <= LIVE_WINDOW
+    return fresh(rxp), fresh(txp)
 
 
 def health_of(cfg, thorough=False):
@@ -1593,15 +1602,15 @@ def health_of(cfg, thorough=False):
         # A netdev exists iff /sys/class/net/<name> does — one stat(2), no fork. `ip link show` spawned
         # a process per tunnel per 3s sweep AND held the global mutation lock for the whole fork+exec,
         # so on a hub the health sweep alone owned that lock a large fraction of the time and every
-        # rebuild queued behind it. _flow_alive four lines down already reads this same directory.
+        # rebuild queued behind it. _flow_sample four lines down already reads this same directory.
         up = os.path.exists("/sys/class/net/" + name)   # mid-teardown gap as a transient false 'down'
     # Real-state liveness: if authenticated tunnel traffic is actually arriving on the iface, the tunnel
     # is alive no matter whether ICMP is answered or filtered. Only meaningful once the iface exists.
-    flow = _flow_alive(name) if up else None
+    rx_live, tx_live = _flow_sample(name) if up else (None, None)
     # Core heartbeat: a client core writes its lastRx (hb, unix-seconds) plus its RESOLVED dead-window (dw)
     # into the status file every few seconds. A FRESH hb (age <= dw) proves the encrypted session is alive
     # even with zero user traffic and filtered ICMP; an aged-out hb, or an unpaired real-death `down`, is a
-    # positive DEATH signal. hb 0 or absent (server side, pre-handshake) falls through to flow + ICMP.
+    # positive DEATH signal. hb 0 or absent (server side, pre-handshake) falls through to rx + ICMP.
     beat = None  # True = alive, False = confirmed dead, None = no heartbeat to judge by
     _hb = _dw = 0    # published heartbeat + resolved dead-window; kept in scope for the never-connected check below
     drops = 0        # sessions LOST inside DROP_WINDOW — the count the up/down dot cannot express
@@ -1641,15 +1650,15 @@ def health_of(cfg, thorough=False):
                 beat = False
             elif _dw > 0:
                 beat = _age <= _dw                     # core-authoritative window: unifies the multiplier, honours the operator's tuning
-            # no dw published -> leave beat None and fall through to flow + ICMP (the core always
+            # no dw published -> leave beat None and fall through to rx + ICMP (the core always
             # publishes dw, so this is a malformed-status guard, not a version fallback)
     ping = rtt = loss = None
     tip = cfg.get("tunnel_ip", "")
     # Probe with ICMP only when it can add something: the on-demand (thorough) check ALWAYS pings; the
-    # passive sweep pings only when NEITHER the core heartbeat NOR traffic-flow has already settled the
+    # passive sweep pings only when NEITHER the core heartbeat NOR arriving traffic has already settled the
     # verdict — so a filtered ICMP can't paint a busy/idle-but-live tunnel half-open, while a tunnel with
-    # no heartbeat/flow still gets a real reachability probe.
-    if up and tip and tip != "N/A" and (thorough or (beat is None and flow is not True)):
+    # no heartbeat and no arriving traffic still gets a real reachability probe.
+    if up and tip and tip != "N/A" and (thorough or (beat is None and rx_live is not True)):
         peer = peer_of(tip, ttype)
         cnt, wait = ("4", "2") if thorough else ("1", "2")  # on-demand pings harder; passive stays a single cheap packet (2s wait) so an idle-ICMP-heavy fleet doesn't pile up
         cmd = (["ping", "-6", "-c", cnt, "-W", wait, peer] if ttype == "sit"
@@ -1667,7 +1676,7 @@ def health_of(cfg, thorough=False):
     # NEVER-CONNECTED counts as dead, not unknown: the core publishes dw the moment it starts but stamps
     # hb only once an authenticated frame arrives, so dw>0 with hb==0 means it was never answered.
     nohb_dead = False
-    if up and ttype == "core" and _dw > 0 and _hb <= 0 and flow is not True and ping is False:
+    if up and ttype == "core" and _dw > 0 and _hb <= 0 and rx_live is not True and ping is False:
         with _nohb_lock:
             _t0 = _nohb_state.get(name)
             if _t0 is None:
@@ -1676,13 +1685,16 @@ def health_of(cfg, thorough=False):
     else:
         with _nohb_lock:
             _nohb_state.pop(name, None)   # condition no longer holds -> restart the grace next time
+    # alive answers ONE question: does the peer's traffic reach us. The heartbeat and rx are two views of
+    # that same fact, so neither outranks the other; tx is deliberately absent, because nothing measurable
+    # HERE can say whether what we send arrives -- only the far end knows, and the panel pairs the two.
     dead = False
-    if beat is True:
+    if beat is False:
+        alive, src, dead = False, "beat", True     # the core reported a real death: no probe can outvote it
+    elif beat is True:
         alive, src = True, "beat"
-    elif beat is False:
-        alive, src, dead = False, "beat", True
-    elif flow is True:
-        alive, src = True, "flow"
+    elif rx_live is True:
+        alive, src = True, "rx"
     elif ping is True:
         alive, src = True, "ping"
     elif ping is False:
@@ -1691,7 +1703,8 @@ def health_of(cfg, thorough=False):
     else:
         alive, src = None, None
     return {"up": up, "alive": alive, "live_src": src, "dead": dead, "rtt_ms": rtt, "loss_pct": loss,
-            "drops": drops, "drop_win": int(DROP_WINDOW)}
+            "drops": drops, "drop_win": int(DROP_WINDOW),
+            "rx_live": rx_live, "tx_live": tx_live}
 
 
 def _cpu_snap():
