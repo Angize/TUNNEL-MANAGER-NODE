@@ -93,7 +93,7 @@ def main():
     mod.os.path.exists = lambda p: True if p.startswith("/sys/class/net/") else os.path.exists(p)
     mod._cfg_path = lambda name, ext: os.path.join(tmp, name + ext)
 
-    def health(rx_live, tx_live, hb_age=None, ping_ok=None, events=None):
+    def health(rx_live, tx_live, hb_age=None, ping_ok=None, events=None, rt_age=None, rtms=0):
         mod._flow_sample = lambda name: (rx_live, tx_live)
         if hb_age is None:
             try:
@@ -101,8 +101,11 @@ def main():
             except OSError:
                 pass
         else:
+            doc = {"hb": int(time.time() - hb_age), "dw": 20, "events": events or []}
+            if rt_age is not None:
+                doc["rt"], doc["rtt_ms"] = int(time.time() - rt_age), rtms
             with open(os.path.join(tmp, "t0.status"), "w", encoding="utf-8") as f:
-                json.dump({"hb": int(time.time() - hb_age), "dw": 20, "events": events or []}, f)
+                json.dump(doc, f)
         if ping_ok is None:
             mod.run = lambda *a, **k: (1, "", "")          # probe cannot run
         elif ping_ok:
@@ -135,10 +138,30 @@ def main():
         fail("the core reported a real death and the side read alive=%r dead=%r — a positive death "
              "signal must outrank every other input" % (h.get("alive"), h.get("dead")))
 
+    # ---- the answered keepalive: the one local fact covering BOTH directions ----
+    h = health(rx_live=None, tx_live=True, hb_age=2, ping_ok=False, rt_age=3, rtms=42)
+    if h.get("round_trip") is not True:
+        fail("a keepalive answered 3s ago inside a 20s window reported round_trip=%r" % h.get("round_trip"))
+    if h.get("carrier_rtt_ms") != 42:
+        fail("carrier_rtt_ms=%r, want the core's own 42 — this is the RTT through obfs and crypto, not "
+             "the ICMP one" % h.get("carrier_rtt_ms"))
+
+    h = health(rx_live=None, tx_live=True, hb_age=2, ping_ok=False, rt_age=600, rtms=42)
+    if h.get("round_trip") is not None:
+        fail("a round trip 600s old reported %r — it must go to None and NEVER to False: the TCP family "
+             "skips the ping when data just arrived, so stale means no news, not broken"
+             % h.get("round_trip"))
+
+    h = health(rx_live=None, tx_live=True, hb_age=2, ping_ok=False)
+    if h.get("round_trip") is not None:
+        fail("no rt published at all reported round_trip=%r, want None (dns publishes none)"
+             % h.get("round_trip"))
+
     if fails:
         print("\n%d check(s) failed." % len(fails))
         return 1
-    print("ok — directions are reported separately and alive claims downstream only")
+    print("ok — directions reported separately, alive claims downstream only, "
+          "and an answered keepalive passes through as positive-only")
     return 0
 
 
