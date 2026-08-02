@@ -1,22 +1,19 @@
 #!/usr/bin/env python3
 # tnl-node — self-contained node agent for the tnl central control plane.
 #
-# Installed on every NODE server. It is FULLY self-contained: it builds tunnels itself
-# (VXLAN/GRE/SIT native kernel netdevs, iptables port-forwards), re-applies them on boot,
-# and rotates port-forward destinations — all in-process. No tnl.sh, no reload.sh, no jq,
-# no menu. Every operation is driven by the central panel over a token-authenticated API.
-#
-# Node dependencies: python3, iproute2 (ip), iptables. All tunnels are native kernel netdevs
-# (VXLAN/GRE/SIT/IPIP/L2TPv3/FOU/IPsec) — no OpenvSwitch required.
+# Installed on every NODE server. It builds tunnels itself (native kernel netdevs, iptables
+# port-forwards), re-applies them on boot and rotates port-forward destinations, all in-process. Every
+# operation is driven by the central panel over a token-authenticated API. Needs python3, iproute2
+# and iptables; every tunnel is a native kernel netdev.
 #
 # Usage:
 #   sudo python3 tnl-node.py --install         # set port + generate token, install+start the service
-#   sudo python3 tnl-node.py --auto-install P  # non-interactive install on port P (panel SSH provisioning)
+#   sudo python3 tnl-node.py --auto-install P  # non-interactive install on port P (panel provisioning)
 #   sudo python3 tnl-node.py --show            # print host / port / token for the central panel
-#   sudo python3 tnl-node.py               # run (used by systemd): re-applies configs, then serves
+#   sudo python3 tnl-node.py                   # run (used by systemd): re-apply configs, then serve
 #
-# Auth: every request must carry header  X-Node-Token: <token>  (constant-time compared).
-# Plain HTTP — expose the agent port to the central server only (trusted network / VPN).
+# Auth: every request must carry header  X-Node-Token: <token>  (constant-time compared). Plain HTTP —
+# expose the agent port to the central server only.
 
 import base64
 import hashlib
@@ -324,21 +321,9 @@ def enable_ip_forward():
 
 
 # --- Host network tuning; the core-side SO_*BUF is the other half of the throughput work ---
-# OPT-IN, operator-triggered from the panel (a button beside the other node actions) — NOT run
-# at install/startup, because it mutates host-wide network behaviour and the operator may not
-# want it. BBR + fq + larger socket-buffer ceilings: BBR does not collapse on the packet loss /
-# high RTT of the Iran path the way the default CUBIC does, so it lifts throughput on the
-# TCP-family carriers (direct-tcp / ws / http); fq gives BBR its pacing. The raised
-# tcp_rmem/tcp_wmem + core rmem_max/wmem_max ceilings let those TCP carriers autotune up to the
-# bandwidth-delay product, and also raise the ceiling for the datagram carriers' non-privileged
-# SO_*BUF fallback (the core prefers SO_*BUFFORCE, which needs no sysctl). Every knob is
-# best-effort — one the kernel rejects is skipped, never fatal. NOTE on fq: net.core.default_qdisc
-# only sets the qdisc for netdevs created AFTER the write (tunnel devices, and every device at the
-# next reboot) — it does not re-attach a qdisc to an already-up uplink; BBR self-paces regardless
-# (kernel ≥4.13), so live throughput does not depend on it. apply() records the prior
-# congestion-control + qdisc into TUNING_PREV so revert() can restore exactly them; TUNING_PREV is
-# also the single source of truth for "is tuning on" (written before any live change, removed only
-# by revert), which keeps apply idempotent and revert a no-op when nothing was applied.
+# OPT-IN, operator-triggered from the panel — NOT at install or startup, because it changes host-wide
+# behaviour. BBR does not collapse on the loss and RTT of the Iran path the way CUBIC does, fq gives it
+# pacing, and the raised ceilings let the TCP carriers autotune. TUNING_PREV is what revert restores.
 TUNING_DROPIN = "/etc/sysctl.d/99-angize-tuning.conf"
 TUNING_MODLOAD = "/etc/modules-load.d/angize-bbr.conf"  # ensure tcp_bbr is loaded before systemd-sysctl at boot
 TUNING_PREV = os.path.join(CONFIG_DIR, "tuning_prev.json")  # original CC+qdisc, for a faithful revert
@@ -712,14 +697,10 @@ def _core_config(cfg):
         # Spoof forges the whole outer IPv4 header itself (IP_HDRINCL), bip-like: IP20, no L4 header.
         outer = 20
     elif transport == "flux":
-        # IP20 + the carrier header. udp adds an 8-byte UDP header. The raw carrier adds none.
-        # stun is NOT 8+20: buildSTUN wraps the frame as a STUN attribute, so the real cost is
-        #   UDP 8 + STUN header 20 + attribute header 4 + the attribute's 4-byte alignment pad (0..3)
-        # = 32..35. Budgeting 28 (UDP + the STUN header only) under-counted by 4..7 bytes on every
-        # FULL-SIZE packet, so the crafted IPv4 packet exceeded the egress MTU: the kernel refuses an
-        # oversize IP_HDRINCL send with EMSGSIZE, and until core #157 that error was discarded — a
-        # textbook MTU black hole where keepalives pass and any bulk transfer stalls. Budget the WORST
-        # case (pad 3): a 4-aligned payload merely leaves 3 bytes unused, which is the safe direction.
+        # IP20 + the carrier header. udp adds 8. The raw carrier adds none. stun is NOT 8+20: buildSTUN
+        # wraps the frame as a STUN attribute, so the real cost is UDP 8 + STUN header 20 + attribute
+        # header 4 + the 4-byte alignment pad (0..3). Under-counting makes the crafted IPv4 packet exceed
+        # the egress MTU, and an oversize IP_HDRINCL send is refused with EMSGSIZE.
         outer = 20 + {"udp": 8, "stun": 8 + 20 + 4 + 3}.get(flux_carrier, 0)
     elif transport == "ws":
         outer = 40 + 14        # IP20 + TCP20 + up to a 14-byte WebSocket frame header
@@ -783,23 +764,16 @@ def _core_config(cfg):
         sni = str(cfg.get("cover_sni") or "").strip()
         if sni:
             corecfg["cover_sni"] = sni
-    # Datagram (udp/raw/flux) and direct-stream (plain tcp / tcp+cover) transports have no ws edge pool,
-    # but the CLIENT still writes a precise self-heal event ring (stale-detect / recovery) PLUS a liveness
-    # heartbeat (`hb`) to a status file we expose back to the panel's system log — same file
-    # name the pool uses, so op_edge_status reads it unchanged. This is `status_path` (NOT `ws_status_path`),
-    # so _is_ws_pool keeps telling a pool core apart from a plain core (only the pool has SIGHUP/SIGUSR
-    # handlers). Single ws/http gets its own status_path below; ws-pool uses ws_status_path.
-    # dns belongs here too: it was the ONE client carrier the core wrote no status file for, so the
-    # health sweep below found no hb/dw and fell through to traffic-flow + ICMP. That reads a healthy
-    # but idle dns tunnel as half-open, and never reports a dead one as dead (instant-red needs a
-    # published dw). The core publishes both now; withholding the path here would keep it inert.
+    # Datagram (udp/raw/flux) and direct-stream (tcp, tcp+cover) transports have no ws edge pool, but the
+    # CLIENT still writes a self-heal event ring plus a liveness heartbeat (`hb`) to a status file we expose
+    # to the panel's log. This is `status_path`, NOT `ws_status_path`, so _is_ws_pool keeps telling a pool
+    # core apart from a plain one. dns belongs here too, or the health sweep has no hb/dw to judge by.
     if transport in ("udp", "tcp", "raw", "flux", "spoof", "dns") and str(cfg.get("role")) == "client":
         corecfg["status_path"] = _cfg_path(name, ".status")
-    # peer_src_ips (raw/flux SERVER): the client's source pool. These carriers receive via a raw/
-    # AF_PACKET socket that sees every host and pre-filter by the learned peer source, so a rotated
-    # client source is otherwise dropped pre-crypto and never re-learned (the tunnel dies on a source
-    # rotation until a rebuild). Handing the server the client's known sources lets a rotated-but-
-    # expected source reach crypto and re-bind. udp/tcp bind per-source and re-learn on their own.
+    # peer_src_ips (raw/flux SERVER): the client's source pool. These carriers receive on a socket that
+    # sees every host and pre-filter by the learned peer source, so a rotated client source is otherwise
+    # dropped pre-crypto and never re-learned — the tunnel dies on a source rotation until a rebuild.
+    # udp/tcp bind per-source and re-learn on their own.
     if transport in ("raw", "flux") and str(cfg.get("role")) == "server":
         _psrc = [str(x).strip() for x in (cfg.get("peer_src_ips") or []) if is_ipv4(str(x).strip())]
         if _psrc:
@@ -850,20 +824,17 @@ def _core_config(cfg):
             corecfg["ws_host"] = str(cfg["ws_host"])
         if cfg.get("ws_path"):
             corecfg["ws_path"] = str(cfg["ws_path"])
-        # the HTTP carrier: carry the stream over a GET(down)+POST(up) request pair instead
-        # of a WebSocket upgrade, so it passes a CDN/account that blocks WebSocket. Both
-        # roles need it (the server serves the endpoint, the client dials it); the same
-        # fronting fields (ws_host/ws_tls/ws_ech/ws_path) apply. Not combined with the pool.
-        # One field for the SHAPE this CDN-frontable carrier takes: ws | http | grpc. It replaced a
-        # boolean plus a mode string, which could describe states that do not exist.
+        # One field for the SHAPE this CDN-frontable carrier takes: ws | http | grpc. The http shape carries
+        # the stream over a GET(down)+POST(up) request pair instead of a WebSocket upgrade, so it passes a
+        # CDN or account that blocks WebSocket. Both roles need it — the server serves the endpoint, the
+        # client dials it — and the same fronting fields (ws_host/ws_tls/ws_ech/ws_path) apply.
         cdn = str(cfg.get("cdn_carrier") or "ws").strip().lower()
         if cdn in ("http", "grpc"):
             corecfg["cdn_carrier"] = cdn
-            # The CDN carrier shape: "http" (a POST ladder — many short POSTs, most
-            # CDN-compatible) or "grpc" (a single full-duplex request dressed as a real gRPC call so
-            # a CDN reaches the origin over h2c and streams instead of buffering; needs ws_tls).
-            # Forward for both roles; the core server auto-detects the client's style but the client
-            # must be told.
+            # The CDN carrier shape: "http" (a POST ladder — many short POSTs, the most CDN-compatible) or
+            # "grpc" (a single full-duplex request dressed as a real gRPC call, so a CDN reaches the origin
+            # over h2c and streams instead of buffering; needs ws_tls). Forwarded for both roles: the core
+            # server auto-detects the client's style, but the client must be told.
 
             # Upstream shape — the http-carrier CLIENT only. The server never POSTs, and the core
             # REJECTS these on a server or in grpc mode, so emitting them there would refuse to
@@ -959,12 +930,10 @@ def _core_config(cfg):
         corecfg["fake_count"] = max(1, min(64, int(cfg.get("fake_count") or 2)))
         mode = str(cfg.get("fake_mode") or "ttl").strip().lower()
         corecfg["fake_mode"] = mode if mode in ("ttl", "badsum", "both") else "ttl"
-    # Destination rotation pool (client, direct transports udp/tcp/raw/flux): cycle the foreign node's
-    # IPs and burn a blocked one. Build the pool with the primary remote_ip FIRST (so the pool's
-    # starting endpoint matches the single `peer` the core also dials), dedup, then format per
-    # transport: udp/tcp dial "ip:port" (every endpoint shares the tunnel's core port), raw/flux
-    # address a bare IP (the core ignores any port there). A pool of >=2 overrides the single peer;
-    # the core writes its live active/burned state to a dedicated file we expose via op_peer_status.
+    # Destination rotation pool (client, direct transports udp/tcp/raw/flux): cycle the foreign node's IPs
+    # and burn a blocked one. The primary remote_ip goes FIRST, so the pool's starting endpoint matches the
+    # single `peer` the core also dials; then dedup and format per transport — udp/tcp dial "ip:port",
+    # raw/flux address a bare IP. A pool of >=2 overrides the single peer.
     if transport in ("udp", "tcp", "raw", "flux") and str(cfg.get("role")) == "client":
         ordered = _ordered_pool(str(cfg.get("remote_ip") or ""), cfg.get("peer_ips"))
         if len(ordered) >= 2:
@@ -972,16 +941,10 @@ def _core_config(cfg):
             corecfg["peer_rotate_secs"] = max(0, int(cfg.get("peer_rotate_secs") or 0))
             corecfg["peer_auto_burn"] = bool(cfg.get("peer_auto_burn"))
             corecfg["peer_status_path"] = _cfg_path(name, ".peerpool")
-        # Source rotation pool (client): this node's OWN IPs to send FROM, cycled alongside peer_ips.
-        # Prepend local_ip so the pool's start matches the client's default source; bare IPv4 for every
-        # carrier (a source is never "ip:port"). A pool of >=2 activates source rotation in the core.
-        # The core gate is >=1, not >=2, and deliberately so: a LONE src_ip is a fixed source that
-        # supersedes bind_ip (which is TCP-family-only, so on udp/raw/flux nothing else can pin it).
-        # Emitting only at >=2 made that unreachable — the panel ships a 1-entry src_ips whenever the
-        # OTHER side is the one with >=2 selected, and the node dropped it, so the kernel picked the
-        # egress IP and the operator's chosen node address was silently not used. Gate on the operator
-        # having actually chosen sources, not on the pool length: a bare [local_ip] (what _ordered_pool
-        # returns when nothing was configured) is not a choice and still emits nothing.
+        # Source rotation pool (client): this node's OWN IPs to send FROM, cycled alongside peer_ips. local_ip
+        # goes first so the pool's start matches the client's default source; bare IPv4 for every carrier. The
+        # core gate is >=1, not >=2, and deliberately so: a LONE src_ip is a fixed source that supersedes
+        # bind_ip. Gate on the operator having actually chosen sources, not on the pool length.
         _src_sel = [str(x).strip() for x in (cfg.get("src_ips") or []) if str(x).strip()]
         sord = _ordered_pool(str(cfg.get("local_ip") or ""), _src_sel)
         if _src_sel and sord:
@@ -992,26 +955,15 @@ def _core_config(cfg):
             # sides (destination = .peerpool, source = .srcpool).
             corecfg["src_status_path"] = _cfg_path(name, ".srcpool")
     if cfg.get("role") == "server":
-        # Bind to THIS node's physical IP for the tunnel, not 0.0.0.0. With multiple IPs on the
-        # host this is required for the raw transport: a raw (portless) socket bound to 0.0.0.0
-        # replies from the primary IP, so a second tunnel on a secondary IP would send from the
-        # wrong source and the client (which filters by peer IP) drops every reply. Binding to the
-        # exact listen IP makes the reply source correct and also cleanly demuxes by destination IP.
+        # Bind to THIS node's physical IP for the tunnel, not 0.0.0.0. With several IPs on the host this is
+        # required for the raw transport: a raw, portless socket bound to 0.0.0.0 replies from the primary IP,
+        # so a second tunnel on a secondary IP would send from the wrong source and the client, which filters
+        # by peer IP, drops every reply. The exact listen IP also demuxes cleanly by destination.
         lip = cfg.get("local_ip") or "0.0.0.0"
-        # EXCEPTION — under a destination rotation pool the client dials THIS server across several of
-        # its selected IPs, so a single concrete bind makes the server DEAF to every other pool IP.
-        # udp/tcp: bind EACH one explicitly (the core opens one socket/listener per IP) instead of
-        # 0.0.0.0, for two reasons: (1) a UDP reply then egresses from the exact IP the client dialed
-        # — a single 0.0.0.0 socket would reply from the host's primary IP and the client, which filters
-        # by peer IP, would drop it; (2) the server accepts only on the pool IPs, not every host IP.
-        # listen stays the first IP as a friendly anchor; listen_ips drives the actual binds.
-        # raw: the core takes ONE listen address (main.go hands cfg.Listen to ListenRaw and ignores
-        # cfg.ListenIPs), and a bound AF_INET raw socket is demuxed by DESTINATION, so 0.0.0.0 is the
-        # only correct value — the core then answers from the exact IP the client dialed via IP_PKTINFO.
-        # Binding the anchor here silently killed destination rotation: only the anchor ever completed a
-        # handshake and every other pool IP burned. The reason a concrete bind once looked necessary
-        # (the reply egressing from the host's primary IP) is fixed in the core itself.
-        # flux is exempt either way: ListenFlux ignores its listen argument and receives via AF_PACKET.
+        # EXCEPTION — under a destination rotation pool the client dials THIS server across several of its
+        # selected IPs, so a single concrete bind makes the server DEAF to every other pool IP. udp/tcp bind
+        # EACH one explicitly (correct reply source, and accept only on pool IPs); raw must bind 0.0.0.0, since
+        # its socket is demuxed by DESTINATION, and answers from the dialed IP via IP_PKTINFO. flux is exempt.
         pool_ips = [str(x).strip() for x in (cfg.get("listen_ips") or []) if str(x).strip()]
         pooled = bool(cfg.get("pool_listen"))
         if transport == "dns":
@@ -1037,25 +989,16 @@ def _core_config(cfg):
             if sep and p.isdigit():
                 dial, dport = h, int(p)
             else:
-                # A bare edge address needs the EDGE's port, and `port` is not it: `port` is where the
-                # CDN connects to US (the origin listener, typically 80). The client is talking to the
-                # edge, which serves TLS on 443 and cleartext on 80. Inheriting the origin port meant a
-                # wss client sent its TLS ClientHello to a plain-HTTP :80 edge and the handshake died —
-                # so a CDN-fronted tunnel worked with wss OFF and broke the moment it was turned on,
-                # which reads as "the CDN doesn't support this" and is nothing of the sort.
+                # A bare edge address needs the EDGE's port, and `port` is not it: `port` is where the CDN
+                # connects to US (the origin listener, typically 80), while the client talks to the edge, which
+                # serves TLS on 443 and cleartext on 80. Inheriting the origin port sends a wss ClientHello to a
+                # plain-HTTP :80 edge, so the tunnel works with wss OFF and breaks the moment it is turned on.
                 dial, dport = edge, (443 if bool(cfg.get("ws_tls")) else 80)
         corecfg["peer"] = f"{dial}:{dport}"
-        # Pin the client's outbound source to THIS node's own IP (local_ip is validated to be a
-        # local address in op_tunnel). On a host with several IPs the kernel would otherwise egress
-        # from its primary IP; binding makes the peer/CDN see this node's registered IP.
-        #
-        # It used to say the core applies this only to the TCP-family carriers and ignores it
-        # otherwise. core #209 made that false: bind_ip is now turned into a ONE-ENTRY SOURCE POOL for
-        # every carrier that exposes SetSourcePool — udp, raw and flux included — and the core logs
-        # "binding outbound source IP to %s (pinned as a one-entry source pool)". So on raw/flux this
-        # key is exactly what pins the crafted header's source, and on the udp/tcp raw profiles an IP
-        # the host cannot send from is a silent blackout rather than a cosmetic mismatch. Anyone
-        # debugging "why does this raw tunnel leave from the wrong IP" reads this line first.
+        # Pin the client's outbound source to THIS node's own IP (local_ip is validated as local in
+        # op_tunnel). On a host with several IPs the kernel would otherwise egress from its primary. The
+        # core turns bind_ip into a ONE-ENTRY SOURCE POOL for every carrier that exposes SetSourcePool —
+        # udp, raw and flux included — so on raw/flux this key is what pins the crafted header's source.
         lip = str(cfg.get("local_ip") or "").strip()
         if lip:
             corecfg["bind_ip"] = lip
@@ -1615,12 +1558,10 @@ def health_of(cfg, thorough=False):
     # Real-state liveness: if authenticated tunnel traffic is actually arriving on the iface, the tunnel
     # is alive no matter whether ICMP is answered or filtered. Only meaningful once the iface exists.
     flow = _flow_alive(name) if up else None
-    # Core heartbeat: a client core writes its lastRx (hb, unix-seconds) + its RESOLVED dead-window (dw,
-    # seconds) into the status file every few seconds. A FRESH hb (age <= dw) proves the encrypted session
-    # is alive even with zero user traffic and filtered ICMP (idle-green); an aged-out hb, OR an unpaired
-    # real-death `down` event, is a positive DEATH signal (-> red). Using the core's own dw means the dot
-    # ages hb against the EXACT window the core self-heals on (no private multiplier); a rotation/pin `down`
-    # is NOT a death. hb 0/absent (server side / pre-handshake) -> fall through to flow + ICMP.
+    # Core heartbeat: a client core writes its lastRx (hb, unix-seconds) plus its RESOLVED dead-window (dw)
+    # into the status file every few seconds. A FRESH hb (age <= dw) proves the encrypted session is alive
+    # even with zero user traffic and filtered ICMP; an aged-out hb, or an unpaired real-death `down`, is a
+    # positive DEATH signal. hb 0 or absent (server side, pre-handshake) falls through to flow + ICMP.
     beat = None  # True = alive, False = confirmed dead, None = no heartbeat to judge by
     _hb = _dw = 0    # published heartbeat + resolved dead-window; kept in scope for the never-connected check below
     if up and ttype == "core":
@@ -1674,16 +1615,10 @@ def health_of(cfg, thorough=False):
         if mr:
             rtt = float(mr.group(1))
         ping = (loss < 100) if loss is not None else (rc3 == 0)
-    # alive = the real-state verdict the panel colours the dot from. `dead` = a POSITIVE death signal
-    # (frozen core heartbeat) so the panel paints it RED at once; an unconfirmed miss stays amber. None
-    # (no signal at all) leaves the dot amber — the panel has no probe of its own to fall back to.
-    # NEVER-CONNECTED = dead, not "unknown". The core publishes `dw` the moment it starts but only
-    # stamps `hb` once a genuine authenticated frame has arrived, so dw>0 with hb==0 means this client has
-    # never been answered even once. Together with no traffic and a FAILED probe that is a dead tunnel.
-    # Without this it could only ever go amber: `dead` was reachable solely through the heartbeat path, and a
-    # tunnel that never connects produces no heartbeat to age out — so a permanently-broken tunnel (e.g. a
-    # pooled ws/http client whose edge accepts TLS but never carries a frame) sat amber forever. Held for the
-    # core's own dead-window so a freshly (re)built tunnel can't flash red before its first frame lands.
+    # alive = the real-state verdict the panel colours the dot from. `dead` is a POSITIVE death signal so
+    # the panel paints it RED at once; an unconfirmed miss stays amber, and None leaves it amber too.
+    # NEVER-CONNECTED counts as dead, not unknown: the core publishes dw the moment it starts but stamps
+    # hb only once an authenticated frame arrives, so dw>0 with hb==0 means it was never answered.
     nohb_dead = False
     if up and ttype == "core" and _dw > 0 and _hb <= 0 and flow is not True and ping is False:
         with _nohb_lock:
@@ -1869,11 +1804,10 @@ def health_refresh_once(ex):
     _health_harvest(names)                       # whatever finished since the last round, including stragglers
     for nm in [n for n in _health_inflight if n not in names]:
         _health_inflight.pop(nm, None)           # tunnel deleted while its probe was running
-    # ONE probe per tunnel in flight, never two. A round used to submit a full fresh batch every 3s no
-    # matter what, so a sweep that overran the deadline stacked another N tasks onto the executor's
-    # unbounded queue behind its own stragglers — the pile-up the panel's poller has always guarded
-    # against with its `inflight` set. Worst case that is any mutating op: health_of takes _apply_lock,
-    # a core build holds it for 8-16s, so all 64 workers park and zero futures complete.
+    # ONE probe per tunnel in flight, never two. Submitting a full fresh batch every 3s regardless lets a
+    # sweep that overran the deadline stack another N tasks onto the executor's unbounded queue behind its
+    # own stragglers. Worst case is any mutating op: health_of takes _apply_lock, a core build holds it for
+    # seconds, so every worker parks and zero futures complete.
     for c in cfgs:
         if c["name"] not in _health_inflight:
             _health_inflight[c["name"]] = ex.submit(health_of, c)
@@ -1923,13 +1857,9 @@ _SELF_SHA = _self_sha()
 
 
 # ----------------------------------------------------------------------------- central check-in
-# The panel reaches us at host:port (from its registry). If our public IP changes, the panel can no
-# longer find us — so we phone home. We learn the panel's callback from its INCOMING requests (it
-# stamps X-Central-Port; the source IP is where it reached us from). Because our check-in POSTs the
-# node's bearer token, we must NOT hand that callback to just any authenticated caller: the source IP
-# is bound to the panel — pinned on first contact (persisted to node.conf) or set explicitly via
-# `central_allow` — so a stolen/shared token replayed from another host cannot redirect our token.
-# When our IP set changes we POST /api/checkin so the panel can fix our host and heal the tunnels.
+# The panel reaches us at host:port from its registry, so if our public IP changes we phone home. We
+# learn the panel's callback from its INCOMING requests — and because the check-in POSTs the node's
+# bearer token, that callback is pinned to one source IP (persisted, or set via `central_allow`).
 
 def _ip_in_allow(ip, allow):
     """True if ip matches any host/CIDR in `allow` (a str list or a comma/space-separated string)."""
@@ -2125,12 +2055,10 @@ def op_tunnel(d):
     if ttype == "core" and d.get("dead_after_secs") not in (None, ""):
         _da = int(d["dead_after_secs"])
         obj["dead_after_secs"] = 0 if _da <= 0 else max(10, min(300, _da))
-    # tuning (core, optional): the fleet-wide operational-timing overrides the panel stamps onto EVERY
-    # core body (_apply_core_tuning). This whitelist entry is load-bearing — _core_config reads
-    # cfg["tuning"] from the PERSISTED config, so while the key was missing here it was dropped on the
-    # way in and every Settings knob except keepalive/dead_after_secs (which ride top-level, just above)
-    # was a silent fleet-wide no-op. Sanitize with the same helper _core_config uses so a malformed
-    # field can never reach disk; {} means "nothing to override" and is not stored.
+    # tuning (core, optional): the fleet-wide operational-timing overrides the panel stamps onto EVERY core
+    # body. This whitelist entry is load-bearing — _core_config reads cfg["tuning"] from the PERSISTED
+    # config, so without it the key is dropped on the way in and every Settings knob but keepalive and
+    # dead_after_secs is a silent fleet-wide no-op. Sanitized with the same helper _core_config uses.
     if ttype == "core":
         _tn = _core_tuning(d.get("tuning"))
         if _tn:
@@ -2228,17 +2156,10 @@ def op_tunnel(d):
                     raise ValueError("bad cdn_carrier")
                 if _cdn != "ws":
                     obj["cdn_carrier"] = _cdn
-                # Upstream POST-ladder shape, chosen per CDN by the panel: workers x batch is the
-                # window, and the rate cap is a ceiling on POSTs/sec that a worker count cannot
-                # express (workers/RTT differs per path). The core clamps and validates; we only
-                # have to keep them, because a key that is not whitelisted here is dropped in
-                # SILENCE and the tunnel quietly rebuilds on the default Cloudflare shape — which
-                # on a WAF-protected CDN means the source IP gets blocked.
-                # The ceilings are the CORE's own (config.go validate()), not arbitrary numbers: the
-                # core REJECTS an out-of-range value rather than clamping it, so a wider bound here
-                # only moves the failure to a core that refuses to start, a TUN that never appears and
-                # a generic "the interface was not created". Every other combination the core rejects
-                # is pre-checked here for exactly that reason; these three were the gap.
+                # Upstream POST-ladder shape, chosen per CDN by the panel: workers x batch is the window, and
+                # the rate cap is a ceiling on POSTs/sec a worker count cannot express. A key not whitelisted
+                # here is dropped in SILENCE and the tunnel rebuilds on the default shape, which a WAF-protected
+                # CDN blocks. The ceilings are the CORE's own, because it REJECTS rather than clamps.
                 _up_max = {"http_up_workers": 16, "http_up_batch_kb": 512, "http_up_rate": 1000}
                 for _k in ("http_up_workers", "http_up_batch_kb", "http_up_rate"):
                     if _k in d:
@@ -2295,10 +2216,9 @@ def op_tunnel(d):
                     if len(pips) > 64 or len(psnis) > 64:
                         raise ValueError("ws edge pool too large")
                     # The core dials each edge as a literal ip:port with no DNS step (config.go
-                    # validatePoolEndpoint, needPort=true): the host MUST be an IPv4 and a port is
-                    # REQUIRED. Reject hostnames/IPv6 and default a port-less IPv4 to :443 so the
-                    # normalized ip:port we forward always loads (a domain or a bare IP passed here
-                    # but failed the core config load — panel/node/core now agree on IPv4:port).
+                    # validatePoolEndpoint, needPort=true): the host MUST be an IPv4 and a port is REQUIRED.
+                    # Reject hostnames and IPv6, and default a port-less IPv4 to :443, so the normalized ip:port
+                    # we forward always loads — panel, node and core agree on IPv4:port.
                     npips = []
                     for ip in pips:
                         h = ip.rpartition(":")[0] if ":" in ip else ip
@@ -2376,13 +2296,10 @@ def op_tunnel(d):
                 raise ValueError("fec_data/fec_parity out of range (>=1, sum<=255)")
             obj["fec_data"] = fd
             obj["fec_parity"] = fp
-        # Destination rotation pool (client, direct transports udp/tcp/raw/flux): the panel sends the
-        # foreign node's IPs to cycle through so a single blocked server IP doesn't kill the tunnel —
-        # the direct-transport analogue of the ws edge pool. Whitelisting these is mandatory (an
-        # un-whitelisted key is silently dropped and never reaches the core). Each must be a plain
-        # IPv4: the pool swaps the dial destination with no DNS step, and raw/flux are IPv4-only.
-        # Meaningless on ws (its own edge pool) or a server (it listens), so restrict to a direct
-        # client. Stored as bare IPs; _core_config appends the port for udp/tcp and leaves raw/flux bare.
+        # Destination rotation pool (client, direct transports udp/tcp/raw/flux): the panel sends the foreign
+        # node's IPs to cycle through, so a single blocked server IP does not kill the tunnel. Whitelisting is
+        # mandatory — an un-whitelisted key is silently dropped and never reaches the core. Each must be a
+        # plain IPv4: the pool swaps the destination with no DNS step, and raw/flux are IPv4-only.
         if transport in ("udp", "tcp", "raw", "flux") and role == "client":
             pips = _clean_pool("peer_ips")   # destination pool: the SERVER's IPs the client dials
             sips = _clean_pool("src_ips")     # source pool: this client node's OWN IPs to send FROM
@@ -2395,15 +2312,9 @@ def op_tunnel(d):
                 obj["peer_rotate_secs"] = max(0, min(86400, int(_prs))) if _prs is not None else 0
                 obj["peer_auto_burn"] = _as_bool(d.get("peer_auto_burn"))
         # pool_listen (server side): the client rotates the destination across THIS server's selected IPs.
-        # udp/tcp bind EACH of them explicitly (one socket/listener per IP) rather than 0.0.0.0 — see
-        # _core_config for why (correct UDP reply source + accept only on pool IPs). listen_ips carries
-        # that selected set as bare IPv4 (the port is appended in _core_config).
-        # raw needs the FLAG too (but not listen_ips, which the core ignores for raw): the core takes a
-        # single listen address for raw and a concrete bind makes its AF_INET socket deaf to every other
-        # pool IP, so _core_config must bind 0.0.0.0 instead. Dropping the flag here is what silently
-        # broke raw destination rotation — only the anchor IP ever connected and the rest burned.
-        # flux is exempt: ListenFlux ignores its listen argument and receives via AF_PACKET.
-        # Whitelisting is mandatory (an un-whitelisted key is dropped and never reaches core).
+        # udp/tcp bind EACH of them explicitly rather than 0.0.0.0 — see _core_config — and listen_ips carries
+        # that set as bare IPv4. raw needs the FLAG but not listen_ips, which the core ignores for raw: a
+        # concrete bind makes its socket deaf to every other pool IP, so _core_config binds 0.0.0.0 instead.
         if transport in ("udp", "tcp", "raw") and role == "server" and _as_bool(d.get("pool_listen")):
             obj["pool_listen"] = True
             if transport in ("udp", "tcp"):
@@ -2494,11 +2405,10 @@ def op_tunnel(d):
     write_config(name, obj)
 
     def _fail(msg):
-        # The new build failed. Tear it down, then ROLL BACK to the previously-working config
-        # instead of deleting the tunnel outright: a transient build/verify blip (e.g. a core
-        # cold-start slower than the TUN wait) must not permanently destroy a tunnel that was
-        # healthy before this edit. Only drop the file if there was no prior build to restore,
-        # or the restore itself also fails.
+        # The new build failed. Tear it down, then ROLL BACK to the previously-working config instead of
+        # deleting the tunnel outright: a transient build or verify blip — a core cold-start slower than
+        # the TUN wait, say — must not permanently destroy a tunnel that was healthy before this edit.
+        # Only drop the file if there was no prior build to restore, or the restore itself also fails.
         teardown_config(obj)
         if old and old.get("type") != "portfw" and NAME_RE.match(old.get("name", "")):
             write_config(name, old)
@@ -2507,14 +2417,10 @@ def op_tunnel(d):
                 apply_config(old)
             except Exception:
                 restored = False
-            # A disabled tunnel legitimately has no netdev, so its restore succeeds as long as
-            # apply_config didn't throw; only require the netdev to exist when it should be UP.
-            # A `core` tunnel's TUN appears ASYNCHRONOUSLY: build_core launches a Restart=always unit
-            # and only waits ~8s for the TUN, never raising if it's still absent. On a node whose core
-            # cold-starts slower than that wait, a synchronous netdev check here would read False and
-            # fall through to os.remove — DELETING the perfectly-good restored config while the unit
-            # (which will bring the TUN up shortly) keeps running orphaned. So for core, a successful
-            # apply_config IS the restore signal (same reasoning as the disabled-tunnel skip below).
+            # A disabled tunnel legitimately has no netdev, so its restore succeeds as long as apply_config
+            # did not throw; require the netdev only when it should be UP. A `core` tunnel's TUN appears
+            # ASYNCHRONOUSLY, so a synchronous netdev check here would read False on a slow cold start and
+            # delete the restored config. For core, a successful apply_config IS the restore signal.
             old_async_tun = old.get("type") == "core"
             if restored and (not old.get("enabled", True) or old_async_tun or run(["ip", "link", "show", name])[0] == 0):
                 return {"ok": False, "msg": msg, "restored": True}
@@ -2539,11 +2445,10 @@ def op_tunnel(d):
     # builds run `ip` via run() which never raises on failure, so verify the netdev really exists
     rc, _, _ = run(["ip", "link", "show", name])   # every type is a plain kernel netdev now
     if rc != 0:
-        # For a core tunnel the missing netdev has THREE very different causes and the message below
-        # only ever described one of them: the core is not installed, the core ran and REFUSED the
-        # config (it said why — quote it), or the core is running fine and its TUN has not appeared
-        # yet. The third has to be checked FIRST: a running core's newest journal line is its success
-        # line, and quoting that as «پیامِ خودش» reported the startup message as the failure reason.
+        # For a core tunnel a missing netdev has THREE very different causes: the core is not installed,
+        # the core ran and REFUSED the config (it said why — quote it), or the core is running fine and
+        # its TUN has not appeared yet. The third has to be checked FIRST, because a running core's
+        # newest journal line is its success line, and quoting that as «پیامِ خودش» blames startup.
         if ttype == "core":
             if _core_running(name):
                 return _fail("هستهٔ tnl-core در حال اجراست ولی اینترفیسِ «" + name + "» هنوز بالا نیامده — "
@@ -3215,17 +3120,9 @@ def op_spoof_probe(d):
 
 
 # --------------------------------------------------------------------------- spoof egress probe
-#
-# The core's --probe-spoof is a LOCAL capability check only (can the raw sockets be opened). It cannot
-# answer the question that actually decides whether the spoof carrier works: does the upstream network
-# FORWARD a forged source, and does a decoy destination ROUTE to the server? That is directional and
-# per-provider — measured 2026-07-28, a forged source is dropped by both our datacenters' anti-spoofing,
-# and a decoy only arrives when it routes to the receiving server. This probe measures it end to end:
-# one node forges packets carrying a nonce, the other listens off the wire (AF_PACKET, so it sees a
-# decoy-dst frame the kernel would otherwise drop) and reports which arrived. Root-only (raw sockets).
-#
-# Two roles, orchestrated by the panel: the RECEIVER starts a background capture (returns a token
-# immediately), the SENDER forges the packets, then the panel reads the verdict by token.
+# --probe-spoof is a LOCAL capability check only; it cannot say whether the upstream network FORWARDS a
+# forged source or a decoy destination ROUTES to the server. This probe measures that end to end: the
+# RECEIVER captures off the wire (AF_PACKET) and returns a token, the SENDER forges nonce packets.
 
 _EGRESS = {}                       # token -> {"done": bool, "saw": {...}, "observed": {...}}
 _EGRESS_LOCK = threading.Lock()
@@ -3492,11 +3389,10 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
-    # MAX_CONNS is enforced at the CONNECTION level (here), not per parsed request: ThreadingHTTPServer
-    # spawns a thread per accepted TCP connection BEFORE any header is read, so a slowloris dribbling
-    # headers used to tie up threads bounded only by the 30s socket timeout. We try-acquire _conn_sem the
-    # moment the connection is set up; if the cap is already reached we refuse instantly in handle()
-    # (no header read at all), so the thread exits immediately and can never be pinned by a slow client.
+    # MAX_CONNS is enforced at the CONNECTION level, not per parsed request: ThreadingHTTPServer spawns a
+    # thread per accepted TCP connection BEFORE any header is read, so a slowloris dribbling headers would
+    # tie up threads bounded only by the socket timeout. We try-acquire _conn_sem the moment the connection
+    # is set up and refuse instantly in handle(), so the thread exits and can never be pinned.
     def setup(self):
         BaseHTTPRequestHandler.setup(self)
         self._sem_held = _conn_sem.acquire(blocking=False)
