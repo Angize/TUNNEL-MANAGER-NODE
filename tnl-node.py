@@ -1056,6 +1056,30 @@ def _core_last_error(name, lines=40):
     return ""
 
 
+def _netdev_missing_reason(name, ttype):
+    """Why `name`'s data path is not up, in the operator's own words — "" when the netdev is there.
+
+    Every builder runs `ip` through run(), which never raises, so the netdev is the only proof a build
+    worked. For a core tunnel its absence has THREE different causes: the core is not installed, the
+    core ran and REFUSED the config (it said why — quote it), or the core is fine and its TUN has not
+    appeared yet. The third is checked FIRST, because a running core's newest journal line is its
+    SUCCESS line and quoting that as «پیامِ خودش» blames startup.
+    """
+    if run(["ip", "link", "show", name])[0] == 0:
+        return ""
+    if ttype == "core":
+        if _core_running(name):
+            return ("هستهٔ tnl-core در حال اجراست ولی اینترفیسِ «" + name + "» هنوز بالا نیامده — "
+                    "احتمالاً استارتِ کند؛ چند لحظه بعد دوباره امتحان کن")
+        why = _core_last_error(name)
+        if why:
+            return "هستهٔ tnl-core بالا نیامد — پیامِ خودش: " + why
+    need = {"vxlan": "vxlan", "gre": "ip_gre", "sit": "sit", "ipip": "ipip",
+            "l2tpv3": "l2tp_eth", "fou": "fou و ipip", "ipsec": "xfrm_interface",
+            "core": "هستهٔ tnl-core"}.get(ttype, ttype)
+    return f"اینترفیسِ {ttype} ساخته نشد — «{need}» روی این نود نصب/فعال نیست"
+
+
 def _core_running(name):
     """Is the core's unit actually up right now?
 
@@ -1203,17 +1227,25 @@ def _core_teardown(cfg):
 def _set_link_state(cfg, enabled):
     """Bring a tunnel's data path up or down WITHOUT tearing the config down. For a core tunnel the
     TUN is owned by the core process (and Restart=always would fight an `ip link down`), so we stop the
-    unit to disable and (re)build it to enable. Plain kernel tunnels just toggle the netdev's admin state."""
+    unit to disable and (re)build it to enable. Plain kernel tunnels just toggle the netdev's admin state.
+
+    Raises when the data path did NOT actually change, so the caller reports what happened instead of
+    the request it was handed."""
     name = cfg.get("name", "")
     if not NAME_RE.match(name):
-        return
+        raise ValueError("bad name")
     if cfg.get("type") == "core":
         if enabled:
             build_core(cfg)
+            why = _netdev_missing_reason(name, "core")
+            if why:
+                raise RuntimeError(why)
         else:
             _core_stop(name)   # stop the unit + clear stale pool status/pin files, but keep the config
+            if _core_running(name):
+                raise RuntimeError("واحدِ هستهٔ «" + name + "» با وجودِ stop هنوز در حال اجراست")
     else:
-        run(["ip", "link", "set", name, "up" if enabled else "down"])
+        must(["ip", "link", "set", name, "up" if enabled else "down"])
 
 
 def _pf_match(cfg, iface, proto, lp):
@@ -2443,23 +2475,9 @@ def op_tunnel(d):
     if not obj.get("enabled", True):
         return {"ok": True, "name": name, "tunnel_ip": tunnel_ip}
     # builds run `ip` via run() which never raises on failure, so verify the netdev really exists
-    rc, _, _ = run(["ip", "link", "show", name])   # every type is a plain kernel netdev now
-    if rc != 0:
-        # For a core tunnel a missing netdev has THREE very different causes: the core is not installed,
-        # the core ran and REFUSED the config (it said why — quote it), or the core is running fine and
-        # its TUN has not appeared yet. The third has to be checked FIRST, because a running core's
-        # newest journal line is its success line, and quoting that as «پیامِ خودش» blames startup.
-        if ttype == "core":
-            if _core_running(name):
-                return _fail("هستهٔ tnl-core در حال اجراست ولی اینترفیسِ «" + name + "» هنوز بالا نیامده — "
-                             "احتمالاً استارتِ کند؛ چند لحظه بعد دوباره امتحان کن")
-            why = _core_last_error(name)
-            if why:
-                return _fail("هستهٔ tnl-core بالا نیامد — پیامِ خودش: " + why)
-        need = {"vxlan": "vxlan", "gre": "ip_gre", "sit": "sit", "ipip": "ipip",
-                "l2tpv3": "l2tp_eth", "fou": "fou و ipip", "ipsec": "xfrm_interface",
-                "core": "هستهٔ tnl-core"}[ttype]
-        return _fail(f"اینترفیسِ {ttype} ساخته نشد — «{need}» روی این نود نصب/فعال نیست")
+    why = _netdev_missing_reason(name, ttype)
+    if why:
+        return _fail(why)
     return {"ok": True, "name": name, "tunnel_ip": tunnel_ip}
 
 
@@ -2605,8 +2623,13 @@ def op_link_enable(d):
     if not cfg or cfg.get("type") == "portfw":
         return {"ok": True, "already": True}   # nothing to toggle (idempotent)
     cfg["enabled"] = enabled
+    # Move the data path FIRST and persist only what really happened: a stored `enabled` the interface
+    # does not match is the same lie in a different place, and the panel would keep showing it.
+    try:
+        _set_link_state(cfg, enabled)
+    except Exception as e:
+        return {"ok": False, "msg": str(e)}
     write_config(name, cfg)
-    _set_link_state(cfg, enabled)
     return {"ok": True, "enabled": enabled}
 
 
