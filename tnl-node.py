@@ -1612,6 +1612,7 @@ def health_of(cfg, thorough=False):
     # positive DEATH signal. hb 0 or absent (server side, pre-handshake) falls through to rx + ICMP.
     beat = None  # True = alive, False = confirmed dead, None = no heartbeat to judge by
     _hb = _dw = 0    # published heartbeat + resolved dead-window; kept in scope for the never-connected check below
+    _rt = _rtms = 0  # last ANSWERED keepalive + what that round trip took, straight from the core
     if up and ttype == "core":
         _evs = []
         try:
@@ -1619,6 +1620,7 @@ def health_of(cfg, thorough=False):
                 _doc = json.load(f)
             if isinstance(_doc, dict):
                 _hb, _dw, _evs = int(_doc.get("hb") or 0), int(_doc.get("dw") or 0), (_doc.get("events") or [])
+                _rt, _rtms = int(_doc.get("rt") or 0), int(_doc.get("rtt_ms") or 0)
         except (OSError, ValueError, TypeError):
             pass
         if _hb > 0:
@@ -1694,8 +1696,15 @@ def health_of(cfg, thorough=False):
         dead = nohb_dead
     else:
         alive, src = None, None
+    # round_trip is the core's ANSWERED keepalive: our ping reached the peer AND its reply reached us, the
+    # one thing a single end can observe about BOTH directions. True or None, never False — the TCP family
+    # skips the ping when data just arrived, so a stale rt means "no news", not "broken".
+    round_trip = None
+    if _rt > 0 and _dw > 0 and (time.time() - _rt) <= _dw:
+        round_trip = True
     return {"up": up, "alive": alive, "live_src": src, "dead": dead, "rtt_ms": rtt, "loss_pct": loss,
-            "rx_live": rx_live, "tx_live": tx_live}
+            "rx_live": rx_live, "tx_live": tx_live,
+            "round_trip": round_trip, "carrier_rtt_ms": (_rtms or None)}
 
 
 def _cpu_snap():
