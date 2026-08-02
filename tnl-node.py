@@ -1502,7 +1502,6 @@ def peer_of(tunnel_ip, ttype):
 
 # --- directional liveness: bytes moving on the tunnel iface, counted per direction, whatever ICMP does ---
 LIVE_WINDOW = 12.0   # s: a direction counts as live only if its byte counter advanced within this window (short, so a busy tunnel that dies stops looking live quickly)
-DROP_WINDOW = 300.0  # s: how far back `drops` counts lost sessions. A dot only answers "up right now", which a tunnel reconnecting every 10s answers yes to every time it is asked.
 _flow_lock = threading.Lock()
 _flow_state = {}     # iface name -> {"rx","tx": int, "rxp","txp": float|None} (last sample + monotonic time each direction last advanced)
 # --- never-connected detection: the core publishes `dw` from startup but only stamps `hb` once it has
@@ -1613,7 +1612,6 @@ def health_of(cfg, thorough=False):
     # positive DEATH signal. hb 0 or absent (server side, pre-handshake) falls through to rx + ICMP.
     beat = None  # True = alive, False = confirmed dead, None = no heartbeat to judge by
     _hb = _dw = 0    # published heartbeat + resolved dead-window; kept in scope for the never-connected check below
-    drops = 0        # sessions LOST inside DROP_WINDOW — the count the up/down dot cannot express
     if up and ttype == "core":
         _evs = []
         try:
@@ -1626,7 +1624,6 @@ def health_of(cfg, thorough=False):
         if _hb > 0:
             _rot = ("src-rotate", "peer-rotate")  # `down`s where the session SURVIVES
             _dn = _up_seq = -1
-            _cut = time.time() - DROP_WINDOW      # the core stamps ts on THIS host's clock
             if isinstance(_evs, list):
                 for _e in _evs:
                     if not isinstance(_e, dict):
@@ -1638,11 +1635,6 @@ def health_of(cfg, thorough=False):
                     _k = str(_e.get("kind"))
                     if _k == "down" and str(_e.get("code")) not in _rot:
                         _dn = max(_dn, _sq)
-                        try:
-                            if int(_e.get("ts") or 0) >= _cut:
-                                drops += 1
-                        except (ValueError, TypeError):
-                            pass
                     elif _k == "up":
                         _up_seq = max(_up_seq, _sq)
             _age = time.time() - _hb
@@ -1703,7 +1695,6 @@ def health_of(cfg, thorough=False):
     else:
         alive, src = None, None
     return {"up": up, "alive": alive, "live_src": src, "dead": dead, "rtt_ms": rtt, "loss_pct": loss,
-            "drops": drops, "drop_win": int(DROP_WINDOW),
             "rx_live": rx_live, "tx_live": tx_live}
 
 
