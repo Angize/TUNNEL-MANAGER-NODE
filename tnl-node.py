@@ -287,13 +287,20 @@ def primary_ip():
 def base_mtu(dev=None):
     """MTU of the underlay a tunnel egresses on. Pass the tunnel's own `iface` to sample THAT link
     (PPPoE 1492 / IPv6-min 1280 uplinks differ from the default route); no arg falls back to the
-    default-route iface as before."""
+    default-route iface.
+
+    A NAMED dev that cannot be read RAISES. Falling back to 1500 there hands the tunnel an MTU its
+    underlay cannot carry, and nothing downstream can tell that apart from a genuine 1500 link. With
+    no dev asked for there is nothing better than 1500, so that fallback stays."""
+    asked = dev
     dev = dev or default_iface()
     if dev and IFACE_RE.match(dev):
         rc, out, _ = run(["ip", "link", "show", dev])
-        m = re.search(r"\bmtu (\d+)", out)
+        m = re.search(r"\bmtu (\d+)", out) if rc == 0 else None
         if m:
             return int(m.group(1))
+    if asked:
+        raise RuntimeError("MTUِ اینترفیسِ «" + str(asked) + "» خوانده نشد — تونل از همین لینک خارج می‌شود")
     return 1500
 
 # ----------------------------------------------------------------------------- build / teardown
@@ -454,7 +461,7 @@ def _up_netdev(name, cfg, overhead, v6=False):
     addr = ["ip", "-6", "addr", "add", cfg["tunnel_ip"], "dev", name] if v6 else ["ip", "addr", "add", cfg["tunnel_ip"], "dev", name]
     must(addr)
     must(["ip", "link", "set", name, "up"])
-    run(["ip", "link", "set", "dev", name, "mtu", str(base_mtu(cfg.get("iface")) - overhead)])
+    must(["ip", "link", "set", "dev", name, "mtu", str(base_mtu(cfg.get("iface")) - overhead)])
 
 
 def build_vxlan(cfg):
