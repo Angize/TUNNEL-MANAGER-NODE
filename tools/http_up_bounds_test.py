@@ -2,18 +2,17 @@
 """Guard: the node's bounds for the http_up_* upstream knobs must be the CORE's bounds.
 
 The core does not clamp these three — config.go's validate() REJECTS an out-of-range value, and a
-rejected config means the core exits, its TUN never appears, and the operator is told the interface
-was not created. So a bound here that is wider than the core's does not "allow more", it converts a
-value the panel could send into a tunnel that never comes up. The node pre-checks every other
-combination the core rejects for precisely this reason; http_up_* was the gap (it bounded all three
-at 100000 while the core caps them at 16 / 512 / 1000).
+rejected config means the core exits, its TUN never appears, and the operator is told the interface was
+not created. So a bound here that is wider than the core's does not "allow more", it converts a value
+the panel could send into a tunnel that never comes up. The node pre-checks every other combination the
+core rejects for precisely this reason.
 
 Two halves, and the second is the one that closes the class:
 
   1. Drive the REAL op_tunnel — not the whitelist loop beside it — and assert an over-range value is
      refused before anything is built, and an at-limit value survives into the persisted config.
-  2. Read the ceilings straight out of the core's config.go and assert the node agrees. If someone
-     changes a bound on either side, this fails instead of drifting silently.
+  2. Read the ceilings straight out of the core's config.go and assert the node agrees, so a bound
+     changed on either side fails here instead of drifting silently.
 
 Run with no arguments. Exit 0 = the two sides agree.
 """
@@ -78,8 +77,8 @@ def base_req(name="cor1"):
 def drive(mod, req, tmpdir):
     """Run the REAL op_tunnel far enough to validate and build the persisted object.
 
-    Only the four host-dependent lookups op_tunnel makes before the whitelist are stubbed, plus
-    apply_config, which is where the real build would begin. Returns (obj_or_None, error_or_None).
+    Only the host-dependent lookups op_tunnel makes before the whitelist are stubbed, plus
+    apply_config, where the real build would begin. Returns (obj_or_None, error_or_None).
     """
     captured = {}
 

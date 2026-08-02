@@ -1,27 +1,23 @@
 #!/usr/bin/env python3
 """Guard: a POOLED raw server must be handed 0.0.0.0, and the core must still take only one.
 
-A raw carrier has no ports. The only thing the kernel can use to tell two raw sockets apart is the
-DESTINATION IP, so `listenRawBase` binding a concrete address means the socket receives packets
-addressed to that address and to nothing else. Under a destination-rotation pool the client dials
-several of this server's IPs in turn, so a concrete bind makes the server deaf on every pool IP but
-the one it bound: only the anchor ever completes a handshake and the pool burns the rest, one at a
-time, with nothing logged anywhere. This has already happened once in this project.
+A raw carrier has no ports, so the only thing the kernel can use to tell two raw sockets apart is the
+DESTINATION IP: `listenRawBase` binding a concrete address receives packets addressed to that address
+and to nothing else. Under a destination-rotation pool the client dials several of this server's IPs in
+turn, so a concrete bind makes the server deaf on every pool IP but the one it bound — only the anchor
+ever completes a handshake, and the pool burns the rest with nothing logged anywhere.
 
-The core has no guard for it (CLAUDE.md invariant "a pooled raw/flux server assumes 0.0.0.0"), and
-it cannot easily have one — from inside `ListenRaw` a concrete bind is indistinguishable from a
-deliberate single-IP server. So the invariant is held on this side, where the value is chosen, and
-this is what stops it drifting back.
+The core cannot easily guard it: from inside `ListenRaw` a concrete bind is indistinguishable from a
+deliberate single-IP server. So the invariant is held on this side, where the value is chosen.
 
 Two halves:
 
-  1. Drive the REAL `_core_config` for a pooled raw server and assert it emits `0.0.0.0:<port>` —
-     and that a NON-pooled raw server still binds its own address, so the guard cannot be satisfied
-     by making everything a wildcard.
-  2. Read the core's `main.go` and assert `ListenRaw` still takes ONE listen address. The whole
-     reason the node sends a wildcard is that the core cannot bind a list for raw the way it does
-     for udp/tcp. If that ever changes, this fails — which is the moment to revisit both sides,
-     rather than leaving a wildcard bind nobody remembers the reason for.
+  1. Drive the REAL `_core_config` for a pooled raw server and assert it emits `0.0.0.0:<port>` — and
+     that a NON-pooled raw server still binds its own address, so the guard cannot be satisfied by
+     making everything a wildcard.
+  2. Read the core's `main.go` and assert `ListenRaw` still takes ONE listen address. The reason the
+     node sends a wildcard is that the core cannot bind a list for raw the way it does for udp/tcp; if
+     that changes, this fails, which is the moment to revisit both sides.
 
 Run with no arguments. Exit 0 = the two sides agree.
 """

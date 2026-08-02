@@ -6,13 +6,12 @@ the core REJECTS makes it exit at once, so the TUN never appears and op_tunnel's
 and the agent reported «هستهٔ tnl-core روی این نود نصب/فعال نیست», which is false, and most
 misleading in the one case where the real reason was one line away in the unit's journal.
 
-config.go has ~68 distinct rejections. Findings #41 and #42 each asked for a node-side twin of one of
-them (obfs+dns, fake_desync+http-carrier). Two guards would have covered two rejections and left 66,
-and the core can add more at any time. Quoting the core covers all of them, including future ones.
+config.go has dozens of distinct rejections and can add more at any time, so a node-side twin per rule
+does not scale — quoting the core covers all of them, including future ones.
 
 The tests drive the REAL op_tunnel through the REAL failure tail, with `run` stubbed at the process
-boundary — the only thing that cannot exist on a dev box — so the netdev check, the branch, the
-journal read, the parse and the returned message are all the shipping code.
+boundary, so the netdev check, the branch, the journal read, the parse and the returned message are all
+shipping code.
 
 Run with no arguments. Exit 0 = the core's reason reaches the operator.
 """
@@ -65,9 +64,8 @@ def drive(mod, tmpdir, journal, journal_rc=0, netdev_rc=1, is_active="inactive",
     """Run the REAL op_tunnel to the netdev-verify tail and return its result dict.
 
     `run` is stubbed at the process boundary: `ip link show` reports the TUN missing (what a rejected
-    config looks like), `systemctl` answers whether the unit is up and which invocation it is on, and
-    `journalctl` returns whatever the case under test wants. Everything else the build would shell
-    out to succeeds silently.
+    config looks like), `systemctl` answers whether the unit is up and on which invocation, and
+    `journalctl` returns whatever the case wants. Everything else succeeds silently.
     """
     calls = []
 
