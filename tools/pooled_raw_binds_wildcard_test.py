@@ -50,6 +50,11 @@ def load_node():
     mod = importlib.util.module_from_spec(spec)
     sys.modules["tnl_node"] = mod
     spec.loader.exec_module(mod)
+    # _core_config samples the uplink MTU. Answer it here rather than letting the guard shell out to
+    # the host it happens to run on — an unreadable uplink is a build error, not this guard's subject.
+    mod.run = lambda args, timeout=60: (
+        (0, "2: eth0: <BROADCAST,UP> mtu 1500 qdisc fq state UP\n", "")
+        if args[:3] == ["ip", "link", "show"] else (0, "", ""))
     return mod
 
 
