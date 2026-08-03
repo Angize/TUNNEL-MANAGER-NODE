@@ -1504,16 +1504,52 @@ def peer_of(tunnel_ip, ttype):
     return f"{base}.2" if last == "1" else f"{base}.1"
 
 
+# --- the liveness verdict: one TCP handshake sent THROUGH the tunnel ---------------------------------
+PROBE_PORT = 9         # discard. Nothing listens, so the far KERNEL answers with RST and no agent need be up
+PROBE_WAIT = 2.0       # s per attempt
+_SO_BINDTODEVICE = getattr(socket, "SO_BINDTODEVICE", 25)   # absent off Linux, where the guards run
+
+
+def tun_probe(iface, tunnel_ip, ttype, tries=2):
+    """Send a TCP SYN from the tunnel device to the peer's tunnel address and report whether ANYTHING
+    came back. A RST proves as much as a completed handshake: both are a packet the far side put on the
+    wire in reply, so both mean the tunnel carried traffic in each direction just now. Only silence is a
+    negative verdict. Answering needs no process at the far end, which matters because the agent restarts
+    on every update and a healthy tunnel must not go red for those seconds.
+
+    Returns (alive, rtt_ms). alive is None only when the socket could not be set up at all."""
+    self_ip = tunnel_ip.split("/")[0]
+    peer = peer_of(tunnel_ip, ttype)
+    fam = socket.AF_INET6 if ttype == "sit" else socket.AF_INET
+    last = None
+    for _ in range(max(1, tries)):
+        s = socket.socket(fam, socket.SOCK_STREAM)
+        t0 = time.monotonic()
+        try:
+            s.settimeout(PROBE_WAIT)
+            # Pin to the device AND to the tunnel address. Routing alone would usually pick this tunnel,
+            # but "usually" is not a measurement: a probe free to leave by another path can report a
+            # tunnel alive that is carrying nothing.
+            s.setsockopt(socket.SOL_SOCKET, _SO_BINDTODEVICE, iface.encode() + b"\x00")
+            s.bind((self_ip, 0))
+            s.connect((peer, PROBE_PORT))
+            return True, round((time.monotonic() - t0) * 1000, 1)
+        except ConnectionRefusedError:
+            return True, round((time.monotonic() - t0) * 1000, 1)
+        except (socket.timeout, TimeoutError):
+            last = False        # nothing came back: retry, since one lost SYN is not a dead tunnel
+        except OSError:
+            last = None         # device gone mid-sweep, or the address is not ours (yet)
+            break
+        finally:
+            s.close()
+    return last, None
+
+
 # --- directional liveness: bytes moving on the tunnel iface, counted per direction, whatever ICMP does ---
 LIVE_WINDOW = 12.0   # s: a direction counts as live only if its byte counter advanced within this window (short, so a busy tunnel that dies stops looking live quickly)
 _flow_lock = threading.Lock()
 _flow_state = {}     # iface name -> {"rx","tx": int, "rxp","txp": float|None} (last sample + monotonic time each direction last advanced)
-# --- never-connected detection: the core publishes `dw` from startup but only stamps `hb` once it has
-# actually received an authenticated frame, so dw>0 with hb==0 means this client has NEVER been answered.
-_nohb_lock = threading.Lock()
-_nohb_state = {}     # iface name -> monotonic time we first saw "modern core running, still no inbound frame"
-
-
 def _iface_ctr(name, which):
     """Total rx_bytes/tx_bytes on <name> from the kernel, or None if the counter can't be read."""
     try:
@@ -1531,9 +1567,6 @@ def _prune_iface_state(names):
     with _flow_lock:
         for nm in [n for n in _flow_state if n not in names]:
             _flow_state.pop(nm, None)
-    with _nohb_lock:
-        for nm in [n for n in _nohb_state if n not in names]:
-            _nohb_state.pop(nm, None)
 
 
 def _flow_sample(name):
@@ -1610,117 +1643,16 @@ def health_of(cfg, thorough=False):
         # so on a hub the health sweep alone owned that lock a large fraction of the time and every
         # rebuild queued behind it. _flow_sample four lines down already reads this same directory.
         up = os.path.exists("/sys/class/net/" + name)   # mid-teardown gap as a transient false 'down'
-    # Real-state liveness: if authenticated tunnel traffic is actually arriving on the iface, the tunnel
-    # is alive no matter whether ICMP is answered or filtered. Only meaningful once the iface exists.
-    rx_still, tx_still = _flow_sample(name) if up else (None, None)
-    rx_live = rx_still is not None and rx_still <= LIVE_WINDOW   # "arriving right now", the short question
-    # Core heartbeat: a client core writes its lastRx (hb, unix-seconds) plus its RESOLVED dead-window (dw)
-    # into the status file every few seconds. A FRESH hb (age <= dw) proves the encrypted session is alive
-    # even with zero user traffic and filtered ICMP; an aged-out hb, or an unpaired real-death `down`, is a
-    # positive DEATH signal. hb 0 or absent (server side, pre-handshake) falls through to rx + ICMP.
-    beat = None  # True = alive, False = confirmed dead, None = no heartbeat to judge by
-    _hb = _dw = 0    # published heartbeat + resolved dead-window; kept in scope for the never-connected check below
-    _rt = _rtms = 0  # last ANSWERED keepalive + what that round trip took, straight from the core
-    _role = ""       # which end wrote the status file; a server WAITING for its first client is not dead
-    if up and ttype == "core":
-        _evs = []
-        try:
-            with open(_cfg_path(name, ".status")) as f:
-                _doc = json.load(f)
-            if isinstance(_doc, dict):
-                _hb, _dw, _evs = int(_doc.get("hb") or 0), int(_doc.get("dw") or 0), (_doc.get("events") or [])
-                _rt, _rtms = int(_doc.get("rt") or 0), int(_doc.get("rtt_ms") or 0)
-                _role = str(_doc.get("role") or "")
-        except (OSError, ValueError, TypeError):
-            pass
-        if _hb > 0:
-            _rot = ("src-rotate", "peer-rotate")  # `down`s where the session SURVIVES
-            _dn = _up_seq = -1
-            if isinstance(_evs, list):
-                for _e in _evs:
-                    if not isinstance(_e, dict):
-                        continue
-                    try:
-                        _sq = int(_e.get("seq") or 0)
-                    except (ValueError, TypeError):
-                        continue
-                    _k = str(_e.get("kind"))
-                    if _k == "down" and str(_e.get("code")) not in _rot:
-                        _dn = max(_dn, _sq)
-                    elif _k == "up":
-                        _up_seq = max(_up_seq, _sq)
-            _age = time.time() - _hb
-            if _dn > _up_seq:                          # core fired a real-death down not yet recovered -> dead NOW (fast, esp. stream eof)
-                beat = False
-            elif _dw > 0:
-                beat = _age <= _dw                     # core-authoritative window: unifies the multiplier, honours the operator's tuning
-            # no dw published -> leave beat None and fall through to rx + ICMP (the core always
-            # publishes dw, so this is a malformed-status guard, not a version fallback)
-    ping = rtt = loss = None
+    # ONE verdict for every tunnel, core and system alike: send a TCP SYN out of the tunnel device itself
+    # and see whether anything comes back. That single exchange is the whole question — a packet crossed
+    # in each direction, just now, through this tunnel and no other path.
+    rx_still, tx_still = _flow_sample(name) if up else (None, None)   # throughput for the card; casts no vote
+    alive, rtt = None, None
     tip = cfg.get("tunnel_ip", "")
-    # Probe with ICMP only when it can add something: the on-demand (thorough) check ALWAYS pings; the
-    # passive sweep pings only when NEITHER the core heartbeat NOR arriving traffic has already settled the
-    # verdict — so a filtered ICMP can't paint a busy/idle-but-live tunnel half-open, while a tunnel with
-    # no heartbeat and no arriving traffic still gets a real reachability probe.
-    if up and tip and tip != "N/A" and (thorough or (beat is None and not rx_live)):
-        peer = peer_of(tip, ttype)
-        cnt, wait = ("4", "2") if thorough else ("1", "2")  # on-demand pings harder; passive stays a single cheap packet (2s wait) so an idle-ICMP-heavy fleet doesn't pile up
-        cmd = (["ping", "-6", "-c", cnt, "-W", wait, peer] if ttype == "sit"
-               else ["ping", "-c", cnt, "-W", wait, peer])
-        rc3, out3, _ = run(cmd, timeout=14)
-        ml = re.search(r"(\d+(?:\.\d+)?)% packet loss", out3)
-        if ml:
-            loss = float(ml.group(1))
-        mr = re.search(r"=\s*[\d.]+/([\d.]+)/", out3)  # rtt min/avg/max/mdev = a/b/c/d ms -> avg
-        if mr:
-            rtt = float(mr.group(1))
-        ping = (loss < 100) if loss is not None else (rc3 == 0)
-    # alive = the real-state verdict the panel colours the dot from. `dead` is a POSITIVE death signal so
-    # the panel paints it RED at once; an unconfirmed miss stays amber, and None leaves it amber too.
-    # NEVER-CONNECTED counts as dead, not unknown: the core publishes dw the moment it starts but stamps
-    # hb only once an authenticated frame arrives, so dw>0 with hb==0 means it was never answered.
-    nohb_dead = False
-    # A SERVER with hb==0 has simply never been reached yet — it does not dial, so there is nothing for it
-    # to be failing at. Only a client that published a dead-window and was never answered is dead.
-    if up and ttype == "core" and _role != "server" and _dw > 0 and _hb <= 0 and not rx_live and ping is False:
-        with _nohb_lock:
-            _t0 = _nohb_state.get(name)
-            if _t0 is None:
-                _t0 = _nohb_state[name] = time.monotonic()
-        nohb_dead = (time.monotonic() - _t0) >= max(_dw, 20)
-    else:
-        with _nohb_lock:
-            _nohb_state.pop(name, None)   # condition no longer holds -> restart the grace next time
-    # alive answers ONE question: does the peer's traffic reach us. The heartbeat and rx are two views of
-    # that same fact, so neither outranks the other; tx is deliberately absent, because nothing measurable
-    # HERE can say whether what we send arrives -- only the far end knows, and the panel pairs the two.
-    dead = False
-    if beat is False:
-        alive, src, dead = False, "beat", True     # the core reported a real death: no probe can outvote it
-    elif beat is True:
-        alive, src = True, "beat"
-    elif rx_live:
-        alive, src = True, "rx"
-    elif ping is True:
-        alive, src = True, "ping"
-    elif ping is False:
-        alive, src = False, ("nohb" if nohb_dead else "ping")
-        dead = nohb_dead
-    else:
-        alive, src = None, None
-    # round_trip is the core's ANSWERED keepalive: our ping reached the peer AND its reply reached us, the
-    # one thing a single end can observe about BOTH directions. True or None, never False — the TCP family
-    # skips the ping when data just arrived, so a stale rt means "no news", not "broken".
-    round_trip = None
-    if _rt > 0 and _dw > 0 and (time.time() - _rt) <= _dw:
-        round_trip = True
-    # The two windows go out with the numbers so the reader applies OUR thresholds, not its own guess at
-    # them, and so a direction can be called broken only on the tunnel's own dead-window — never on a
-    # quiet patch. dead_win is 0 for a tunnel with no core, which simply means no negative verdict.
-    return {"up": up, "alive": alive, "live_src": src, "dead": dead, "rtt_ms": rtt, "loss_pct": loss,
-            "rx_still": rx_still, "tx_still": tx_still,
-            "live_win": int(LIVE_WINDOW), "dead_win": _dw,
-            "round_trip": round_trip, "carrier_rtt_ms": (_rtms or None)}
+    if up and tip and tip != "N/A":
+        alive, rtt = tun_probe(name, tip, ttype, tries=(3 if thorough else 2))
+    return {"up": up, "alive": alive, "dead": alive is False, "rtt_ms": rtt,
+            "rx_still": rx_still, "tx_still": tx_still, "live_win": int(LIVE_WINDOW)}
 
 
 def _cpu_snap():
