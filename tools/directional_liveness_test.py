@@ -7,7 +7,9 @@ handshake went unanswered, and silence must not condemn one whose handshake came
 """
 import sys
 sys.dont_write_bytecode = True
+import errno
 import importlib.util
+import select
 import socket
 import time
 from pathlib import Path
@@ -34,32 +36,38 @@ def main():
     calls = {}
 
     class FakeSock:
+        """A non-blocking connect: connect_ex reports pending and readiness is decided by the patched
+        select below, which is where the kernel decides it too."""
         def __init__(self, outcome):
             self.outcome = outcome
-        def settimeout(self, *_): pass
+        def setblocking(self, *_): pass
         def setsockopt(self, _lvl, opt, val):
             calls.setdefault("bound", []).append((opt, val))
         def bind(self, addr):
             calls["src"] = addr[0]
-        def connect(self, addr):
+        def connect_ex(self, addr):
             calls["dst"] = addr
-            if self.outcome == "refused":
-                raise ConnectionRefusedError()
-            if self.outcome == "timeout":
-                raise socket.timeout()
+            return errno.EINPROGRESS
+        def getsockopt(self, _lvl, _opt):
+            return {"ok": 0, "refused": errno.ECONNREFUSED}.get(self.outcome, errno.ETIMEDOUT)
+        def fileno(self): return -1
         def close(self): pass
 
-    def with_outcome(outcome, tries=None):
+    def ready_unless_timeout(_r, w, _x, _t):
+        return ([], [s for s in w if getattr(s, "outcome", "") != "timeout"], [])
+
+    def with_outcome(outcome, count=None, selector=ready_unless_timeout):
         calls.clear()
-        real = socket.socket
+        real_sock, real_sel = socket.socket, select.select
         socket.socket = lambda *a, **k: FakeSock(outcome)
+        select.select = selector
         try:
-            return m.tun_probe("core44", "192.168.44.2/24", "core", tries=tries or m.PROBE_TRIES)
+            return m.tun_probe("core44", "192.168.44.2/24", "core", count=count or m.PROBE_COUNT)
         finally:
-            socket.socket = real
+            socket.socket, select.select = real_sock, real_sel
 
     hits, sent, rtt = with_outcome("ok")
-    want((hits, sent) == (m.PROBE_TRIES, m.PROBE_TRIES), f"every attempt answered, got {hits}/{sent}")
+    want((hits, sent) == (m.PROBE_COUNT, m.PROBE_COUNT), f"every sample answered, got {hits}/{sent}")
     want(rtt is not None, "and it must carry the round trip it measured")
     want(calls.get("dst") == ("192.168.44.1", m.PROBE_PORT),
          f"the probe must target the PEER tunnel address, got {calls.get('dst')}")
@@ -70,49 +78,43 @@ def main():
          "leave by another path can call a tunnel alive that carries nothing")
 
     hits, sent, _ = with_outcome("refused")
-    want(hits == sent == m.PROBE_TRIES,
+    want(hits == sent == m.PROBE_COUNT,
          "a RST must count as alive: the far KERNEL put a packet on the wire, which is the whole "
          "question. Requiring a listener would turn every agent restart into a red healthy tunnel")
 
     hits, sent, rtt = with_outcome("timeout")
-    want((hits, sent) == (0, m.PROBE_TRIES), f"silence answers nothing, got {hits}/{sent}")
+    want((hits, sent) == (0, m.PROBE_COUNT), f"silence answers nothing, got {hits}/{sent}")
     want(rtt is None, "a dead probe reports no round trip")
 
     # THE regression this file exists for. The manual check reported a tunnel connected while the card
     # beside it drew red, because the probe stopped at its first success -- on a tunnel dropping two
-    # thirds of its packets, "did anything get through" is yes and still useless. Every attempt goes out.
+    # thirds of its packets, "did anything get through" is yes and still useless. Every sample goes out.
     seq = ["timeout", "ok", "timeout"]
     calls.clear()
-    real = socket.socket
+    real_sock, real_sel = socket.socket, select.select
     it = iter(seq)
     socket.socket = lambda *a, **k: FakeSock(next(it))
+    select.select = ready_unless_timeout
     try:
-        hits, sent, _ = m.tun_probe("core44", "192.168.44.2/24", "core", tries=len(seq))
+        hits, sent, _ = m.tun_probe("core44", "192.168.44.2/24", "core", count=len(seq))
     finally:
-        socket.socket = real
+        socket.socket, select.select = real_sock, real_sel
     want((hits, sent) == (1, 3),
-         f"the probe must send every attempt even after one succeeds, got {hits}/{sent} -- stopping "
+         f"the probe must send every sample even after one answers, got {hits}/{sent} -- stopping "
          f"early is exactly what let the button claim a 67%-loss tunnel was connected")
 
-    # the reported latency must be the FASTEST reply. A kernel that lost the first SYN retransmits after
-    # ~1s, so the slow sample is its own retry timer wearing latency clothes.
-    class TimedSock(FakeSock):
-        def __init__(self, delay):
-            FakeSock.__init__(self, "ok")
-            self.delay = delay
-        def connect(self, addr):
-            calls["dst"] = addr
-            t = time.monotonic() + self.delay
-            while time.monotonic() < t:
-                pass
-    real = socket.socket
-    delays = iter([0.30, 0.02, 0.30])
-    socket.socket = lambda *a, **k: TimedSock(next(delays))
-    try:
-        _, _, rtt = m.tun_probe("core44", "192.168.44.2/24", "core", tries=3)
-    finally:
-        socket.socket = real
-    want(rtt is not None and rtt < 150,
+    # the reported latency must be the FASTEST reply, not the last one to straggle in.
+    stage = {"n": 0}
+
+    def staged(_r, w, _x, _t):
+        stage["n"] += 1
+        if stage["n"] == 1:
+            return ([], list(w)[:1], [])     # one answers immediately
+        time.sleep(0.06)                     # the rest arrive much later
+        return ([], list(w), [])
+
+    _, _, rtt = with_outcome("ok", count=3, selector=staged)
+    want(rtt is not None and rtt < 30,
          f"rtt must be the fastest reply, not the slowest or the mean, got {rtt}")
 
     # --- one sample count, so the button and the card cannot disagree ------------------------------
