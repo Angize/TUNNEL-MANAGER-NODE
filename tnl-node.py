@@ -1507,21 +1507,29 @@ def peer_of(tunnel_ip, ttype):
 # --- the liveness verdict: one TCP handshake sent THROUGH the tunnel ---------------------------------
 PROBE_PORT = 9         # discard. Nothing listens, so the far KERNEL answers with RST and no agent need be up
 PROBE_WAIT = 2.0       # s per attempt
+PROBE_TRIES = 3        # the SAME count everywhere. A manual check that samples harder than the sweep
+                       # reports a different tunnel than the card it sits on, and the operator is left
+                       # holding two answers with no way to tell which one is lying.
 _SO_BINDTODEVICE = getattr(socket, "SO_BINDTODEVICE", 25)   # absent off Linux, where the guards run
 
 
-def tun_probe(iface, tunnel_ip, ttype, tries=2):
-    """Send a TCP SYN from the tunnel device to the peer's tunnel address and report whether ANYTHING
-    came back. A RST proves as much as a completed handshake: both are a packet the far side put on the
-    wire in reply, so both mean the tunnel carried traffic in each direction just now. Only silence is a
-    negative verdict. Answering needs no process at the far end, which matters because the agent restarts
-    on every update and a healthy tunnel must not go red for those seconds.
+def tun_probe(iface, tunnel_ip, ttype, tries=PROBE_TRIES):
+    """Send `tries` TCP handshakes from the tunnel device to the peer's tunnel address and count how
+    many came back. A RST proves as much as a completed handshake: both are a packet the far side put
+    on the wire, so both mean the tunnel carried traffic in each direction. Answering needs no process
+    at the far end, which matters because the agent restarts on every update.
 
-    Returns (alive, rtt_ms). alive is None only when the socket could not be set up at all."""
+    Every attempt is sent even after one succeeds. Stopping early would answer "does anything get
+    through" -- which a tunnel dropping three quarters of its packets also answers yes to.
+
+    Returns (hits, sent, rtt_ms). rtt_ms is the FASTEST reply: a kernel that lost the first SYN and
+    retransmitted reports ~1 s of its own retry timer, which is a loss symptom, not the path's latency.
+    sent is 0 only when the socket could not be set up at all."""
     self_ip = tunnel_ip.split("/")[0]
     peer = peer_of(tunnel_ip, ttype)
     fam = socket.AF_INET6 if ttype == "sit" else socket.AF_INET
-    last = None
+    hits = sent = 0
+    best = None
     for _ in range(max(1, tries)):
         s = socket.socket(fam, socket.SOCK_STREAM)
         t0 = time.monotonic()
@@ -1533,17 +1541,21 @@ def tun_probe(iface, tunnel_ip, ttype, tries=2):
             s.setsockopt(socket.SOL_SOCKET, _SO_BINDTODEVICE, iface.encode() + b"\x00")
             s.bind((self_ip, 0))
             s.connect((peer, PROBE_PORT))
-            return True, round((time.monotonic() - t0) * 1000, 1)
+            answered = True
         except ConnectionRefusedError:
-            return True, round((time.monotonic() - t0) * 1000, 1)
+            answered = True
         except (socket.timeout, TimeoutError):
-            last = False        # nothing came back: retry, since one lost SYN is not a dead tunnel
+            answered = False
         except OSError:
-            last = None         # device gone mid-sweep, or the address is not ours (yet)
-            break
+            break              # device gone mid-sweep, or the address is not ours (yet)
         finally:
             s.close()
-    return last, None
+        sent += 1
+        if answered:
+            hits += 1
+            ms = round((time.monotonic() - t0) * 1000, 1)
+            best = ms if best is None else min(best, ms)
+    return hits, sent, best
 
 
 # --- directional liveness: bytes moving on the tunnel iface, counted per direction, whatever ICMP does ---
@@ -1604,7 +1616,7 @@ def _flow_sample(name):
     return still(rxp), still(txp)
 
 
-def health_of(cfg, thorough=False):
+def health_of(cfg):
     ttype, name = cfg.get("type"), cfg.get("name", "")
     if ttype == "portfw":
         iface, lp, dp = cfg.get("iface", ""), str(cfg.get("listen_port", "")), str(cfg.get("dst_port", ""))
@@ -1647,11 +1659,17 @@ def health_of(cfg, thorough=False):
     # and see whether anything comes back. That single exchange is the whole question — a packet crossed
     # in each direction, just now, through this tunnel and no other path.
     rx_still, tx_still = _flow_sample(name) if up else (None, None)   # throughput for the card; casts no vote
-    alive, rtt = None, None
+    alive, rtt, loss = None, None, None
     tip = cfg.get("tunnel_ip", "")
     if up and tip and tip != "N/A":
-        alive, rtt = tun_probe(name, tip, ttype, tries=(3 if thorough else 2))
-    return {"up": up, "alive": alive, "dead": alive is False, "rtt_ms": rtt,
+        hits, sent, rtt = tun_probe(name, tip, ttype)
+        if sent:
+            # A boolean cannot describe a tunnel that carries one packet in four, and calling that
+            # either "connected" or "down" is a lie in both directions. The count goes out with the
+            # verdict so the reader can say degraded.
+            alive = hits > 0
+            loss = round((sent - hits) * 100.0 / sent, 1)
+    return {"up": up, "alive": alive, "dead": alive is False, "rtt_ms": rtt, "loss_pct": loss,
             "rx_still": rx_still, "tx_still": tx_still, "live_win": int(LIVE_WINDOW)}
 
 
@@ -2638,12 +2656,13 @@ def op_wipe(d):
 
 
 def op_check(d):
-    """On-demand health probe for ONE config — a thorough live peer-ping over the tunnel."""
+    """On-demand health probe for ONE config. Deliberately the SAME measurement the sweep runs: a
+    button that samples differently would disagree with the card it sits on."""
     _require(d, ["name"])
     cfg = read_config(d["name"])
     if not cfg:
         raise ValueError("not found")
-    return {"ok": True, "health": health_of(cfg, thorough=True)}
+    return {"ok": True, "health": health_of(cfg)}
 
 
 def _ss_proc(line):
