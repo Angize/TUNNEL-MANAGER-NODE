@@ -1506,7 +1506,11 @@ def peer_of(tunnel_ip, ttype):
 
 # --- the liveness verdict: one TCP handshake sent THROUGH the tunnel ---------------------------------
 PROBE_PORT = 9         # discard. Nothing listens, so the far KERNEL answers with RST and no agent need be up
-PROBE_WAIT = 2.0       # s per attempt
+SYN_RTO = 1.0          # s: the kernel's initial SYN retransmit timer (TCP_TIMEOUT_INIT), the value the
+                       # deadline below must stay under. Not tunable from userspace, so it is a constant here.
+PROBE_WAIT = 0.8       # s per attempt: ONE SYN's worth, deliberately under SYN_RTO. A deadline that spans
+                       # the retransmit measures two SYNs as one sample and gets both numbers wrong -- see
+                       # tun_probe. The fleet's real round trips are 78-170 ms, so this leaves 4x headroom.
 PROBE_TRIES = 3        # the SAME count everywhere. A manual check that samples harder than the sweep
                        # reports a different tunnel than the card it sits on, and the operator is left
                        # holding two answers with no way to tell which one is lying.
@@ -1522,8 +1526,12 @@ def tun_probe(iface, tunnel_ip, ttype, tries=PROBE_TRIES):
     Every attempt is sent even after one succeeds. Stopping early would answer "does anything get
     through" -- which a tunnel dropping three quarters of its packets also answers yes to.
 
-    Returns (hits, sent, rtt_ms). rtt_ms is the FASTEST reply: a kernel that lost the first SYN and
-    retransmitted reports ~1 s of its own retry timer, which is a loss symptom, not the path's latency.
+    Each attempt is exactly ONE SYN: PROBE_WAIT is under the kernel's initial retransmit timer, so an
+    attempt either gets an answer to that SYN or ends. A longer deadline silently folds the retransmit
+    into the same attempt and corrupts both numbers -- the reply is counted as a hit although the first
+    SYN was lost, and its "latency" is the kernel's own 1 s timer wearing the path's clothes.
+
+    Returns (hits, sent, rtt_ms). rtt_ms is the FASTEST reply and is always a real round trip.
     sent is 0 only when the socket could not be set up at all."""
     self_ip = tunnel_ip.split("/")[0]
     peer = peer_of(tunnel_ip, ttype)
