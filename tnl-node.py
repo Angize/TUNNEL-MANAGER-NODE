@@ -1513,12 +1513,15 @@ SYN_RTO = 1.0          # s: the kernel's initial SYN retransmit timer (TCP_TIMEO
 PROBE_WAIT = 0.8       # s per attempt: ONE SYN's worth, deliberately under SYN_RTO. A deadline that spans
                        # the retransmit measures two SYNs as one sample and gets both numbers wrong -- see
                        # tun_probe. The fleet's real round trips are 78-170 ms, so this leaves 4x headroom.
-PROBE_COUNT = 10       # samples per sweep, sent CONCURRENTLY. The verdict is a majority of these, so the
-                       # count is the resolution of the answer: at 3 the only readings were 0/33/67/100
-                       # and a tunnel sitting near the line flipped colour on the luck of three throws.
-                       # Ten costs ~3.3 packets/s per tunnel and, because they fly together, no more
-                       # wall time than one. The SAME count everywhere: a button that samples harder
-                       # than the sweep reports a different tunnel than the card it sits on.
+PROBE_COUNT = 20       # samples per sweep, sent CONCURRENTLY. They no longer decide the colour -- one
+                       # reply does that -- so the count buys two other things. It is the resolution of
+                       # loss_pct, now the only signal of how BADLY a tunnel is carrying (20 -> 5% steps).
+                       # And it is what keeps a very lossy tunnel steadily GREEN: at 90% loss the chance
+                       # a whole sweep falls silent by luck is 35% at ten samples but 12% at twenty, and
+                       # squared again by RED_SWEEPS. Concurrency is what makes this free: twenty cost
+                       # the same wall time as one, ~6.7 packets/s per tunnel. The SAME count everywhere:
+                       # a button that samples harder than the sweep reports a different tunnel than the
+                       # card it sits on.
 RED_SWEEPS = 2         # consecutive bad sweeps before a GREEN tunnel is repainted red. Green publishes
                        # at once -- an outage must show fast, one unlucky sweep must not.
 _SO_BINDTODEVICE = getattr(socket, "SO_BINDTODEVICE", 25)   # absent off Linux, where the guards run
@@ -1744,12 +1747,13 @@ def health_of(cfg):
     if up and tip and tip != "N/A":
         hits, sent, rtt = tun_probe(name, tip, ttype)
         if sent:
-            # Two states, and the line is the majority: a tunnel is connected when most of what we
-            # sent came back. "Any reply at all" was the old rule and it called a tunnel carrying one
-            # packet in four connected, which is how the check button came to disagree with the card
-            # beside it. The percentage still goes out -- as a number to read, not a third colour.
+            # Two states, and the line is all-or-nothing: connected while ANYTHING still crosses,
+            # disconnected only once nothing does. A tunnel still carrying traffic is not down, however
+            # badly it carries it -- "how well" is a different question and loss_pct beside it is the
+            # answer. Which is why the probe still sends every sample: one reply decides the colour,
+            # but only the whole set can say what fraction is getting through.
             loss = round((sent - hits) * 100.0 / sent, 1)
-            alive = settle(name, hits * 2 > sent)
+            alive = settle(name, hits > 0)
     return {"up": up, "alive": alive, "dead": alive is False, "rtt_ms": rtt, "loss_pct": loss,
             "rx_still": rx_still, "tx_still": tx_still, "live_win": int(LIVE_WINDOW)}
 
