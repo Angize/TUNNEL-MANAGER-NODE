@@ -1744,12 +1744,13 @@ def health_of(cfg):
     if up and tip and tip != "N/A":
         hits, sent, rtt = tun_probe(name, tip, ttype)
         if sent:
-            # Two states, and the line is the majority: a tunnel is connected when most of what we
-            # sent came back. "Any reply at all" was the old rule and it called a tunnel carrying one
-            # packet in four connected, which is how the check button came to disagree with the card
-            # beside it. The percentage still goes out -- as a number to read, not a third colour.
+            # Two states, and the line is all-or-nothing: connected while ANYTHING still crosses,
+            # disconnected only once nothing does. A tunnel still carrying traffic is not down, however
+            # badly it carries it -- "how well" is a different question and loss_pct beside it is the
+            # answer. Which is why the probe still sends every sample: one reply decides the colour,
+            # but only the whole set can say what fraction is getting through.
             loss = round((sent - hits) * 100.0 / sent, 1)
-            alive = settle(name, hits * 2 > sent)
+            alive = settle(name, hits > 0)
     return {"up": up, "alive": alive, "dead": alive is False, "rtt_ms": rtt, "loss_pct": loss,
             "rx_still": rx_still, "tx_still": tx_still, "live_win": int(LIVE_WINDOW)}
 
