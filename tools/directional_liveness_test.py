@@ -74,15 +74,21 @@ def main():
     mod._flow_sample("ifc")                       # first sample: baseline only
     setctr(1000, 9000)                            # we sent; nothing came back
     rx, tx = mod._flow_sample("ifc")
-    if tx is not True:
-        fail("tx advanced and tx_live=%r — the sending direction must be reported" % tx)
-    if rx is True:
-        fail("rx did NOT advance and rx_live=%r — a still direction must not read live" % rx)
+    # isinstance, not just a comparison: `True > 1` is False in Python, so a boolean would sail through
+    # every numeric check here and the flag-vs-number regression would go unnoticed.
+    if not isinstance(tx, float):
+        fail("tx_still=%r (%s) — the sampler must report SECONDS, not a flag: the 'moving now' and "
+             "'definitely not arriving' thresholds are different and a flag can only carry one"
+             % (tx, type(tx).__name__))
+    elif tx > 1:
+        fail("tx advanced and tx_still=%r — the sending direction must report ~0s quiet" % tx)
+    if rx is not None and (not isinstance(rx, float) or rx <= 1):
+        fail("rx did NOT advance and rx_still=%r — a still direction must not report as just-moved" % rx)
 
     setctr(7000, 9000)                            # now traffic comes back
     rx, tx = mod._flow_sample("ifc")
-    if rx is not True:
-        fail("rx advanced and rx_live=%r" % rx)
+    if not isinstance(rx, float) or rx > 1:
+        fail("rx advanced and rx_still=%r — must be SECONDS near zero" % rx)
 
     setctr(5, 5)                                  # counters went backwards: iface recreated
     rx, tx = mod._flow_sample("ifc")
@@ -93,8 +99,8 @@ def main():
     mod.os.path.exists = lambda p: True if p.startswith("/sys/class/net/") else os.path.exists(p)
     mod._cfg_path = lambda name, ext: os.path.join(tmp, name + ext)
 
-    def health(rx_live, tx_live, hb_age=None, ping_ok=None, events=None, rt_age=None, rtms=0, role=""):
-        mod._flow_sample = lambda name: (rx_live, tx_live)
+    def health(rx_still, tx_still, hb_age=None, ping_ok=None, events=None, rt_age=None, rtms=0, role=""):
+        mod._flow_sample = lambda name: (rx_still, tx_still)
         if hb_age is None:
             try:
                 os.remove(os.path.join(tmp, "t0.status"))
@@ -116,45 +122,46 @@ def main():
             mod.run = lambda *a, **k: (1, "100% packet loss", "")
         return mod.health_of({"type": "core", "name": "t0", "tunnel_ip": "10.9.9.2/24"}, thorough=True)
 
-    h = health(rx_live=None, tx_live=True, ping_ok=False)
+    h = health(rx_still=None, tx_still=0.0, ping_ok=False)
     if h.get("alive") is True:
         fail("tx moving with nothing arriving reported alive=True — sending into a hole is not a "
              "connection, and nothing on THIS host can prove what we send lands")
-    if h.get("tx_live") is not True:
-        fail("tx_live must still be REPORTED even when it proves nothing (got %r)" % h.get("tx_live"))
+    if not isinstance(h.get("tx_still"), float) or h.get("tx_still") != 0.0:
+        fail("tx_still must still be REPORTED, as seconds, even when it proves nothing (got %r)"
+             % h.get("tx_still"))
 
-    h = health(rx_live=True, tx_live=None, ping_ok=False)
+    h = health(rx_still=0.0, tx_still=None, ping_ok=False)
     if h.get("alive") is not True:
         fail("arriving traffic must make a side alive even when the probe fails (got %r)" % h.get("alive"))
     if h.get("live_src") != "rx":
         fail("live_src=%r, want 'rx' — the panel names the reason" % h.get("live_src"))
 
-    h = health(rx_live=None, tx_live=None, hb_age=2, ping_ok=False)
+    h = health(rx_still=None, tx_still=None, hb_age=2, ping_ok=False)
     if h.get("alive") is not True:
         fail("a fresh heartbeat is the same fact as rx and must also count (got %r)" % h.get("alive"))
 
     # A core-reported death: a `down` with no `up` after it. No probe may outvote it.
     dead_ev = [{"seq": 1, "ts": int(time.time()), "kind": "down", "code": "eof", "detail": ""}]
-    h = health(rx_live=True, tx_live=True, hb_age=2, ping_ok=True, events=dead_ev)
+    h = health(rx_still=0.0, tx_still=0.0, hb_age=2, ping_ok=True, events=dead_ev)
     if not h.get("dead") or h.get("alive") is not False:
         fail("the core reported a real death and the side read alive=%r dead=%r — a positive death "
              "signal must outrank every other input" % (h.get("alive"), h.get("dead")))
 
     # ---- the answered keepalive: the one local fact covering BOTH directions ----
-    h = health(rx_live=None, tx_live=True, hb_age=2, ping_ok=False, rt_age=3, rtms=42)
+    h = health(rx_still=None, tx_still=0.0, hb_age=2, ping_ok=False, rt_age=3, rtms=42)
     if h.get("round_trip") is not True:
         fail("a keepalive answered 3s ago inside a 20s window reported round_trip=%r" % h.get("round_trip"))
     if h.get("carrier_rtt_ms") != 42:
         fail("carrier_rtt_ms=%r, want the core's own 42 — this is the RTT through obfs and crypto, not "
              "the ICMP one" % h.get("carrier_rtt_ms"))
 
-    h = health(rx_live=None, tx_live=True, hb_age=2, ping_ok=False, rt_age=600, rtms=42)
+    h = health(rx_still=None, tx_still=0.0, hb_age=2, ping_ok=False, rt_age=600, rtms=42)
     if h.get("round_trip") is not None:
         fail("a round trip 600s old reported %r — it must go to None and NEVER to False: the TCP family "
              "skips the ping when data just arrived, so stale means no news, not broken"
              % h.get("round_trip"))
 
-    h = health(rx_live=None, tx_live=True, hb_age=2, ping_ok=False)
+    h = health(rx_still=None, tx_still=0.0, hb_age=2, ping_ok=False)
     if h.get("round_trip") is not None:
         fail("no rt published at all reported round_trip=%r, want None (dns publishes none)"
              % h.get("round_trip"))
@@ -164,7 +171,7 @@ def main():
     # paint every freshly-built server red until someone connects.
     import types
     mod._nohb_state.clear()
-    h = health(rx_live=None, tx_live=None, hb_age=0, ping_ok=False, role="server")
+    h = health(rx_still=None, tx_still=None, hb_age=0, ping_ok=False, role="server")
     with open(os.path.join(tmp, "t0.status"), "w", encoding="utf-8") as f:
         json.dump({"hb": 0, "dw": 20, "events": [], "role": "server"}, f)
     mod._nohb_state.clear()
