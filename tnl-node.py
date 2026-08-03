@@ -16,11 +16,13 @@
 # expose the agent port to the central server only.
 
 import base64
+import errno
 import hashlib
 import hmac
 import ipaddress
 import json
 import os
+import select
 import py_compile
 import re
 import secrets
@@ -1511,59 +1513,125 @@ SYN_RTO = 1.0          # s: the kernel's initial SYN retransmit timer (TCP_TIMEO
 PROBE_WAIT = 0.8       # s per attempt: ONE SYN's worth, deliberately under SYN_RTO. A deadline that spans
                        # the retransmit measures two SYNs as one sample and gets both numbers wrong -- see
                        # tun_probe. The fleet's real round trips are 78-170 ms, so this leaves 4x headroom.
-PROBE_TRIES = 3        # the SAME count everywhere. A manual check that samples harder than the sweep
-                       # reports a different tunnel than the card it sits on, and the operator is left
-                       # holding two answers with no way to tell which one is lying.
+PROBE_COUNT = 10       # samples per sweep, sent CONCURRENTLY. The verdict is a majority of these, so the
+                       # count is the resolution of the answer: at 3 the only readings were 0/33/67/100
+                       # and a tunnel sitting near the line flipped colour on the luck of three throws.
+                       # Ten costs ~3.3 packets/s per tunnel and, because they fly together, no more
+                       # wall time than one. The SAME count everywhere: a button that samples harder
+                       # than the sweep reports a different tunnel than the card it sits on.
+RED_SWEEPS = 2         # consecutive bad sweeps before a GREEN tunnel is repainted red. Green publishes
+                       # at once -- an outage must show fast, one unlucky sweep must not.
 _SO_BINDTODEVICE = getattr(socket, "SO_BINDTODEVICE", 25)   # absent off Linux, where the guards run
+_ANSWERED = (0, errno.ECONNREFUSED)   # connected, or refused: either way the far side put a packet on the wire
+_PENDING = (errno.EINPROGRESS, errno.EWOULDBLOCK, errno.EALREADY)
 
 
-def tun_probe(iface, tunnel_ip, ttype, tries=PROBE_TRIES):
-    """Send `tries` TCP handshakes from the tunnel device to the peer's tunnel address and count how
+def tun_probe(iface, tunnel_ip, ttype, count=PROBE_COUNT):
+    """Fire `count` TCP handshakes from the tunnel device to the peer's tunnel address and count how
     many came back. A RST proves as much as a completed handshake: both are a packet the far side put
     on the wire, so both mean the tunnel carried traffic in each direction. Answering needs no process
     at the far end, which matters because the agent restarts on every update.
 
-    Every attempt is sent even after one succeeds. Stopping early would answer "does anything get
+    They go out TOGETHER, not one after another. Serially, `count` samples cost `count` deadlines and
+    the sweep could not afford enough of them to say anything but 0/33/67/100. Concurrently the whole
+    probe still costs one deadline, so the sample count is free to be the resolution of the answer.
+
+    Every sample is sent even once one has answered. Stopping early would answer "does anything get
     through" -- which a tunnel dropping three quarters of its packets also answers yes to.
 
-    Each attempt is exactly ONE SYN: PROBE_WAIT is under the kernel's initial retransmit timer, so an
-    attempt either gets an answer to that SYN or ends. A longer deadline silently folds the retransmit
-    into the same attempt and corrupts both numbers -- the reply is counted as a hit although the first
+    Each sample is exactly ONE SYN: PROBE_WAIT is under the kernel's initial retransmit timer, so a
+    sample either gets an answer to that SYN or ends. A longer deadline silently folds the retransmit
+    into the same sample and corrupts both numbers -- the reply is counted as a hit although the first
     SYN was lost, and its "latency" is the kernel's own 1 s timer wearing the path's clothes.
 
     Returns (hits, sent, rtt_ms). rtt_ms is the FASTEST reply and is always a real round trip.
-    sent is 0 only when the socket could not be set up at all."""
+    sent counts the SYNs that actually went out; it is 0 only when no socket could be set up at all."""
     self_ip = tunnel_ip.split("/")[0]
     peer = peer_of(tunnel_ip, ttype)
     fam = socket.AF_INET6 if ttype == "sit" else socket.AF_INET
     hits = sent = 0
     best = None
-    for _ in range(max(1, tries)):
-        s = socket.socket(fam, socket.SOCK_STREAM)
-        t0 = time.monotonic()
+
+    def faster(prev, secs):
+        ms = round(secs * 1000, 1)
+        return ms if prev is None else min(prev, ms)
+
+    waiting = {}           # socket -> the moment its SYN went out, so each rtt is its own
+    for _ in range(max(1, count)):
         try:
-            s.settimeout(PROBE_WAIT)
+            s = socket.socket(fam, socket.SOCK_STREAM)
+        except OSError:
+            break
+        try:
+            s.setblocking(False)
             # Pin to the device AND to the tunnel address. Routing alone would usually pick this tunnel,
             # but "usually" is not a measurement: a probe free to leave by another path can report a
             # tunnel alive that is carrying nothing.
             s.setsockopt(socket.SOL_SOCKET, _SO_BINDTODEVICE, iface.encode() + b"\x00")
             s.bind((self_ip, 0))
-            s.connect((peer, PROBE_PORT))
-            answered = True
-        except ConnectionRefusedError:
-            answered = True
-        except (socket.timeout, TimeoutError):
-            answered = False
+            t0 = time.monotonic()
+            err = s.connect_ex((peer, PROBE_PORT))
         except OSError:
-            break              # device gone mid-sweep, or the address is not ours (yet)
-        finally:
             s.close()
-        sent += 1
-        if answered:
+            break              # device gone mid-sweep, or the address is not ours (yet)
+        if err in _ANSWERED:   # answered before we even reached the wait
+            sent += 1
             hits += 1
-            ms = round((time.monotonic() - t0) * 1000, 1)
-            best = ms if best is None else min(best, ms)
+            best = faster(best, time.monotonic() - t0)
+            s.close()
+        elif err in _PENDING:
+            sent += 1
+            waiting[s] = t0
+        else:
+            s.close()          # the SYN never left; it is not a sample and must not count as loss
+
+    deadline = time.monotonic() + PROBE_WAIT
+    while waiting:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            break
+        try:
+            ready = select.select([], list(waiting), [], left)[1]
+        except OSError:
+            break
+        if not ready:
+            break              # the deadline passed with nothing more to collect
+        now = time.monotonic()
+        for s in ready:
+            t0 = waiting.pop(s, None)
+            try:
+                if s.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR) in _ANSWERED:
+                    hits += 1
+                    best = faster(best, now - t0)
+            except OSError:
+                pass
+            s.close()
+    for s in waiting:
+        s.close()              # never answered inside the deadline: a lost SYN, already counted in sent
     return hits, sent, best
+
+
+_verdict_lock = threading.Lock()
+_verdict = {}          # tunnel name -> {"pub": bool|None, "bad": int}
+
+
+def settle(name, ok):
+    """Turn this sweep's raw yes/no into the verdict that gets published.
+
+    A tunnel that is currently GREEN needs RED_SWEEPS consecutive bad sweeps before it is repainted;
+    green publishes at once. The asymmetry is the point: a real outage must show fast, but one unlucky
+    sweep must not repaint a working tunnel, and a dot that flickers is a dot the operator stops
+    reading. A tunnel that is not already green goes red on its first bad sweep -- there is nothing
+    to protect."""
+    with _verdict_lock:
+        st = _verdict.setdefault(name, {"pub": None, "bad": 0})
+        if ok:
+            st["pub"], st["bad"] = True, 0
+        else:
+            st["bad"] += 1
+            if not (st["pub"] is True and st["bad"] < RED_SWEEPS):
+                st["pub"] = False
+        return st["pub"]
 
 
 # --- directional liveness: bytes moving on the tunnel iface, counted per direction, whatever ICMP does ---
@@ -1583,10 +1651,14 @@ def _prune_iface_state(names):
     """Drop per-iface liveness bookkeeping for tunnels that no longer exist. Both dicts are keyed by
     config name and nothing removed their entries on delete, so a node churned by create/delete grew
     them forever — and a recreated tunnel inherited a stale rx baseline until the counter-went-backwards
-    reset in _flow_sample cost it one extra sweep."""
+    reset in _flow_sample cost it one extra sweep. The verdict's own memory is keyed the same way and
+    goes with them: a recreated tunnel must not inherit the green that protected its namesake."""
     with _flow_lock:
         for nm in [n for n in _flow_state if n not in names]:
             _flow_state.pop(nm, None)
+    with _verdict_lock:
+        for nm in [n for n in _verdict if n not in names]:
+            _verdict.pop(nm, None)
 
 
 def _flow_sample(name):
@@ -1672,11 +1744,12 @@ def health_of(cfg):
     if up and tip and tip != "N/A":
         hits, sent, rtt = tun_probe(name, tip, ttype)
         if sent:
-            # A boolean cannot describe a tunnel that carries one packet in four, and calling that
-            # either "connected" or "down" is a lie in both directions. The count goes out with the
-            # verdict so the reader can say degraded.
-            alive = hits > 0
+            # Two states, and the line is the majority: a tunnel is connected when most of what we
+            # sent came back. "Any reply at all" was the old rule and it called a tunnel carrying one
+            # packet in four connected, which is how the check button came to disagree with the card
+            # beside it. The percentage still goes out -- as a number to read, not a third colour.
             loss = round((sent - hits) * 100.0 / sent, 1)
+            alive = settle(name, hits * 2 > sent)
     return {"up": up, "alive": alive, "dead": alive is False, "rtt_ms": rtt, "loss_pct": loss,
             "rx_still": rx_still, "tx_still": tx_still, "live_win": int(LIVE_WINDOW)}
 
