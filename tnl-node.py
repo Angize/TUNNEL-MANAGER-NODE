@@ -1537,15 +1537,18 @@ def _prune_iface_state(names):
 
 
 def _flow_sample(name):
-    """Per-DIRECTION liveness on <name>, as (rx_live, tx_live), each True/False/None.
+    """Per-DIRECTION quiet time on <name>, as (rx_still, tx_still) in SECONDS, or None each.
 
     rx = bytes the tunnel DELIVERED to us, so the peer's traffic is arriving. tx = bytes we pushed INTO
     the tunnel, so we are trying. They answer different questions and are never merged: a tunnel that is
     sending into a hole has tx moving and rx still, which is exactly the state a single flag cannot say.
 
-    None = undetermined: first sample, nothing seen yet, unreadable counter, or the iface was recreated
-    (the counter went backwards). Never a hard False on silence alone — an idle tunnel is not a dead one;
-    that is what the probe is for."""
+    A NUMBER, not a flag, because the two thresholds are different. "Moving recently" is a short window;
+    "definitely not arriving" has to be a long one, or an ordinary quiet patch in bursty traffic reads as
+    a broken direction. A flag collapses both into one and forces the reader to pick the wrong threshold.
+
+    None = no baseline: first sample, nothing seen yet, unreadable counter, or the iface was recreated
+    (the counter went backwards)."""
     now = time.monotonic()
     with _flow_lock:  # sample + compare + store atomically so concurrent same-name callers can't invert the order
         rx, tx = _iface_ctr(name, "rx"), _iface_ctr(name, "tx")
@@ -1564,8 +1567,8 @@ def _flow_sample(name):
             elif tx < prev["tx"]:
                 txp = None
         _flow_state[name] = {"rx": rx, "tx": tx, "rxp": rxp, "txp": txp}
-    fresh = lambda p: None if p is None else (now - p) <= LIVE_WINDOW
-    return fresh(rxp), fresh(txp)
+    still = lambda p: None if p is None else max(0.0, now - p)
+    return still(rxp), still(txp)
 
 
 def health_of(cfg, thorough=False):
@@ -1609,7 +1612,8 @@ def health_of(cfg, thorough=False):
         up = os.path.exists("/sys/class/net/" + name)   # mid-teardown gap as a transient false 'down'
     # Real-state liveness: if authenticated tunnel traffic is actually arriving on the iface, the tunnel
     # is alive no matter whether ICMP is answered or filtered. Only meaningful once the iface exists.
-    rx_live, tx_live = _flow_sample(name) if up else (None, None)
+    rx_still, tx_still = _flow_sample(name) if up else (None, None)
+    rx_live = rx_still is not None and rx_still <= LIVE_WINDOW   # "arriving right now", the short question
     # Core heartbeat: a client core writes its lastRx (hb, unix-seconds) plus its RESOLVED dead-window (dw)
     # into the status file every few seconds. A FRESH hb (age <= dw) proves the encrypted session is alive
     # even with zero user traffic and filtered ICMP; an aged-out hb, or an unpaired real-death `down`, is a
@@ -1658,7 +1662,7 @@ def health_of(cfg, thorough=False):
     # passive sweep pings only when NEITHER the core heartbeat NOR arriving traffic has already settled the
     # verdict — so a filtered ICMP can't paint a busy/idle-but-live tunnel half-open, while a tunnel with
     # no heartbeat and no arriving traffic still gets a real reachability probe.
-    if up and tip and tip != "N/A" and (thorough or (beat is None and rx_live is not True)):
+    if up and tip and tip != "N/A" and (thorough or (beat is None and not rx_live)):
         peer = peer_of(tip, ttype)
         cnt, wait = ("4", "2") if thorough else ("1", "2")  # on-demand pings harder; passive stays a single cheap packet (2s wait) so an idle-ICMP-heavy fleet doesn't pile up
         cmd = (["ping", "-6", "-c", cnt, "-W", wait, peer] if ttype == "sit"
@@ -1678,7 +1682,7 @@ def health_of(cfg, thorough=False):
     nohb_dead = False
     # A SERVER with hb==0 has simply never been reached yet — it does not dial, so there is nothing for it
     # to be failing at. Only a client that published a dead-window and was never answered is dead.
-    if up and ttype == "core" and _role != "server" and _dw > 0 and _hb <= 0 and rx_live is not True and ping is False:
+    if up and ttype == "core" and _role != "server" and _dw > 0 and _hb <= 0 and not rx_live and ping is False:
         with _nohb_lock:
             _t0 = _nohb_state.get(name)
             if _t0 is None:
@@ -1695,7 +1699,7 @@ def health_of(cfg, thorough=False):
         alive, src, dead = False, "beat", True     # the core reported a real death: no probe can outvote it
     elif beat is True:
         alive, src = True, "beat"
-    elif rx_live is True:
+    elif rx_live:
         alive, src = True, "rx"
     elif ping is True:
         alive, src = True, "ping"
@@ -1710,8 +1714,12 @@ def health_of(cfg, thorough=False):
     round_trip = None
     if _rt > 0 and _dw > 0 and (time.time() - _rt) <= _dw:
         round_trip = True
+    # The two windows go out with the numbers so the reader applies OUR thresholds, not its own guess at
+    # them, and so a direction can be called broken only on the tunnel's own dead-window — never on a
+    # quiet patch. dead_win is 0 for a tunnel with no core, which simply means no negative verdict.
     return {"up": up, "alive": alive, "live_src": src, "dead": dead, "rtt_ms": rtt, "loss_pct": loss,
-            "rx_live": rx_live, "tx_live": tx_live,
+            "rx_still": rx_still, "tx_still": tx_still,
+            "live_win": int(LIVE_WINDOW), "dead_win": _dw,
             "round_trip": round_trip, "carrier_rtt_ms": (_rtms or None)}
 
 
