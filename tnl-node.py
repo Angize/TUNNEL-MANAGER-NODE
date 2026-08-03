@@ -771,11 +771,15 @@ def _core_config(cfg):
         sni = str(cfg.get("cover_sni") or "").strip()
         if sni:
             corecfg["cover_sni"] = sni
-    # Datagram (udp/raw/flux) and direct-stream (tcp, tcp+cover) transports have no ws edge pool, but the
-    # CLIENT still writes a self-heal event ring plus a liveness heartbeat (`hb`) to a status file we expose
-    # to the panel's log. This is `status_path`, NOT `ws_status_path`, so _is_ws_pool keeps telling a pool
-    # core apart from a plain one. dns belongs here too, or the health sweep has no hb/dw to judge by.
-    if transport in ("udp", "tcp", "raw", "flux", "spoof", "dns") and str(cfg.get("role")) == "client":
+    # Datagram (udp/raw/flux) and direct-stream (tcp, tcp+cover) transports have no ws edge pool, but both
+    # ends write a liveness heartbeat (`hb`) — and the client its self-heal event ring — to a status file we
+    # expose to the panel's log. This is `status_path`, NOT `ws_status_path`, so _is_ws_pool keeps telling a
+    # pool core apart from a plain one. dns belongs here too, or the health sweep has no hb/dw to judge by.
+    #
+    # The SERVER end gets one for the same reason the client does: its own lastRx is the only local proof
+    # that the CLIENT->SERVER direction carries. Without it that end had nothing to judge by and the sweep
+    # probed it with ICMP forever — traffic the tunnel then counted as its own liveness.
+    if transport in ("udp", "tcp", "raw", "flux", "spoof", "dns"):
         corecfg["status_path"] = _cfg_path(name, ".status")
     # peer_src_ips (raw/flux SERVER): the client's source pool. These carriers receive on a socket that
     # sees every host and pre-filter by the learned peer source, so a rotated client source is otherwise
@@ -1613,6 +1617,7 @@ def health_of(cfg, thorough=False):
     beat = None  # True = alive, False = confirmed dead, None = no heartbeat to judge by
     _hb = _dw = 0    # published heartbeat + resolved dead-window; kept in scope for the never-connected check below
     _rt = _rtms = 0  # last ANSWERED keepalive + what that round trip took, straight from the core
+    _role = ""       # which end wrote the status file; a server WAITING for its first client is not dead
     if up and ttype == "core":
         _evs = []
         try:
@@ -1621,6 +1626,7 @@ def health_of(cfg, thorough=False):
             if isinstance(_doc, dict):
                 _hb, _dw, _evs = int(_doc.get("hb") or 0), int(_doc.get("dw") or 0), (_doc.get("events") or [])
                 _rt, _rtms = int(_doc.get("rt") or 0), int(_doc.get("rtt_ms") or 0)
+                _role = str(_doc.get("role") or "")
         except (OSError, ValueError, TypeError):
             pass
         if _hb > 0:
@@ -1670,7 +1676,9 @@ def health_of(cfg, thorough=False):
     # NEVER-CONNECTED counts as dead, not unknown: the core publishes dw the moment it starts but stamps
     # hb only once an authenticated frame arrives, so dw>0 with hb==0 means it was never answered.
     nohb_dead = False
-    if up and ttype == "core" and _dw > 0 and _hb <= 0 and rx_live is not True and ping is False:
+    # A SERVER with hb==0 has simply never been reached yet — it does not dial, so there is nothing for it
+    # to be failing at. Only a client that published a dead-window and was never answered is dead.
+    if up and ttype == "core" and _role != "server" and _dw > 0 and _hb <= 0 and rx_live is not True and ping is False:
         with _nohb_lock:
             _t0 = _nohb_state.get(name)
             if _t0 is None:
