@@ -93,7 +93,7 @@ def main():
     mod.os.path.exists = lambda p: True if p.startswith("/sys/class/net/") else os.path.exists(p)
     mod._cfg_path = lambda name, ext: os.path.join(tmp, name + ext)
 
-    def health(rx_live, tx_live, hb_age=None, ping_ok=None, events=None, rt_age=None, rtms=0):
+    def health(rx_live, tx_live, hb_age=None, ping_ok=None, events=None, rt_age=None, rtms=0, role=""):
         mod._flow_sample = lambda name: (rx_live, tx_live)
         if hb_age is None:
             try:
@@ -102,6 +102,8 @@ def main():
                 pass
         else:
             doc = {"hb": int(time.time() - hb_age), "dw": 20, "events": events or []}
+            if role:
+                doc["role"] = role
             if rt_age is not None:
                 doc["rt"], doc["rtt_ms"] = int(time.time() - rt_age), rtms
             with open(os.path.join(tmp, "t0.status"), "w", encoding="utf-8") as f:
@@ -156,6 +158,28 @@ def main():
     if h.get("round_trip") is not None:
         fail("no rt published at all reported round_trip=%r, want None (dns publishes none)"
              % h.get("round_trip"))
+
+    # ---- a SERVER waiting for its first client is not dead ----
+    # It does not dial, so hb==0 means "nobody has arrived yet", not "I failed". Calling that dead would
+    # paint every freshly-built server red until someone connects.
+    import types
+    mod._nohb_state.clear()
+    h = health(rx_live=None, tx_live=None, hb_age=0, ping_ok=False, role="server")
+    with open(os.path.join(tmp, "t0.status"), "w", encoding="utf-8") as f:
+        json.dump({"hb": 0, "dw": 20, "events": [], "role": "server"}, f)
+    mod._nohb_state.clear()
+    mod._nohb_state["t0"] = 0.0        # pretend the grace period elapsed long ago
+    h = mod.health_of({"type": "core", "name": "t0", "tunnel_ip": "10.9.9.2/24"}, thorough=True)
+    if h.get("dead"):
+        fail("a server that has never been reached was reported dead — it does not dial, so there is "
+             "nothing for it to be failing at")
+
+    with open(os.path.join(tmp, "t0.status"), "w", encoding="utf-8") as f:
+        json.dump({"hb": 0, "dw": 20, "events": [], "role": "client"}, f)
+    mod._nohb_state.clear(); mod._nohb_state["t0"] = 0.0
+    h = mod.health_of({"type": "core", "name": "t0", "tunnel_ip": "10.9.9.2/24"}, thorough=True)
+    if not h.get("dead"):
+        fail("a CLIENT that published a dead-window and was never answered must still read dead")
 
     if fails:
         print("\n%d check(s) failed." % len(fails))
