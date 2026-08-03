@@ -38,9 +38,11 @@ def main():
         if not cond:
             fails.append(msg)
 
-    want(m.PROBE_COUNT >= 8,
-         f"PROBE_COUNT is {m.PROBE_COUNT}: the samples no longer decide the colour, they decide the "
-         f"PERCENTAGE, and at 3 the only readings it can ever show are 0/33/67/100")
+    want(m.PROBE_COUNT >= 16,
+         f"PROBE_COUNT is {m.PROBE_COUNT}. Green now covers everything short of silence, so the very "
+         f"tunnels this rule keeps green are the ones most likely to fall silent by luck: at 90% loss "
+         f"a whole sweep goes quiet 35% of the time at ten samples, 12% at twenty. Too few samples and "
+         f"a tunnel the operator asked to see as connected flaps red instead")
     want(m.RED_SWEEPS >= 2, f"RED_SWEEPS is {m.RED_SWEEPS}: one bad sweep must not repaint a green tunnel")
 
     # --- drive health_of with a probe of known outcome ---------------------------------------------
@@ -73,9 +75,13 @@ def main():
     # the colour no longer does
     h = health("t-loss", half)
     want(h.get("loss_pct") == 50.0, f"the loss must still be REPORTED, got {h.get('loss_pct')}")
+    worst = round((n - 1) * 100.0 / n, 1)   # derived, so raising PROBE_COUNT cannot silently stale it
     h = health("t-loss2", 1)
-    want(h.get("loss_pct") == 90.0,
-         f"a green tunnel losing nine in ten must SAY so, got {h.get('loss_pct')}")
+    want(h.get("loss_pct") == worst,
+         f"the worst a GREEN tunnel can read must be stated exactly ({worst}%), got {h.get('loss_pct')}")
+    want(worst >= 90.0,
+         f"and it must reach at least 90%: the operator's rule is that a tunnel losing almost "
+         f"everything is still connected, so the card has to be able to SHOW almost everything")
 
     # --- 2. red needs confirming, green does not ---------------------------------------------------
     want(health("t-hys", n)["alive"] is True, "sweep 1 good -> green")
