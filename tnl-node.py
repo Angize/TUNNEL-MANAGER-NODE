@@ -1646,7 +1646,29 @@ _fo = {}                    # tunnel -> {"burns": asks issued this round, "settl
 
 
 def _fo_state(name):
-    return _fo.setdefault(name, {"burns": 0, "settle": 0.0, "cooldown": 0.0})
+    return _fo.setdefault(name, {"burns": 0, "settle": 0.0, "cooldown": 0.0, "red": False})
+
+
+def _report_carrying(name):
+    """Tell the core that traffic is CROSSING again, naming the endpoints it crossed on.
+
+    The core has no way to learn this for itself. Everything it can observe -- a frame coming back, a
+    dial that completed, a handshake that was answered -- is something a filtered IP passes while
+    carrying nothing, which is how 5.75.197.201 kept being re-admitted. So the probe that condemns an
+    endpoint is the only thing allowed to clear it, and this is how it says so.
+
+    Sent ONCE, on the red->green edge, so a healthy tunnel writes nothing. Both keys are read from the
+    pool files the core itself publishes, so a verdict that crossed with a rotation names endpoints the
+    core has already left, and is dropped there rather than clearing the wrong one."""
+    if not _is_peer_pool(name):
+        return
+    dst = (_read_peer_pool(name, ".peerpool") or {}).get("active") or ""
+    src = (_read_peer_pool(name, ".srcpool") or {}).get("active") or ""
+    if not dst and not src:
+        return
+    err = _atomic_write_json(_cfg_path(name, ".peerpool.cmd"), {"cmd": "ok", "key": dst, "src": src})
+    logline(f"{name}: probe found traffic crossing again — told the core {dst or '?'} / {src or '?'} are carrying"
+            + (f" [{err}]" if err else ""))
 
 
 def pool_failover(name, alive):
@@ -1666,7 +1688,16 @@ def pool_failover(name, alive):
         st = _fo_state(name)
         if alive is not False:
             st["burns"] = 0       # something crosses again -- whatever we were chasing is over
-            return
+            # Only a MEASURED green is news. Anything else says nothing about any endpoint.
+            recovered, st["red"] = st["red"] and alive is True, False
+        else:
+            st["red"] = True
+    if alive is not False:
+        if recovered:
+            _report_carrying(name)  # the other half of the verdict, off the lock: it writes a file
+        return
+    with _fo_lock:
+        st = _fo_state(name)
         if now < st["settle"] or now < st["cooldown"]:
             return
     with _verdict_lock:
@@ -1696,7 +1727,8 @@ def pool_failover(name, alive):
         st = _fo_state(name)
         # COUNT the asks, do not track WHICH endpoint each landed on. The carrier fails over on its own
         # timers too, so between our decision and the core acting the active endpoint can already have
-        # moved -- keying the walk on identity made it burn the same address repeatedly and never finish.
+        # moved -- keying the WALK on identity made it burn the same address repeatedly and never finish.
+        # The ask itself is still keyed, below; only this counter is blind to which endpoint it hit.
         st["burns"] += 1
         walked = st["burns"] >= combos
         st["settle"] = now + FAILOVER_SETTLE
@@ -1709,9 +1741,13 @@ def pool_failover(name, alive):
         logline(f"{name}: whole destination pool tried and still dead — restoring every entry, "
                 f"standing down for {int(FAILOVER_COOLDOWN)}s")
         return
+    # NAME the endpoint the probe measured, exactly as the ok verdict does. That poll is a one-second
+    # ticker and the probe before it takes most of a second, so every proactive rotate beat is a window
+    # where an unnamed verdict lands on whatever the core moved to -- condemning an endpoint nothing
+    # measured and putting the tunnel back on the one that was.
     # Atomic (tmp+replace): the core polls this file once a second and deletes it, so a half-written
     # one would be read and dropped, and the failover silently lost.
-    err = _atomic_write_json(_cfg_path(name, ".peerpool.cmd"), {"cmd": "fail"})
+    err = _atomic_write_json(_cfg_path(name, ".peerpool.cmd"), {"cmd": "fail", "key": cur})
     logline(f"{name}: probe found nothing crossing — asked the core to fail destination "
             f"{cur or '?'} (ask {st['burns']} of {combos}: {len(addrs)} dst x {max(1, len(srcs))} src)"
             + (f" [{err}]" if err else ""))

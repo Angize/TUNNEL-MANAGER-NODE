@@ -82,8 +82,8 @@ def main():
     # --- confirmed dead -> exactly ONE burn, then silence while it settles -------------------------
     clock["t"] += 4.0
     sweep()
-    want(len(sent) == 1 and sent[0][1] == {"cmd": "fail"},
-         f"a confirmed-dead tunnel must ask the core to fail the destination, got {sent}")
+    want(len(sent) == 1 and sent[0][1] == {"cmd": "fail", "key": "10.0.0.1"},
+         f"a confirmed-dead tunnel must ask the core to fail the destination BY NAME, got {sent}")
     want(sent[0][0].endswith(".peerpool.cmd"),
          f"and it must go to the DESTINATION pool's command file, got {sent[0][0]}")
 
@@ -167,6 +167,70 @@ def main():
          f"{len(sighups) - s0}")
     STATE["srcs"] = []
     want(burns_for("t-nopool", is_pool=False) == 0, "a tunnel with no pool at all must be left alone")
+
+    # --- EVERY ask names the endpoint the probe was measured on, never "whatever is active later" ---
+    # The core reads these on a one-second ticker and its own proactive rotation runs in that gap, so an
+    # unnamed ask lands on whatever the core moved to meanwhile -- condemning an endpoint nothing
+    # measured and dropping the tunnel back onto the one that was. Reproduced live in netns on
+    # 2026-08-05. Its own tunnel, 3 dst x 2 src, so five asks fit before the walk completes.
+    STATE["srcs"] = ["10.9.0.1", "10.9.0.2"]
+    STATE["is_pool"], STATE["hits"] = True, 0
+    clock["t"] += m.FAILOVER_COOLDOWN + m.FAILOVER_SETTLE + 10
+    STATE["active"] = "10.0.0.1"
+    dead_sweeps(2, name="t-key")                      # confirm red, first ask
+    for want_key in ("10.0.0.2", "10.0.0.3", "10.0.0.1"):
+        STATE["active"] = want_key                    # the reading this sweep is measured on
+        n = len(sent)
+        clock["t"] += m.FAILOVER_SETTLE + 1
+        sweep("t-key")
+        got = [o for _, o in sent[n:]]
+        want(len(got) == 1 and got[0].get("key") == want_key,
+             f"an ask measured on {want_key} must name {want_key}, got {got}")
+    STATE["srcs"] = []
+
+    # --- the OTHER half of the verdict: recovery is reported, once, with both keys ----------------
+    # The core cannot learn this for itself -- every signal it can observe is one a filtered IP passes
+    # while carrying nothing. So the probe that condemns an endpoint is the only thing that clears it.
+    STATE["srcs"] = ["10.9.0.1", "10.9.0.2"]
+    STATE["active"], STATE["is_pool"], STATE["hits"] = "10.0.0.2", True, 0
+    clock["t"] += m.FAILOVER_COOLDOWN + m.FAILOVER_SETTLE + 10
+    dead_sweeps(2, name="t-ok")                      # confirm red so there is something to recover from
+    n0 = len(sent)
+    want(n0 > 0 and sent[-1][1]["cmd"] == "fail", f"setup: expected a burn first, got {sent[-1:]}")
+
+    STATE["hits"] = m.PROBE_COUNT                     # traffic crosses again
+    clock["t"] += 4.0
+    sweep("t-ok")
+    got = [o for _, o in sent[n0:]]
+    want(len(got) == 1 and got[0].get("cmd") == "ok",
+         f"a tunnel that came back must tell the core so, exactly once, got {got}")
+    want(got and got[0].get("key") == "10.0.0.2" and got[0].get("src") == "",
+         f"and it must name the endpoints it crossed on, read from the pool files, got {got}")
+
+    n1 = len(sent)
+    clock["t"] += 4.0
+    sweep("t-ok")
+    clock["t"] += 4.0
+    sweep("t-ok")
+    want(len(sent) == n1,
+         f"a tunnel that is simply healthy must write nothing -- the report is edge-triggered, got "
+         f"{len(sent) - n1} extra")
+
+    # A sweep that could not RUN says nothing about any endpoint, so it must reach neither verdict.
+    STATE["hits"] = 0
+    clock["t"] += 4.0
+    sweep("t-ok")
+    clock["t"] += 4.0
+    sweep("t-ok")                                     # red again, and past the settle window
+    n2 = len(sent)
+    real_probe = m.tun_probe
+    m.tun_probe = lambda *a, **k: (0, 0, None)        # the probe socket could not be set up
+    clock["t"] += m.FAILOVER_SETTLE + 4.0
+    sweep("t-ok")
+    m.tun_probe = real_probe
+    want(len(sent) == n2,
+         f"an unmeasurable sweep must produce no verdict at all, got {sent[n2:]}")
+    STATE["srcs"] = []
 
     # --- the memory must not outlive the tunnel ---------------------------------------------------
     m._prune_iface_state(set())
