@@ -1680,18 +1680,25 @@ def pool_failover(name, alive):
         return
     if str(_read_core_cfg(name).get("role") or "") != "client":
         return                    # a server does not choose destinations; only the dialling end may rotate
-    pool = _read_peer_pool(name, ".peerpool")
-    addrs, cur = pool.get("addrs") or [], pool.get("active") or ""
-    if len(addrs) < 2:
-        return                    # one endpoint is not a pool: burning it would only take the tunnel down
+    dst = _read_peer_pool(name, ".peerpool")
+    src = _read_peer_pool(name, ".srcpool")
+    addrs, cur = dst.get("addrs") or [], dst.get("active") or ""
+    srcs = src.get("addrs") or []
+    if len(addrs) < 2 and len(srcs) < 2:
+        return                    # nothing to rotate to on either axis: a burn could only take it down
+    # The pools are NESTED, not parallel: the core walks every destination against the current source,
+    # and only once they are all spent does it burn THAT SOURCE and move to the next -- which is the
+    # attribution, since a source that fails against every destination is the one thing that did not
+    # vary. So the matrix, not the destination list, is what "everything has been tried" means. Stopping
+    # at the destination count quits after the first row and undoes the source burn the core just earned.
+    combos = max(1, len(addrs)) * max(1, len(srcs))
     with _fo_lock:
         st = _fo_state(name)
         # COUNT the asks, do not track WHICH endpoint each landed on. The carrier fails over on its own
         # timers too, so between our decision and the core acting the active endpoint can already have
         # moved -- keying the walk on identity made it burn the same address repeatedly and never finish.
-        # One ask per endpoint is the bound that matters, and it terminates whoever else is steering.
         st["burns"] += 1
-        walked = st["burns"] >= len(addrs)
+        walked = st["burns"] >= combos
         st["settle"] = now + FAILOVER_SETTLE
         if walked:
             st["burns"] = 0
@@ -1706,7 +1713,8 @@ def pool_failover(name, alive):
     # one would be read and dropped, and the failover silently lost.
     err = _atomic_write_json(_cfg_path(name, ".peerpool.cmd"), {"cmd": "fail"})
     logline(f"{name}: probe found nothing crossing — asked the core to fail destination "
-            f"{cur or '?'} (ask {st['burns']} of {len(addrs)})" + (f" [{err}]" if err else ""))
+            f"{cur or '?'} (ask {st['burns']} of {combos}: {len(addrs)} dst x {max(1, len(srcs))} src)"
+            + (f" [{err}]" if err else ""))
 
 
 # --- directional liveness: bytes moving on the tunnel iface, counted per direction, whatever ICMP does ---
