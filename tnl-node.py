@@ -1727,7 +1727,8 @@ def pool_failover(name, alive):
         st = _fo_state(name)
         # COUNT the asks, do not track WHICH endpoint each landed on. The carrier fails over on its own
         # timers too, so between our decision and the core acting the active endpoint can already have
-        # moved -- keying the walk on identity made it burn the same address repeatedly and never finish.
+        # moved -- keying the WALK on identity made it burn the same address repeatedly and never finish.
+        # The ask itself is still keyed, below; only this counter is blind to which endpoint it hit.
         st["burns"] += 1
         walked = st["burns"] >= combos
         st["settle"] = now + FAILOVER_SETTLE
@@ -1740,9 +1741,13 @@ def pool_failover(name, alive):
         logline(f"{name}: whole destination pool tried and still dead — restoring every entry, "
                 f"standing down for {int(FAILOVER_COOLDOWN)}s")
         return
+    # NAME the endpoint the probe measured, exactly as the ok verdict does. That poll is a one-second
+    # ticker and the probe before it takes most of a second, so every proactive rotate beat is a window
+    # where an unnamed verdict lands on whatever the core moved to -- condemning an endpoint nothing
+    # measured and putting the tunnel back on the one that was.
     # Atomic (tmp+replace): the core polls this file once a second and deletes it, so a half-written
     # one would be read and dropped, and the failover silently lost.
-    err = _atomic_write_json(_cfg_path(name, ".peerpool.cmd"), {"cmd": "fail"})
+    err = _atomic_write_json(_cfg_path(name, ".peerpool.cmd"), {"cmd": "fail", "key": cur})
     logline(f"{name}: probe found nothing crossing — asked the core to fail destination "
             f"{cur or '?'} (ask {st['burns']} of {combos}: {len(addrs)} dst x {max(1, len(srcs))} src)"
             + (f" [{err}]" if err else ""))

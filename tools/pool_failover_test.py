@@ -82,8 +82,8 @@ def main():
     # --- confirmed dead -> exactly ONE burn, then silence while it settles -------------------------
     clock["t"] += 4.0
     sweep()
-    want(len(sent) == 1 and sent[0][1] == {"cmd": "fail"},
-         f"a confirmed-dead tunnel must ask the core to fail the destination, got {sent}")
+    want(len(sent) == 1 and sent[0][1] == {"cmd": "fail", "key": "10.0.0.1"},
+         f"a confirmed-dead tunnel must ask the core to fail the destination BY NAME, got {sent}")
     want(sent[0][0].endswith(".peerpool.cmd"),
          f"and it must go to the DESTINATION pool's command file, got {sent[0][0]}")
 
@@ -167,6 +167,26 @@ def main():
          f"{len(sighups) - s0}")
     STATE["srcs"] = []
     want(burns_for("t-nopool", is_pool=False) == 0, "a tunnel with no pool at all must be left alone")
+
+    # --- EVERY ask names the endpoint the probe was measured on, never "whatever is active later" ---
+    # The core reads these on a one-second ticker and its own proactive rotation runs in that gap, so an
+    # unnamed ask lands on whatever the core moved to meanwhile -- condemning an endpoint nothing
+    # measured and dropping the tunnel back onto the one that was. Reproduced live in netns on
+    # 2026-08-05. Its own tunnel, 3 dst x 2 src, so five asks fit before the walk completes.
+    STATE["srcs"] = ["10.9.0.1", "10.9.0.2"]
+    STATE["is_pool"], STATE["hits"] = True, 0
+    clock["t"] += m.FAILOVER_COOLDOWN + m.FAILOVER_SETTLE + 10
+    STATE["active"] = "10.0.0.1"
+    dead_sweeps(2, name="t-key")                      # confirm red, first ask
+    for want_key in ("10.0.0.2", "10.0.0.3", "10.0.0.1"):
+        STATE["active"] = want_key                    # the reading this sweep is measured on
+        n = len(sent)
+        clock["t"] += m.FAILOVER_SETTLE + 1
+        sweep("t-key")
+        got = [o for _, o in sent[n:]]
+        want(len(got) == 1 and got[0].get("key") == want_key,
+             f"an ask measured on {want_key} must name {want_key}, got {got}")
+    STATE["srcs"] = []
 
     # --- the OTHER half of the verdict: recovery is reported, once, with both keys ----------------
     # The core cannot learn this for itself -- every signal it can observe is one a filtered IP passes
