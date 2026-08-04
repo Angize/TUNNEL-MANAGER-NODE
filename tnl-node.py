@@ -1637,6 +1637,78 @@ def settle(name, ok):
         return st["pub"]
 
 
+# --- node-driven destination failover ---------------------------------------------------------------
+FAILOVER_SETTLE = 10.0      # s the verdict is ignored after a jump. The fresh handshake disturbs traffic
+                            # by itself; reading that as failure is a loop that walks the pool in seconds.
+FAILOVER_COOLDOWN = 300.0   # s of standing down after a whole pool was walked and the tunnel is STILL dead
+_fo_lock = threading.Lock()
+_fo = {}                    # tunnel -> {"burns": asks issued this round, "settle", "cooldown"}
+
+
+def _fo_state(name):
+    return _fo.setdefault(name, {"burns": 0, "settle": 0.0, "cooldown": 0.0})
+
+
+def pool_failover(name, alive):
+    """Ask the core to burn the destination when our probe says nothing crosses this tunnel.
+
+    The carrier only learns a destination is dead from its own traffic, which on a crypto tunnel means
+    the stale window plus a full run of failed handshakes. The probe sees the same silence far sooner,
+    and sees it where the payload does.
+
+    What the probe CANNOT do is name the guilty endpoint -- it only knows the tunnel is dead. So the
+    jump is the experiment and the next endpoint is the control: burn, move, let the next sweep judge.
+    If the whole pool has been walked and it is still dead, the destination was never the problem: every
+    entry is restored and this stands down, so a filtered path cannot chew through a healthy pool.
+    """
+    now = time.monotonic()
+    with _fo_lock:
+        st = _fo_state(name)
+        if alive is not False:
+            st["burns"] = 0       # something crosses again -- whatever we were chasing is over
+            return
+        if now < st["settle"] or now < st["cooldown"]:
+            return
+    with _verdict_lock:
+        # A tunnel that was never green goes red on its FIRST bad sweep -- there was no green to protect.
+        # Right for the dot, wrong for burning: the agent restarts on every update, so one momentary
+        # silence in the first sweep after a restart would cost a destination. Burning waits for the
+        # same confirmation the colour gets, whatever the tunnel looked like before.
+        if _verdict.get(name, {}).get("bad", 0) < RED_SWEEPS:
+            return
+    if not _is_peer_pool(name):
+        return
+    if str(_read_core_cfg(name).get("role") or "") != "client":
+        return                    # a server does not choose destinations; only the dialling end may rotate
+    pool = _read_peer_pool(name, ".peerpool")
+    addrs, cur = pool.get("addrs") or [], pool.get("active") or ""
+    if len(addrs) < 2:
+        return                    # one endpoint is not a pool: burning it would only take the tunnel down
+    with _fo_lock:
+        st = _fo_state(name)
+        # COUNT the asks, do not track WHICH endpoint each landed on. The carrier fails over on its own
+        # timers too, so between our decision and the core acting the active endpoint can already have
+        # moved -- keying the walk on identity made it burn the same address repeatedly and never finish.
+        # One ask per endpoint is the bound that matters, and it terminates whoever else is steering.
+        st["burns"] += 1
+        walked = st["burns"] >= len(addrs)
+        st["settle"] = now + FAILOVER_SETTLE
+        if walked:
+            st["burns"] = 0
+            st["cooldown"] = now + FAILOVER_COOLDOWN
+    if walked:
+        # Every endpoint tried and still nothing crosses -> not the endpoints. Hand them all back.
+        _pool_sighup(name, _is_peer_pool, "")
+        logline(f"{name}: whole destination pool tried and still dead — restoring every entry, "
+                f"standing down for {int(FAILOVER_COOLDOWN)}s")
+        return
+    # Atomic (tmp+replace): the core polls this file once a second and deletes it, so a half-written
+    # one would be read and dropped, and the failover silently lost.
+    err = _atomic_write_json(_cfg_path(name, ".peerpool.cmd"), {"cmd": "fail"})
+    logline(f"{name}: probe found nothing crossing — asked the core to fail destination "
+            f"{cur or '?'} (ask {st['burns']} of {len(addrs)})" + (f" [{err}]" if err else ""))
+
+
 # --- directional liveness: bytes moving on the tunnel iface, counted per direction, whatever ICMP does ---
 LIVE_WINDOW = 12.0   # s: a direction counts as live only if its byte counter advanced within this window (short, so a busy tunnel that dies stops looking live quickly)
 _flow_lock = threading.Lock()
@@ -1662,6 +1734,9 @@ def _prune_iface_state(names):
     with _verdict_lock:
         for nm in [n for n in _verdict if n not in names]:
             _verdict.pop(nm, None)
+    with _fo_lock:
+        for nm in [n for n in _fo if n not in names]:
+            _fo.pop(nm, None)   # a recreated tunnel must not inherit a cooldown or a half-walked pool
 
 
 def _flow_sample(name):
@@ -1754,6 +1829,7 @@ def health_of(cfg):
             # but only the whole set can say what fraction is getting through.
             loss = round((sent - hits) * 100.0 / sent, 1)
             alive = settle(name, hits > 0)
+            pool_failover(name, alive)
     return {"up": up, "alive": alive, "dead": alive is False, "rtt_ms": rtt, "loss_pct": loss,
             "rx_still": rx_still, "tx_still": tx_still, "live_win": int(LIVE_WINDOW)}
 
