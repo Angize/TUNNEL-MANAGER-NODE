@@ -168,6 +168,50 @@ def main():
     STATE["srcs"] = []
     want(burns_for("t-nopool", is_pool=False) == 0, "a tunnel with no pool at all must be left alone")
 
+    # --- the OTHER half of the verdict: recovery is reported, once, with both keys ----------------
+    # The core cannot learn this for itself -- every signal it can observe is one a filtered IP passes
+    # while carrying nothing. So the probe that condemns an endpoint is the only thing that clears it.
+    STATE["srcs"] = ["10.9.0.1", "10.9.0.2"]
+    STATE["active"], STATE["is_pool"], STATE["hits"] = "10.0.0.2", True, 0
+    clock["t"] += m.FAILOVER_COOLDOWN + m.FAILOVER_SETTLE + 10
+    dead_sweeps(2, name="t-ok")                      # confirm red so there is something to recover from
+    n0 = len(sent)
+    want(n0 > 0 and sent[-1][1]["cmd"] == "fail", f"setup: expected a burn first, got {sent[-1:]}")
+
+    STATE["hits"] = m.PROBE_COUNT                     # traffic crosses again
+    clock["t"] += 4.0
+    sweep("t-ok")
+    got = [o for _, o in sent[n0:]]
+    want(len(got) == 1 and got[0].get("cmd") == "ok",
+         f"a tunnel that came back must tell the core so, exactly once, got {got}")
+    want(got and got[0].get("key") == "10.0.0.2" and got[0].get("src") == "",
+         f"and it must name the endpoints it crossed on, read from the pool files, got {got}")
+
+    n1 = len(sent)
+    clock["t"] += 4.0
+    sweep("t-ok")
+    clock["t"] += 4.0
+    sweep("t-ok")
+    want(len(sent) == n1,
+         f"a tunnel that is simply healthy must write nothing -- the report is edge-triggered, got "
+         f"{len(sent) - n1} extra")
+
+    # A sweep that could not RUN says nothing about any endpoint, so it must reach neither verdict.
+    STATE["hits"] = 0
+    clock["t"] += 4.0
+    sweep("t-ok")
+    clock["t"] += 4.0
+    sweep("t-ok")                                     # red again, and past the settle window
+    n2 = len(sent)
+    real_probe = m.tun_probe
+    m.tun_probe = lambda *a, **k: (0, 0, None)        # the probe socket could not be set up
+    clock["t"] += m.FAILOVER_SETTLE + 4.0
+    sweep("t-ok")
+    m.tun_probe = real_probe
+    want(len(sent) == n2,
+         f"an unmeasurable sweep must produce no verdict at all, got {sent[n2:]}")
+    STATE["srcs"] = []
+
     # --- the memory must not outlive the tunnel ---------------------------------------------------
     m._prune_iface_state(set())
     with m._fo_lock:

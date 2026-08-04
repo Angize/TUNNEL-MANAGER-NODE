@@ -1646,7 +1646,29 @@ _fo = {}                    # tunnel -> {"burns": asks issued this round, "settl
 
 
 def _fo_state(name):
-    return _fo.setdefault(name, {"burns": 0, "settle": 0.0, "cooldown": 0.0})
+    return _fo.setdefault(name, {"burns": 0, "settle": 0.0, "cooldown": 0.0, "red": False})
+
+
+def _report_carrying(name):
+    """Tell the core that traffic is CROSSING again, naming the endpoints it crossed on.
+
+    The core has no way to learn this for itself. Everything it can observe -- a frame coming back, a
+    dial that completed, a handshake that was answered -- is something a filtered IP passes while
+    carrying nothing, which is how 5.75.197.201 kept being re-admitted. So the probe that condemns an
+    endpoint is the only thing allowed to clear it, and this is how it says so.
+
+    Sent ONCE, on the red->green edge, so a healthy tunnel writes nothing. Both keys are read from the
+    pool files the core itself publishes, so a verdict that crossed with a rotation names endpoints the
+    core has already left, and is dropped there rather than clearing the wrong one."""
+    if not _is_peer_pool(name):
+        return
+    dst = (_read_peer_pool(name, ".peerpool") or {}).get("active") or ""
+    src = (_read_peer_pool(name, ".srcpool") or {}).get("active") or ""
+    if not dst and not src:
+        return
+    err = _atomic_write_json(_cfg_path(name, ".peerpool.cmd"), {"cmd": "ok", "key": dst, "src": src})
+    logline(f"{name}: probe found traffic crossing again — told the core {dst or '?'} / {src or '?'} are carrying"
+            + (f" [{err}]" if err else ""))
 
 
 def pool_failover(name, alive):
@@ -1666,7 +1688,16 @@ def pool_failover(name, alive):
         st = _fo_state(name)
         if alive is not False:
             st["burns"] = 0       # something crosses again -- whatever we were chasing is over
-            return
+            # Only a MEASURED green is news. Anything else says nothing about any endpoint.
+            recovered, st["red"] = st["red"] and alive is True, False
+        else:
+            st["red"] = True
+    if alive is not False:
+        if recovered:
+            _report_carrying(name)  # the other half of the verdict, off the lock: it writes a file
+        return
+    with _fo_lock:
+        st = _fo_state(name)
         if now < st["settle"] or now < st["cooldown"]:
             return
     with _verdict_lock:
