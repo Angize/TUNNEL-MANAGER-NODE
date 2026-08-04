@@ -49,11 +49,12 @@ def main():
     m._atomic_write_json = lambda path, obj: sent.append((os.path.basename(path), obj)) and None
 
     STATE = {"role": "client", "addrs": ["10.0.0.1", "10.0.0.2", "10.0.0.3"], "active": "10.0.0.1",
-             "is_pool": True, "hits": 0}
+             "srcs": [], "is_pool": True, "hits": 0}
     m._is_peer_pool = lambda name: STATE["is_pool"]
     m._read_core_cfg = lambda name: {"role": STATE["role"], "peer_status_path": "x"}
-    m._read_peer_pool = lambda name, suffix: {"active": STATE["active"], "addrs": STATE["addrs"],
-                                              "health": [], "pin": "", "ts": 0}
+    m._read_peer_pool = lambda name, suffix: (
+        {"active": "", "addrs": STATE["srcs"], "health": [], "pin": "", "ts": 0} if suffix == ".srcpool"
+        else {"active": STATE["active"], "addrs": STATE["addrs"], "health": [], "pin": "", "ts": 0})
 
     real_exists, real_flow = os.path.exists, m._flow_sample
     os.path.exists = lambda p: True if str(p).startswith("/sys/class/net/") else real_exists(p)
@@ -142,8 +143,29 @@ def main():
          "a SERVER end must never ask: it does not choose the destination, and two ends both "
          "rotating would chase each other around the pool")
     want(burns_for("t-one", addrs=["10.0.0.9"], active="10.0.0.9") == 0,
-         "a one-endpoint pool must never be burned -- there is nothing to move to, so the burn would "
-         "just take the tunnel down")
+         "a single destination with no source pool must never be burned -- there is nothing to move to "
+         "on either axis, so the burn would just take the tunnel down")
+
+    # --- the walk is the MATRIX, not the destination list -----------------------------------------
+    # The pools are nested: every destination is tried against the current source, and only then is
+    # THAT SOURCE burned and the next one taken. Bounding the walk by the destination count quits after
+    # the first row and hands back the source burn the core had just earned -- which is the one correct
+    # conclusion in the whole sequence.
+    STATE["srcs"] = ["192.168.1.1", "192.168.1.2"]   # 3 destinations x 2 sources = 6 combinations
+    STATE["hits"] = 0
+    n0, s0 = len(sent), len(sighups)
+    for _ in range(9):
+        clock["t"] += m.FAILOVER_SETTLE + 1
+        sweep("t-matrix")
+    # N combinations take N-1 asks, not N: each ask MOVES you from one combination to the next, so by
+    # the time the last one is standing there is nothing left to ask for -- that is where it gives up.
+    want(len(sent) - n0 == 5,
+         f"with 3 destinations and 2 sources the walk must cover 6 combinations in 5 asks, not stop "
+         f"after the destination list -- got {len(sent) - n0}")
+    want(len(sighups) - s0 == 1,
+         f"and it must hand everything back exactly once, at the END of the matrix, got "
+         f"{len(sighups) - s0}")
+    STATE["srcs"] = []
     want(burns_for("t-nopool", is_pool=False) == 0, "a tunnel with no pool at all must be left alone")
 
     # --- the memory must not outlive the tunnel ---------------------------------------------------
