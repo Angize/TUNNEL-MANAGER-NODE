@@ -637,7 +637,7 @@ def _core_port(cfg):
 
 
 # Carrier-header bytes each raw encapsulation profile prepends, mirroring the core's rawHeaderLens.
-RAW_HEADER_LEN = {"bip": 0, "ipip": 0, "etherip": 2, "ipcomp": 4, "gre": 4, "icmp": 8, "udp": 8,
+RAW_HEADER_LEN = {"bare": 0, "ipip": 0, "etherip": 2, "ipcomp": 4, "gre": 4, "icmp": 8, "udp": 8,
                   "esp": 8, "l2tpv3": 8, "tcp": 20, "ah": 24}
 
 _TUNING_INT_KEYS = ("dead_retest_secs", "pin_ttl_secs", "data_fail_threshold", "data_good_window_secs",
@@ -699,7 +699,7 @@ def _core_config(cfg):
     cipher = str(cfg.get("cipher") or "auto")   # match the panel's default so the MTU/crypto sizing agrees
     crypto_on = bool(cfg.get("psk")) and cipher != "none"  # a psk with cipher=none is NOT encryption
     transport = str(cfg.get("transport") or "udp").lower()
-    raw_profile = str(cfg.get("raw_profile") or "bip").lower()
+    raw_profile = str(cfg.get("raw_profile") or "bare").lower()
     obfs = bool(cfg.get("obfs")) and crypto_on   # obfs is meaningless without the AEAD key
     # MTU budget = outer headers + core framing + obfs padding + AEAD (nonce+tag) + wire mask salt.
     flux_carrier = str(cfg.get("flux_carrier") or "udp").lower()
@@ -709,7 +709,7 @@ def _core_config(cfg):
         # TUNNEL-MANAGER/tools/tuning_consistency.py compares the two tables.
         outer = 20 + RAW_HEADER_LEN.get(raw_profile, 0)
     elif transport == "spoof":
-        # Spoof forges the whole outer IPv4 header itself (IP_HDRINCL), bip-like: IP20, no L4 header.
+        # Spoof forges the whole outer IPv4 header itself (IP_HDRINCL), bare-like: IP20, no L4 header.
         outer = 20
     elif transport == "flux":
         # IP20 + the carrier header. udp adds 8. The raw carrier adds none. stun is NOT 8+20: buildSTUN
@@ -799,17 +799,25 @@ def _core_config(cfg):
             corecfg["peer_src_ips"] = _psrc
     if transport == "raw":
         corecfg["raw_profile"] = raw_profile
-        # bip-only: override the outer IP protocol number (bare, no L4 header) to slip past a
-        # protocol whitelist — e.g. 58 (ICMPv6). 0/absent keeps bip's native 253.
+        # bare-only: override the outer IP protocol number (bare, no L4 header) to slip past a
+        # protocol whitelist — e.g. 58 (ICMPv6). 0/absent keeps bare's native 253.
         try:
             _rp = int(cfg.get("raw_proto") or 0)
         except (TypeError, ValueError):
             _rp = 0
-        if raw_profile == "bip" and 1 <= _rp <= 255:
+        if raw_profile == "bare" and 1 <= _rp <= 255:
             corecfg["raw_proto"] = _rp
+        # udp/tcp only: the SERVER port stamped on the forged L4 header. No socket binds it; it is what
+        # a middlebox reads, and the default 443 makes the udp profile look like QUIC.
+        try:
+            _rport = int(cfg.get("raw_port") or 0)
+        except (TypeError, ValueError):
+            _rport = 0
+        if raw_profile in ("udp", "tcp") and 1 <= _rport <= 65535:
+            corecfg["raw_port"] = _rport
     if transport == "spoof":
-        # The spoof carrier is bip-like (no raw_profile — the core forces it); it only carries the
-        # optional outer IP protocol number override, exactly like a bip raw carrier.
+        # The spoof carrier is bare-like (no raw_profile — the core forces it); it only carries the
+        # optional outer IP protocol number override, exactly like a bare raw carrier.
         try:
             _rp = int(cfg.get("raw_proto") or 0)
         except (TypeError, ValueError):
@@ -2509,17 +2517,23 @@ def op_tunnel(d):
                     raise ValueError("bad edge_ip")
                 obj["edge_ip"] = edge
         if transport == "raw":        # raw-IP carrier: which protocol the sealed frame is wrapped in
-            profile = str(d.get("raw_profile") or "bip").strip().lower()
-            if profile not in ("bip", "ipip", "gre", "icmp", "udp", "tcp", "esp"):
+            profile = str(d.get("raw_profile") or "bare").strip().lower()
+            if profile not in RAW_HEADER_LEN:   # the roster the core registers, guarded across repos
                 raise ValueError("bad raw_profile")
             obj["raw_profile"] = profile
-            if profile == "bip":      # optional custom IP protocol number for the bare bip carrier
+            if profile == "bare":      # optional custom IP protocol number for the headerless carrier
                 rproto = int(d.get("raw_proto") or 0)
                 if rproto and not (1 <= rproto <= 255):
                     raise ValueError("bad raw_proto")
                 if rproto:
                     obj["raw_proto"] = rproto
-        if transport == "spoof":      # standalone IP-spoofing carrier: bip-like, so only the proto override (no profile)
+            if profile in ("udp", "tcp"):   # the forged server port; only these two carry ports
+                rport = int(d.get("raw_port") or 0)
+                if rport and not (1 <= rport <= 65535):
+                    raise ValueError("bad raw_port")
+                if rport:
+                    obj["raw_port"] = rport
+        if transport == "spoof":      # standalone IP-spoofing carrier: bare-like, so only the proto override (no profile)
             rproto = int(d.get("raw_proto") or 0)
             if rproto and not (1 <= rproto <= 255):
                 raise ValueError("bad raw_proto")
