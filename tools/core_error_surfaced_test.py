@@ -55,7 +55,7 @@ def load_node():
 
 def base_req():
     return {"type": "core", "self_ip": "10.0.0.1", "peer_ip": "10.0.0.2",
-            "subnet": "10.200.0.0/24", "id": 1, "name": "cor1", "iface": "eth0",
+            "subnet": "10.200.0.0/24", "id": 1, "name": "cor1", "iface": "eth0", "host": 1,
             "role": "client", "transport": "ws", "psk": "a-sufficiently-long-preshared-key",
             "enabled": True}
 

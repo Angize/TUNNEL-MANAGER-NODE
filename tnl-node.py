@@ -142,17 +142,19 @@ def ip2int(s):
     return int(ipaddress.IPv4Address(s))
 
 
-def derive_tunnel_ip(ttype, local_ip, remote_ip, subnet):
-    """Same rule as the fleet: smaller public IP => .1, larger => .2 (never a custom host)."""
+def derive_tunnel_ip(ttype, subnet, host):
+    """This end's overlay address. `host` is 1 or 2 and comes from the PANEL, which gives .1 to the
+    server and .2 to the client; the node does not choose. Deriving it here from the two public IPs made
+    the overlay address depend on which provider handed out the larger address, and the two ends had to
+    agree on that by luck rather than by being told."""
     parts = subnet.split("/")
     base = parts[0]
     prefix = parts[1] if len(parts) > 1 else ("64" if ttype == "sit" else "24")   # never IndexError on a prefix-less subnet
-    host = "1" if ip2int(local_ip) < ip2int(remote_ip) else "2"
     if ttype == "sit":
         # build the host address with ipaddress so full-form / non-'::'-terminated v6 subnets
         # don't yield a malformed double-'::' string that `ip -6 addr add` silently rejects
         net = ipaddress.ip_network(f"{base}/{prefix}", strict=False)
-        return f"{net.network_address + int(host)}/{net.prefixlen}"
+        return f"{net.network_address + host}/{net.prefixlen}"
     return f"{base.rsplit('.', 1)[0]}.{host}/{prefix}"
 
 # ----------------------------------------------------------------------------- config IO
@@ -213,7 +215,7 @@ def used_ids():
 
 
 def unique_name(ttype, tid):
-    name = f"{ttype}{tid}"
+    name = f"core{tid}" if ttype == "core" else f"native{tid}"
     if os.path.exists(os.path.join(CONFIG_DIR, name + ".json")):
         return None
     rc, _, _ = run(["ip", "link", "show", name])
@@ -1058,7 +1060,7 @@ def _core_last_error(name, lines=40):
     caller keeps its old message for the case it was actually written for (the core NOT installed).
 
     The read is scoped to the CURRENT invocation. Without that it spanned every run the unit ever had,
-    and tunnel names are recycled (core<id> over ids 1..254), so a long-dead tunnel's rejection could
+    and tunnel names are recycled (core<id> over ids 1..255), so a long-dead tunnel's rejection could
     be quoted as this one's reason — with the true message ("the core is not installed") suppressed
     because something quotable was found.
     """
@@ -2282,7 +2284,7 @@ def op_list(d):
 
 def op_tunnel(d):
     """Create ONE side of a node<->node tunnel (central calls this on both nodes)."""
-    _require(d, ["type", "self_ip", "peer_ip", "subnet"])
+    _require(d, ["type", "self_ip", "peer_ip", "subnet", "host"])
     ttype = d["type"]
     if ttype not in ("vxlan", "gre", "sit", "ipip", "l2tpv3", "fou", "ipsec", "core"):
         raise ValueError("bad type")
@@ -2297,15 +2299,18 @@ def op_tunnel(d):
     if not valid_cidr(subnet, want6=(ttype == "sit")):
         raise ValueError("bad subnet")
     tid = int(d.get("id") or 0)
-    if not 1 <= tid <= 254:
-        raise ValueError("id out of range (1-254)")
+    if not 1 <= tid <= 255:
+        raise ValueError("id out of range (1-255)")
+    host = int(d["host"])
+    if host not in (1, 2):
+        raise ValueError("host must be 1 (server) or 2 (client)")
     iface = d.get("iface") or iface_for_ip(self_ip)
     if not iface or not IFACE_RE.match(iface):
         raise ValueError("no local interface for that IP")
     name = d.get("name") or unique_name(ttype, tid)
     if not name or not NAME_RE.match(name):
         raise ValueError("bad name")
-    tunnel_ip = derive_tunnel_ip(ttype, self_ip, peer_ip, subnet)
+    tunnel_ip = derive_tunnel_ip(ttype, subnet, host)
     obj = {"name": name, "type": ttype, "id": tid, "iface": iface,
            "remote_ip": peer_ip, "tunnel_ip": tunnel_ip, "local_ip": self_ip}
     old = read_config(name)   # snapshot the prior build ONCE (serialized under _apply_lock, no write until below):
