@@ -61,7 +61,7 @@ def load_node():
 def cfg_for(pooled):
     """A stored raw SERVER config, as op_tunnel would have persisted it."""
     c = {"type": "core", "name": "cor7", "id": 7, "role": "server", "transport": "raw",
-         "raw_profile": "bip", "iface": "eth0", "local_ip": "10.0.0.1",
+         "raw_profile": "bare", "iface": "eth0", "local_ip": "10.0.0.1",
          "self_ip": "10.0.0.1", "peer_ip": "10.0.0.2", "subnet": "10.200.0.0/24",
          "tunnel_ip": "10.200.0.1/30", "mtu": 1400,
          "psk": "a-sufficiently-long-preshared-key", "port": 20077, "enabled": True}
