@@ -1649,30 +1649,46 @@ def _fo_state(name):
     return _fo.setdefault(name, {"burns": 0, "settle": 0.0, "cooldown": 0.0, "red": False})
 
 
-def _report_carrying(name):
-    """Tell the core that traffic is CROSSING again, naming the endpoints it crossed on.
+def _condemned(pool, addr):
+    """True when `addr` carries a not-healthy record in `pool` -- suspect or dead, either way sidelined."""
+    return bool(addr) and any(h.get("key") == addr and h.get("state") != "healthy"
+                              for h in (pool.get("health") or []))
+
+
+def _report_carrying(name, edge):
+    """Tell the core that traffic is CROSSING, naming the endpoints it crossed on.
 
     The core has no way to learn this for itself. Everything it can observe -- a frame coming back, a
     dial that completed, a handshake that was answered -- is something a filtered IP passes while
     carrying nothing, which is how 5.75.197.201 kept being re-admitted. So the probe that condemns an
     endpoint is the only thing allowed to clear it, and this is how it says so.
 
-    Sent ONCE, on the red->green edge, so a healthy tunnel writes nothing. Both keys are read from the
-    pool files the core itself publishes, so a verdict that crossed with a rotation names endpoints the
-    core has already left, and is dropped there rather than clearing the wrong one."""
+    Two occasions, not one. `edge` is the red->green recovery. The other is an endpoint that is CARRYING
+    while its pool still has it condemned: a burn always rotates AWAY from what it burns, so the pair a
+    recovery lands on is never the pair that was burned. The burned one only returns once its backoff
+    lapses, and by then the tunnel is already green -- no edge left to report on, and it stays condemned
+    for good while visibly carrying traffic. A healthy tunnel on healthy endpoints still writes nothing.
+
+    Both keys are read from the pool files the core itself publishes, in ONE snapshot, so the endpoints
+    named are the ones the burned-check was made against."""
     if not _is_peer_pool(name):
         return
-    dst = (_read_peer_pool(name, ".peerpool") or {}).get("active") or ""
-    src = (_read_peer_pool(name, ".srcpool") or {}).get("active") or ""
+    dpool, spool = _read_peer_pool(name, ".peerpool"), _read_peer_pool(name, ".srcpool")
+    dst, src = dpool.get("active") or "", spool.get("active") or ""
     if not dst and not src:
         return
+    if not edge and not (_condemned(dpool, dst) or _condemned(spool, src)):
+        return
     err = _atomic_write_json(_cfg_path(name, ".peerpool.cmd"), {"cmd": "ok", "key": dst, "src": src})
-    logline(f"{name}: probe found traffic crossing again — told the core {dst or '?'} / {src or '?'} are carrying"
+    logline(f"{name}: probe found traffic crossing — told the core {dst or '?'} / {src or '?'} are carrying"
             + (f" [{err}]" if err else ""))
 
 
-def pool_failover(name, alive):
+def pool_failover(name, alive, crossed):
     """Ask the core to burn the destination when our probe says nothing crosses this tunnel.
+
+    `crossed` is THIS sweep's raw measurement, not the published colour: settle() keeps a green tunnel
+    green through a bad sweep, and a smoothed green measured nothing, so it may never clear a burn.
 
     The carrier only learns a destination is dead from its own traffic, which on a crypto tunnel means
     the stale window plus a full run of failed handshakes. The probe sees the same silence far sooner,
@@ -1693,8 +1709,8 @@ def pool_failover(name, alive):
         else:
             st["red"] = True
     if alive is not False:
-        if recovered:
-            _report_carrying(name)  # the other half of the verdict, off the lock: it writes a file
+        if crossed:
+            _report_carrying(name, recovered)  # the other half of the verdict, off the lock: it writes a file
         return
     with _fo_lock:
         st = _fo_state(name)
@@ -1873,7 +1889,7 @@ def health_of(cfg):
             # but only the whole set can say what fraction is getting through.
             loss = round((sent - hits) * 100.0 / sent, 1)
             alive = settle(name, hits > 0)
-            pool_failover(name, alive)
+            pool_failover(name, alive, hits > 0)
     return {"up": up, "alive": alive, "dead": alive is False, "rtt_ms": rtt, "loss_pct": loss,
             "rx_still": rx_still, "tx_still": tx_still, "live_win": int(LIVE_WINDOW)}
 
