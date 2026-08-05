@@ -636,6 +636,10 @@ def _core_port(cfg):
     return int(cfg.get("port") or (20000 + int(cfg["id"])))
 
 
+# Carrier-header bytes each raw encapsulation profile prepends, mirroring the core's rawHeaderLens.
+RAW_HEADER_LEN = {"bip": 0, "ipip": 0, "etherip": 2, "ipcomp": 4, "gre": 4, "icmp": 8, "udp": 8,
+                  "esp": 8, "l2tpv3": 8, "tcp": 20, "ah": 24}
+
 _TUNING_INT_KEYS = ("dead_retest_secs", "pin_ttl_secs", "data_fail_threshold", "data_good_window_secs",
                     "idle_mult", "idle_min_secs", "session_stale_mult", "session_stale_min_secs",
                     # flux_rotate_default_secs intentionally omitted: every flux tunnel carries an explicit
@@ -700,8 +704,10 @@ def _core_config(cfg):
     # MTU budget = outer headers + core framing + obfs padding + AEAD (nonce+tag) + wire mask salt.
     flux_carrier = str(cfg.get("flux_carrier") or "udp").lower()
     if transport == "raw":
-        # IP20 + the profile's carrier header (bip/ipip add none; gre 4; icmp/udp 8; tcp 20).
-        outer = 20 + {"bip": 0, "ipip": 0, "gre": 4, "icmp": 8, "udp": 8, "tcp": 20, "esp": 8}.get(raw_profile, 0)
+        # IP20 + the profile's carrier header. A COPY of the core's rawHeaderLens; a profile missing here
+        # silently under-counts the overhead and every full-size packet fragments, so
+        # TUNNEL-MANAGER/tools/tuning_consistency.py compares the two tables.
+        outer = 20 + RAW_HEADER_LEN.get(raw_profile, 0)
     elif transport == "spoof":
         # Spoof forges the whole outer IPv4 header itself (IP_HDRINCL), bip-like: IP20, no L4 header.
         outer = 20
