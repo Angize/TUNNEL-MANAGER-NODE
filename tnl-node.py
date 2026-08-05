@@ -1201,9 +1201,6 @@ def build_core(cfg):
     systemd unit with Restart=always. Then wait for the TUN to appear so op_tunnel's verify sees it."""
     name = cfg["name"]
     _ensure_core()
-    # A previous core for this name may have been killed rather than closed, leaving its anti-leak rules
-    # behind. Sweep before launching, or the new core appends a second copy of every rule beside them.
-    _sweep_owned_rules(name)
     # Drop any stale status + select-edge sidecar from a previous core with this name, so a rebuild
     # never shows a stale pool state or replays a leftover "pin this edge" command on first tick.
     for p in _core_status_paths(name):
@@ -1221,6 +1218,10 @@ def build_core(cfg):
     unit = _core_unit(name)
     run(["systemctl", "stop", unit])
     run(["systemctl", "reset-failed", unit])
+    # Only now: a core that is still RUNNING owns its anti-leak rules, and sweeping them out from under it
+    # leaves the kernel free to answer the peer with the RST / ICMP those rules exist to swallow. Once the
+    # unit is stopped, an orderly core has already removed its own and whatever is left is a killed core's.
+    _sweep_owned_rules(name)
     run(["systemd-run", "--unit", unit, "--collect",
          "-p", "Restart=always", "-p", "RestartSec=3",
          CORE_BIN, "--config", path])
