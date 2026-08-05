@@ -2400,7 +2400,7 @@ def op_tunnel(d):
                         except (TypeError, ValueError):
                             raise ValueError("bad %s" % _k)
                         if _v < 0 or _v > _up_max[_k]:
-                            raise ValueError("%s باید بین ۰ و %d باشد (۰ = پیش‌فرض)" % (_k, _up_max[_k]))
+                            raise ValueError("%s باید بین 0 و %d باشد (0 = پیش‌فرض)" % (_k, _up_max[_k]))
                         if _v:
                             obj[_k] = _v
             if _as_bool(d.get("ws_tls")):
