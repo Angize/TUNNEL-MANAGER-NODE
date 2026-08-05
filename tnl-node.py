@@ -23,6 +23,7 @@ import ipaddress
 import json
 import os
 import select
+import shlex
 import py_compile
 import re
 import secrets
@@ -1200,6 +1201,9 @@ def build_core(cfg):
     systemd unit with Restart=always. Then wait for the TUN to appear so op_tunnel's verify sees it."""
     name = cfg["name"]
     _ensure_core()
+    # A previous core for this name may have been killed rather than closed, leaving its anti-leak rules
+    # behind. Sweep before launching, or the new core appends a second copy of every rule beside them.
+    _sweep_owned_rules(name)
     # Drop any stale status + select-edge sidecar from a previous core with this name, so a rebuild
     # never shows a stale pool state or replays a leftover "pin this edge" command on first tick.
     for p in _core_status_paths(name):
@@ -1226,6 +1230,47 @@ def build_core(cfg):
         time.sleep(0.1)
 
 
+# ---------------------------------------------------------------- orphaned firewall rules
+# The core removes its own anti-leak rules on Close(), which covers an orderly stop and nothing else.
+# A SIGKILL, a crash or a reboot leaves them behind, and since they go in with -A and come out by
+# matching their own exact spec, an orphan is invisible to the next core and a duplicate lands beside
+# it. Found on the operator's boxes: a --dport 4500 rule from a tunnel that no longer existed, and the
+# same ICMP rule installed twice.
+#
+# Every rule the core installs now carries `-m comment --comment "tnl:<tun>"`, and tun_name IS the
+# tunnel name, so an orphan is attributable. Swept before a build and after a stop, which between them
+# cover rebuild, edit, disable, delete and crash-then-rebuild.
+RULE_OWNER_PREFIX = "tnl:"
+
+
+def _sweep_owned_rules(name):
+    """Delete every firewall rule tagged as owned by tunnel `name`. Returns how many went."""
+    if not NAME_RE.match(name or ""):
+        return 0
+    tag = '--comment "%s%s"' % (RULE_OWNER_PREFIX, name)   # quoted: tnl:core4 must not match tnl:core42
+    removed = 0
+    for table in ("filter", "raw", "mangle", "nat"):
+        try:
+            out = subprocess.run(["iptables-save", "-t", table], capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if out.returncode != 0:
+            continue
+        for line in out.stdout.splitlines():
+            if not line.startswith("-A ") or tag not in line:
+                continue
+            try:
+                args = shlex.split(line)
+            except ValueError:
+                continue
+            args[0] = "-D"                                  # -A CHAIN ... -> -D CHAIN ...
+            run(["iptables", "-t", table] + args)
+            removed += 1
+    if removed:
+        logline("%s: swept %d orphaned firewall rule(s) tagged %s%s" % (name, removed, RULE_OWNER_PREFIX, name))
+    return removed
+
+
 def _core_stop(name):
     """Stop the core unit for `name` and clear its live status/pool files (so a stopped tunnel's state is
     never rendered as "live", and no leftover pin command survives). The shared body of a full teardown
@@ -1233,6 +1278,7 @@ def _core_stop(name):
     unit = _core_unit(name)
     run(["systemctl", "stop", unit])       # kills the core -> its non-persistent TUN disappears
     run(["systemctl", "reset-failed", unit])
+    _sweep_owned_rules(name)               # whatever it did not remove itself is now certainly nobody's
     for p in _core_status_paths(name):
         try:
             os.remove(p)
