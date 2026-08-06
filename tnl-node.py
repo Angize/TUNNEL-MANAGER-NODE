@@ -150,13 +150,12 @@ def derive_tunnel_ip(ttype, subnet, host):
     agree on that by luck rather than by being told."""
     parts = subnet.split("/")
     base = parts[0]
-    prefix = parts[1] if len(parts) > 1 else ("64" if ttype == "sit" else "24")   # never IndexError on a prefix-less subnet
-    if ttype == "sit":
-        # build the host address with ipaddress so full-form / non-'::'-terminated v6 subnets
-        # don't yield a malformed double-'::' string that `ip -6 addr add` silently rejects
-        net = ipaddress.ip_network(f"{base}/{prefix}", strict=False)
-        return f"{net.network_address + host}/{net.prefixlen}"
-    return f"{base.rsplit('.', 1)[0]}.{host}/{prefix}"
+    prefix = parts[1] if len(parts) > 1 else ("64" if ttype == "sit" else "30")   # never IndexError on a prefix-less subnet
+    # ONE branch for both families: host 1 and 2 are the first two addresses of the network, whatever its
+    # size. v4 used to string-splice the last octet, which only worked while every tunnel owned a whole
+    # /24 -- it would have silently produced an address outside a /30.
+    net = ipaddress.ip_network(f"{base}/{prefix}", strict=False)
+    return f"{net.network_address + host}/{net.prefixlen}"
 
 # ----------------------------------------------------------------------------- config IO
 
@@ -533,7 +532,7 @@ def build_l2tp(cfg):
 
 
 def _fou_port(cfg):
-    return int(cfg.get("port") or (20000 + int(cfg["id"])))
+    return int(cfg.get("port") or 20000)
 
 
 def build_fou(cfg):
@@ -636,7 +635,7 @@ def _ensure_core():
 
 
 def _core_port(cfg):
-    return int(cfg.get("port") or (20000 + int(cfg["id"])))
+    return int(cfg.get("port") or 20000)
 
 
 # Carrier-header bytes each raw encapsulation profile prepends, mirroring the core's rawHeaderLens.
@@ -1561,12 +1560,14 @@ def rotation_loop():
 # ----------------------------------------------------------------------------- health / stats
 
 def peer_of(tunnel_ip, ttype):
-    self_ip = tunnel_ip.split("/")[0]
-    if ttype == "sit":
-        base = self_ip.rpartition(":")[0]
-        return base + ":2" if self_ip.rsplit(":", 1)[1] == "1" else base + ":1"
-    base, last = self_ip.rsplit(".", 1)
-    return f"{base}.2" if last == "1" else f"{base}.1"
+    """The OTHER end's overlay address. The two ends are hosts 1 and 2 of the same network, so this is
+    "the one I am not" -- computed from the network, not by splicing the last octet, which only held
+    while a tunnel owned a whole /24 and would land outside a /30."""
+    addr = tunnel_ip.split("/")[0]
+    prefix = tunnel_ip.split("/")[1] if "/" in tunnel_ip else ("64" if ttype == "sit" else "30")
+    net = ipaddress.ip_network(f"{addr}/{prefix}", strict=False)
+    mine = int(ipaddress.ip_address(addr)) - int(net.network_address)
+    return str(net.network_address + (3 - mine))
 
 
 # --- the liveness verdict: one TCP handshake sent THROUGH the tunnel ---------------------------------
@@ -2346,8 +2347,8 @@ def op_tunnel(d):
     if not valid_cidr(subnet, want6=(ttype == "sit")):
         raise ValueError("bad subnet")
     tid = int(d.get("id") or 0)
-    if not 1 <= tid <= 255:
-        raise ValueError("id out of range (1-255)")
+    if not 1 <= tid <= 4194303:   # a /30 per tunnel out of 10/8; the panel owns the real allocation
+        raise ValueError("id out of range (1-4194303)")
     host = int(d["host"])
     if host not in (1, 2):
         raise ValueError("host must be 1 (server) or 2 (client)")
