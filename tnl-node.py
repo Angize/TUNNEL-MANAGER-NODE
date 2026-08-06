@@ -150,7 +150,7 @@ def derive_tunnel_ip(ttype, subnet, host):
     agree on that by luck rather than by being told."""
     parts = subnet.split("/")
     base = parts[0]
-    prefix = parts[1] if len(parts) > 1 else ("64" if ttype == "sit" else "30")   # never IndexError on a prefix-less subnet
+    prefix = parts[1] if len(parts) > 1 else ("64" if ttype == "sit" else "24")   # never IndexError on a prefix-less subnet
     # ONE branch for both families: host 1 and 2 are the first two addresses of the network, whatever its
     # size. v4 used to string-splice the last octet, which only worked while every tunnel owned a whole
     # /24 -- it would have silently produced an address outside a /30.
@@ -1564,7 +1564,7 @@ def peer_of(tunnel_ip, ttype):
     "the one I am not" -- computed from the network, not by splicing the last octet, which only held
     while a tunnel owned a whole /24 and would land outside a /30."""
     addr = tunnel_ip.split("/")[0]
-    prefix = tunnel_ip.split("/")[1] if "/" in tunnel_ip else ("64" if ttype == "sit" else "30")
+    prefix = tunnel_ip.split("/")[1] if "/" in tunnel_ip else ("64" if ttype == "sit" else "24")
     net = ipaddress.ip_network(f"{addr}/{prefix}", strict=False)
     mine = int(ipaddress.ip_address(addr)) - int(net.network_address)
     return str(net.network_address + (3 - mine))
@@ -2347,8 +2347,8 @@ def op_tunnel(d):
     if not valid_cidr(subnet, want6=(ttype == "sit")):
         raise ValueError("bad subnet")
     tid = int(d.get("id") or 0)
-    if not 1 <= tid <= 4194303:   # a /30 per tunnel out of 10/8; the panel owns the real allocation
-        raise ValueError("id out of range (1-4194303)")
+    if not 1 <= tid <= 65535:   # one /24 per tunnel out of 10/8; the panel owns the real allocation
+        raise ValueError("id out of range (1-65535)")
     host = int(d["host"])
     if host not in (1, 2):
         raise ValueError("host must be 1 (server) or 2 (client)")

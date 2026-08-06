@@ -50,7 +50,7 @@ def load(tmp):
 
 def req(**kw):
     d = {"type": "gre", "self_ip": "10.0.0.1", "peer_ip": "10.0.0.2",
-         "subnet": "10.0.0.168/30", "id": 42, "name": "native42", "iface": "eth0", "host": 1}
+         "subnet": "192.168.42.0/24", "id": 42, "name": "native42", "iface": "eth0", "host": 1}
     d.update(kw)
     return d
 
@@ -59,7 +59,7 @@ def main():
     tmp = tempfile.mkdtemp()
 
     print("== 1) the address is the host the panel asked for ==")
-    for host, want in ((1, "10.0.0.169/30"), (2, "10.0.0.170/30")):
+    for host, want in ((1, "192.168.42.1/24"), (2, "192.168.42.2/24")):
         m = load(tmp)
         m.op_tunnel(req(host=host))
         got = (m.read_config("native42") or {}).get("tunnel_ip")
@@ -71,7 +71,7 @@ def main():
         m = load(tmp)
         m.op_tunnel(req(self_ip=self_ip, peer_ip=peer_ip, host=1))
         seen.add((m.read_config("native42") or {}).get("tunnel_ip"))
-    check(seen == {"10.0.0.169/30"},
+    check(seen == {"192.168.42.1/24"},
           "host=1 gives .1 whichever public IP is the larger, got %s" % sorted(seen))
 
     print("\n== 3) a missing or nonsense host is refused, never guessed ==")
@@ -99,7 +99,7 @@ def main():
           "%s <-> %s are each other's peer (peer_of is what the tun probe aims at)" % (a, b))
 
     print("\n== 5) the id range follows the ADDRESS SPACE, not an octet ==")
-    for tid, ok_want in ((1, True), (255, True), (256, True), (4194303, True), (0, False), (4194304, False)):
+    for tid, ok_want in ((1, True), (255, True), (256, True), (65535, True), (0, False), (65536, False)):
         m = load(tmp)
         try:
             m.op_tunnel(req(id=tid, name="native%d" % tid))
