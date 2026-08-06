@@ -1717,6 +1717,37 @@ def _fo_state(name):
     return _fo.setdefault(name, {"burns": 0, "settle": 0.0, "cooldown": 0.0, "red": False})
 
 
+WS_ACTIVE_SEP = " · "   # what wsPool.writeStatus joins the active edge and SNI with
+
+
+def _read_ws_pool(name):
+    """Parse the ws edge pool's status file into {active_ip, active_sni, ips, snis, health}. The core
+    publishes one flat health list tagged by axis; split it here so a verdict can be sized and keyed on
+    the right one. Empty (well-formed) when the file is missing or the core has not written yet."""
+    empty = {"ip": "", "sni": "", "ips": [], "snis": [], "health": []}
+    try:
+        with open(_cfg_path(name, ".status")) as f:
+            st = json.load(f)
+    except (OSError, ValueError):
+        return empty
+    if not isinstance(st, dict):
+        return empty
+    health = [h for h in (st.get("health") or [])[:256] if isinstance(h, dict) and h.get("key")]
+    active = str(st.get("active") or "")
+    ip, _, sni = active.partition(WS_ACTIVE_SEP)
+    return {"ip": ip, "sni": sni,
+            "ips": [str(h["key"]) for h in health if str(h.get("kind")) != "sni"],
+            "snis": [str(h["key"]) for h in health if str(h.get("kind")) == "sni"],
+            "health": health}
+
+
+def _ws_condemned(pool, kind, key):
+    """True when `key` on axis `kind` carries a not-healthy record -- suspect or dead, either way sidelined."""
+    return bool(key) and any(str(h.get("key")) == key and str(h.get("state")) != "healthy"
+                             and (str(h.get("kind")) == "sni") == (kind == "sni")
+                             for h in (pool.get("health") or []))
+
+
 def _condemned(pool, addr):
     """True when `addr` carries a not-healthy record in `pool` -- suspect or dead, either way sidelined."""
     return bool(addr) and any(h.get("key") == addr and h.get("state") != "healthy"
@@ -1739,6 +1770,17 @@ def _report_carrying(name, edge):
 
     Both keys are read from the pool files the core itself publishes, in ONE snapshot, so the endpoints
     named are the ones the burned-check was made against."""
+    if _is_ws_pool(name):
+        w = _read_ws_pool(name)
+        ip, sni = w["ip"], w["sni"]
+        if not ip and not sni:
+            return
+        if not edge and not (_ws_condemned(w, "ip", ip) or _ws_condemned(w, "sni", sni)):
+            return
+        err = _atomic_write_json(_cfg_path(name, ".status.cmd"), {"cmd": "ok", "ip": ip, "sni": sni})
+        logline(f"{name}: probe found traffic crossing — told the core {ip or '?'} / {sni or '?'} are carrying"
+                + (f" [{err}]" if err else ""))
+        return
     if not _is_peer_pool(name):
         return
     dpool, spool = _read_peer_pool(name, ".peerpool"), _read_peer_pool(name, ".srcpool")
@@ -1791,10 +1833,13 @@ def pool_failover(name, alive, crossed):
         # same confirmation the colour gets, whatever the tunnel looked like before.
         if _verdict.get(name, {}).get("bad", 0) < RED_SWEEPS:
             return
-    if not _is_peer_pool(name):
-        return
     if str(_read_core_cfg(name).get("role") or "") != "client":
         return                    # a server does not choose destinations; only the dialling end may rotate
+    if _is_ws_pool(name):
+        _ws_failover(name, now)
+        return
+    if not _is_peer_pool(name):
+        return
     dst = _read_peer_pool(name, ".peerpool")
     src = _read_peer_pool(name, ".srcpool")
     addrs, cur = dst.get("addrs") or [], dst.get("active") or ""
@@ -1835,6 +1880,39 @@ def pool_failover(name, alive, crossed):
     logline(f"{name}: probe found nothing crossing — asked the core to fail destination "
             f"{cur or '?'} (ask {st['burns']} of {combos}: {len(addrs)} dst x {max(1, len(srcs))} src)"
             + (f" [{err}]" if err else ""))
+
+
+
+def _ws_failover(name, now):
+    """pool_failover's edge-pool half: ask the core to burn the SNI when nothing crosses.
+
+    Same experiment as the direct pools, on the CDN's two axes. The SNI is the low digit and the EDGE
+    the high one, so a whole row of SNIs failing on one edge is what convicts that edge -- the probe
+    only ever sees silence, which names the COMBO and never one axis on its own. "Everything tried" is
+    therefore the matrix, not either list."""
+    w = _read_ws_pool(name)
+    ips, snis, cur_ip, cur_sni = w["ips"], w["snis"], w["ip"], w["sni"]
+    if len(ips) < 2 and len(snis) < 2:
+        return                    # nothing to rotate to on either axis: a burn could only take it down
+    combos = max(1, len(ips)) * max(1, len(snis))
+    with _fo_lock:
+        st = _fo_state(name)
+        st["burns"] += 1
+        walked = st["burns"] >= combos
+        st["settle"] = now + FAILOVER_SETTLE
+        if walked:
+            st["burns"] = 0
+            st["cooldown"] = now + FAILOVER_COOLDOWN
+    if walked:
+        _pool_sighup(name, _is_ws_pool, "")
+        logline(f"{name}: whole edge matrix tried and still dead — restoring every entry, "
+                f"standing down for {int(FAILOVER_COOLDOWN)}s")
+        return
+    err = _atomic_write_json(_cfg_path(name, ".status.cmd"),
+                             {"cmd": "fail", "ip": cur_ip, "sni": cur_sni})
+    logline(f"{name}: probe found nothing crossing — asked the core to fail edge "
+            f"{cur_ip or '?'} / {cur_sni or '?'} (ask {st['burns']} of {combos}: "
+            f"{max(1, len(ips))} edge x {max(1, len(snis))} sni)" + (f" [{err}]" if err else ""))
 
 
 # --- directional liveness: bytes moving on the tunnel iface, counted per direction, whatever ICMP does ---
