@@ -818,6 +818,10 @@ def _core_config(cfg):
             _rport = 0
         if raw_profile in ("udp", "tcp") and 1 <= _rport <= 65535:
             corecfg["raw_port"] = _rport
+        # udp/tcp only: roll the CLIENT's forged SOURCE port for the life of the tunnel instead of the
+        # one constant, so a stateful box cannot burn a single 4-tuple and take the carrier with it.
+        if raw_profile in ("udp", "tcp") and _as_bool(cfg.get("raw_sport_random")):
+            corecfg["raw_sport_random"] = True
     if transport == "spoof":
         # The spoof carrier is bare-like (no raw_profile — the core forces it); it only carries the
         # optional outer IP protocol number override, exactly like a bare raw carrier.
@@ -2585,6 +2589,8 @@ def op_tunnel(d):
                     raise ValueError("bad raw_port")
                 if rport:
                     obj["raw_port"] = rport
+                if _as_bool(d.get("raw_sport_random")):   # ...and whether the SOURCE port rolls
+                    obj["raw_sport_random"] = True
         if transport == "spoof":      # standalone IP-spoofing carrier: bare-like, so only the proto override (no profile)
             rproto = int(d.get("raw_proto") or 0)
             if rproto and not (1 <= rproto <= 255):
