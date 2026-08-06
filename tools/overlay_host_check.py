@@ -98,8 +98,8 @@ def main():
     check(m.peer_of(a, "gre") == b.split("/")[0] and m.peer_of(b, "gre") == a.split("/")[0],
           "%s <-> %s are each other's peer (peer_of is what the tun probe aims at)" % (a, b))
 
-    print("\n== 5) the id range and the name follow the panel's 1..255 ==")
-    for tid, ok_want in ((1, True), (255, True), (0, False), (256, False)):
+    print("\n== 5) the id range follows the ADDRESS SPACE, not an octet ==")
+    for tid, ok_want in ((1, True), (255, True), (256, True), (65535, True), (0, False), (65536, False)):
         m = load(tmp)
         try:
             m.op_tunnel(req(id=tid, name="native%d" % tid))
