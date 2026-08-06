@@ -69,7 +69,7 @@ def core_bounds():
 
 def base_req(name="cor1"):
     return {"type": "core", "self_ip": "10.0.0.1", "peer_ip": "10.0.0.2",
-            "subnet": "10.200.0.0/24", "id": 1, "name": name, "iface": "eth0",
+            "subnet": "10.200.0.0/24", "id": 1, "name": name, "iface": "eth0", "host": 1,
             "role": "client", "transport": "ws", "cdn_carrier": "http",
             "psk": "a-sufficiently-long-preshared-key", "enabled": True}
 

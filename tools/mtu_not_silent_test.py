@@ -47,7 +47,7 @@ def load_node():
 
 
 def req(**over):
-    d = {"type": "vxlan", "self_ip": "10.0.0.1", "peer_ip": "10.0.0.2", "subnet": "10.200.0.0/24",
+    d = {"type": "vxlan", "self_ip": "10.0.0.1", "peer_ip": "10.0.0.2", "subnet": "10.200.0.0/24", "host": 1,
          "id": 7, "name": "vx7", "iface": "eth0", "enabled": True}
     d.update(over)
     return d
