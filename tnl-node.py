@@ -642,7 +642,7 @@ def _core_port(cfg):
 RAW_HEADER_LEN = {"bare": 0, "ipip": 0, "etherip": 2, "ipcomp": 4, "gre": 4, "icmp": 8, "udp": 8,
                   "esp": 8, "l2tpv3": 8, "tcp": 20, "ah": 24}
 
-_TUNING_INT_KEYS = ("dead_retest_secs", "pin_ttl_secs",
+_TUNING_INT_KEYS = ("dead_retest_secs",
                     "idle_mult", "idle_min_secs", "session_stale_mult", "session_stale_min_secs",
                     # flux_rotate_default_secs intentionally omitted: every flux tunnel carries an explicit
                     # flux_rotate_secs, so the core's tuned default is unreachable; the panel offers no knob either.
