@@ -1581,15 +1581,18 @@ SYN_RTO = 1.0          # s: the kernel's initial SYN retransmit timer (TCP_TIMEO
 PROBE_WAIT = 0.8       # s per attempt: ONE SYN's worth, deliberately under SYN_RTO. A deadline that spans
                        # the retransmit measures two SYNs as one sample and gets both numbers wrong -- see
                        # tun_probe. The fleet's real round trips are 78-170 ms, so this leaves 4x headroom.
-PROBE_COUNT = 20       # samples per sweep, sent CONCURRENTLY. They no longer decide the colour -- one
-                       # reply does that -- so the count buys two other things. It is the resolution of
-                       # loss_pct, now the only signal of how BADLY a tunnel is carrying (20 -> 5% steps).
-                       # And it is what keeps a very lossy tunnel steadily GREEN: at 90% loss the chance
-                       # a whole sweep falls silent by luck is 35% at ten samples but 12% at twenty, and
-                       # squared again by RED_SWEEPS. Concurrency is what makes this free: twenty cost
-                       # the same wall time as one, ~6.7 packets/s per tunnel. The SAME count everywhere:
-                       # a button that samples harder than the sweep reports a different tunnel than the
-                       # card it sits on.
+PROBE_COUNT = 20       # samples per sweep, sent CONCURRENTLY. The whole set decides the verdict, so the
+                       # count is the resolution of that decision: 20 gives it 5% steps, which is also
+                       # the resolution of loss_pct beside it. Concurrency is what makes this free:
+                       # twenty cost the same wall time as one, ~6.7 packets/s per tunnel. The SAME count
+                       # everywhere: a button that samples harder than the sweep reports a different
+                       # tunnel than the card it sits on.
+PROBE_MIN_PCT = 15     # percent of the sample set that must answer for the tunnel to count as carrying.
+                       # Operator-set from the panel (probe_min_pct); this is the fallback for a config
+                       # that carries no value. A RATIO, not a count, so changing PROBE_COUNT cannot
+                       # silently redefine it. 1 means "any single reply", which is what this was before
+                       # the knob existed; 100 means every sample must answer.
+PROBE_MIN_PCT_RANGE = (1, 100)
 RED_SWEEPS = 2         # consecutive bad sweeps before a GREEN tunnel is repainted red. Green publishes
                        # at once -- an outage must show fast, one unlucky sweep must not.
 _SO_BINDTODEVICE = getattr(socket, "SO_BINDTODEVICE", 25)   # absent off Linux, where the guards run
@@ -1680,6 +1683,26 @@ def tun_probe(iface, tunnel_ip, ttype, count=PROBE_COUNT):
     for s in waiting:
         s.close()              # never answered inside the deadline: a lost SYN, already counted in sent
     return hits, sent, best
+
+
+def probe_min_pct(cfg):
+    """The operator's carrying threshold for this tunnel, clamped to the range the panel offers.
+    Anything missing or malformed falls back to PROBE_MIN_PCT."""
+    lo, hi = PROBE_MIN_PCT_RANGE
+    try:
+        v = int(cfg.get("probe_min_pct"))
+    except (TypeError, ValueError):
+        return PROBE_MIN_PCT
+    return max(lo, min(hi, v))
+
+
+def carrying(hits, sent, pct):
+    """Did ENOUGH of the sample set answer to call this tunnel carrying?
+
+    Integer arithmetic on both sides, so the comparison is exact and `pct` keeps meaning "percent of
+    what was actually sent" when a sweep managed fewer sockets than PROBE_COUNT. At the default 15 with
+    a full 20 samples that is 3 replies; at 100 it is every one of them."""
+    return hits * 100 >= sent * pct
 
 
 _verdict_lock = threading.Lock()
@@ -2028,14 +2051,15 @@ def health_of(cfg):
     if up and tip and tip != "N/A":
         hits, sent, rtt = tun_probe(name, tip, ttype)
         if sent:
-            # Two states, and the line is all-or-nothing: connected while ANYTHING still crosses,
-            # disconnected only once nothing does. A tunnel still carrying traffic is not down, however
-            # badly it carries it -- "how well" is a different question and loss_pct beside it is the
-            # answer. Which is why the probe still sends every sample: one reply decides the colour,
-            # but only the whole set can say what fraction is getting through.
+            # The verdict rests on the WHOLE sample set, never on one packet. A single reply used to
+            # decide all of it -- the colour, whether to burn the endpoint, and whether to clear a burn --
+            # so a tunnel dropping 19 of 20 read green AND had its path exonerated, which is how a
+            # filtered endpoint kept being re-admitted. The threshold is the operator's, set fleet-wide
+            # from the panel, because only they can say how much loss is still a tunnel worth having.
             loss = round((sent - hits) * 100.0 / sent, 1)
-            alive = settle(name, hits > 0)
-            pool_failover(name, alive, hits > 0)
+            crossed = carrying(hits, sent, probe_min_pct(cfg))
+            alive = settle(name, crossed)
+            pool_failover(name, alive, crossed)
     return {"up": up, "alive": alive, "dead": alive is False, "rtt_ms": rtt, "loss_pct": loss,
             "rx_still": rx_still, "tx_still": tx_still, "live_win": int(LIVE_WINDOW)}
 
@@ -2445,6 +2469,13 @@ def op_tunnel(d):
            "remote_ip": peer_ip, "tunnel_ip": tunnel_ip, "local_ip": self_ip}
     old = read_config(name)   # snapshot the prior build ONCE (serialized under _apply_lock, no write until below):
     obj["enabled"] = _as_bool(d.get("enabled", (old or {}).get("enabled", True)))   # drives the on/off carry-forward here AND the in-place teardown/rollback further down
+    # probe_min_pct: EVERY type, not just core -- the tun probe judges every tunnel it can address, so a
+    # core-only knob would leave two tunnels on one dashboard coloured by two different rules. This one is
+    # CONSUMED here rather than forwarded: health_of reads it off the persisted config, so without this
+    # whitelist entry the panel's value is dropped in silence and the threshold stays at the node default.
+    if d.get("probe_min_pct") not in (None, ""):
+        _lo, _hi = PROBE_MIN_PCT_RANGE
+        obj["probe_min_pct"] = max(_lo, min(_hi, int(d["probe_min_pct"])))
     if ttype == "core" and d.get("keepalive") not in (None, ""):   # optional; whitelist so a set value survives (else _core_config falls back to 15)
         obj["keepalive"] = max(5, min(120, int(d["keepalive"])))
     # dead_after_secs (core, optional): per-tunnel self-heal deadline. Whitelist so a set value survives;
