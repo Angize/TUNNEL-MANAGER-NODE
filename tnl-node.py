@@ -776,14 +776,11 @@ def _core_config(cfg):
         sni = str(cfg.get("cover_sni") or "").strip()
         if sni:
             corecfg["cover_sni"] = sni
-    # Datagram (udp/raw/flux) and direct-stream (tcp, tcp+cover) transports have no ws edge pool, but both
-    # ends write a liveness heartbeat (`hb`) — and the client its self-heal event ring — to a status file we
-    # expose to the panel's log. This is `status_path`, NOT `ws_status_path`, so _is_ws_pool keeps telling a
-    # pool core apart from a plain one. dns belongs here too, or the health sweep has no hb/dw to judge by.
-    #
-    # The SERVER end gets one for the same reason the client does: its own lastRx is the only local proof
-    # that the CLIENT->SERVER direction carries. Without it that end had nothing to judge by and the sweep
-    # probed it with ICMP forever — traffic the tunnel then counted as its own liveness.
+    # Datagram (udp/raw/flux) and direct-stream (tcp, tcp+cover) transports have no ws edge pool, but they
+    # still write a self-heal event ring and startup configuration warnings to a status file we expose to
+    # the panel's log. This is `status_path`, NOT `ws_status_path`, so _is_ws_pool keeps telling a pool core
+    # apart from a plain one. BOTH ends get one: a server raises config warnings of its own, and only that
+    # end can see them. Liveness is not in here — the tun probe decides that.
     if transport in ("udp", "tcp", "raw", "flux", "spoof", "dns"):
         corecfg["status_path"] = _cfg_path(name, ".status")
     # peer_src_ips (raw/flux SERVER): the client's source pool. These carriers receive on a socket that
