@@ -1211,6 +1211,15 @@ def build_core(cfg):
         json.dump(corecfg, f, indent=2)
     os.chmod(tmp, 0o600)          # holds the psk -> keep it private like node.conf
     os.replace(tmp, path)
+    _core_relaunch(name)
+
+
+def _core_relaunch(name):
+    """Stop the core unit for `name` and launch it again on the config already on disk.
+
+    The transient unit is NOT restarted with `systemctl restart`: it is created by systemd-run with
+    --collect, so a stop can take the unit definition with it. Tearing down and re-running the same
+    systemd-run is the one sequence known to work, and it is the only place that sequence lives."""
     unit = _core_unit(name)
     run(["systemctl", "stop", unit])
     run(["systemctl", "reset-failed", unit])
@@ -1220,7 +1229,7 @@ def build_core(cfg):
     _sweep_owned_rules(name)
     run(["systemd-run", "--unit", unit, "--collect",
          "-p", "Restart=always", "-p", "RestartSec=3",
-         CORE_BIN, "--config", path])
+         CORE_BIN, "--config", _cfg_path(name, ".json")])
     for _ in range(80):          # up to 8s: must exceed RestartSec=3 so one restart cycle
         if run(["ip", "link", "show", name])[0] == 0:   # (a slow/first-launch core) isn't misread as failure
             break
@@ -3022,6 +3031,26 @@ def op_link_enable(d):
     return {"ok": True, "enabled": enabled}
 
 
+def op_core_restart(d):
+    """Bounce a core tunnel's process on the config already on disk — no rebuild, no config rewrite.
+
+    A rebuild tears the tunnel down on both nodes, re-fetches ECH, re-stamps tuning and may re-pick the
+    node IP; all this does is give the core a fresh process. That is what clears state a running core
+    cannot clear itself (a poisoned handshake cache, a session it can no longer complete), which is the
+    class of failure where the pool failover has nothing to rotate to and stands down."""
+    name = _req_name(d)
+    cfg = read_config(name)
+    if not cfg:
+        raise ValueError("tunnel not found")
+    if cfg.get("type") != "core":
+        raise ValueError("only a core tunnel has a process to restart")
+    if not _as_bool(cfg.get("enabled", True)):
+        # Restarting one the operator switched OFF would put its data path back up behind their back.
+        return {"ok": False, "msg": "تونل غیرفعال است"}
+    _core_relaunch(name)
+    return {"ok": True, "active": _core_running(name)}
+
+
 def op_wipe(d):
     """Full self-destruct requested by the panel. Tear down every tunnel/portfw in-process, then
     (detached, after this 200 flushes) stop+remove the service and delete /opt/tunnel entirely —
@@ -3788,7 +3817,7 @@ OPS = {"ping": op_ping, "list": op_list, "check": op_check, "tunnel": op_tunnel,
        "spoof-egress-result": op_spoof_egress_result,
        "set-update-key": op_set_update_key,
        "kernel-tune": op_kernel_tune,
-       "link-enable": op_link_enable}
+       "link-enable": op_link_enable, "core-restart": op_core_restart}
 # spoof-egress-* SEND packets / start a capture, so they are POST (not READ_ONLY) even though they
 # mutate no stored config — a forged-packet send is a side effect the CSRF guard should cover.
 READ_ONLY = {"ping", "list", "check", "portcheck", "spoof-probe", "edge-status", "peer-status"}
