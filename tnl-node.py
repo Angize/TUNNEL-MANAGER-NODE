@@ -1197,13 +1197,6 @@ def build_core(cfg):
     systemd unit with Restart=always. Then wait for the TUN to appear so op_tunnel's verify sees it."""
     name = cfg["name"]
     _ensure_core()
-    # Drop any stale status + select-edge sidecar from a previous core with this name, so a rebuild
-    # never shows a stale pool state or replays a leftover "pin this edge" command on first tick.
-    for p in _core_status_paths(name):
-        try:
-            os.remove(p)
-        except OSError:
-            pass
     corecfg = _core_config(cfg)
     path = _cfg_path(name, ".json")
     tmp = path + ".tmp"
@@ -1215,11 +1208,15 @@ def build_core(cfg):
 
 
 def _core_relaunch(name):
-    """Stop the core unit for `name` and launch it again on the config already on disk.
+    """Launch a fresh core for `name` on the config already on disk. Returns True once its TUN is up.
 
     The transient unit is NOT restarted with `systemctl restart`: it is created by systemd-run with
     --collect, so a stop can take the unit definition with it. Tearing down and re-running the same
-    systemd-run is the one sequence known to work, and it is the only place that sequence lives."""
+    systemd-run is the one sequence known to work, and it is the only place that sequence lives.
+
+    The return value is the TUN, not the unit's state: `systemctl is-active` reports `activating` for
+    the whole of a Restart=always crash loop, so a core that cannot start at all reads as running.
+    """
     unit = _core_unit(name)
     run(["systemctl", "stop", unit])
     run(["systemctl", "reset-failed", unit])
@@ -1227,13 +1224,21 @@ def _core_relaunch(name):
     # leaves the kernel free to answer the peer with the RST / ICMP those rules exist to swallow. Once the
     # unit is stopped, an orderly core has already removed its own and whatever is left is a killed core's.
     _sweep_owned_rules(name)
+    # Drop the stale status + command sidecars of the core we just stopped, so the fresh one never shows
+    # its predecessor's pool state or replays a leftover "pin this edge" / "fail this destination".
+    for p in _core_status_paths(name):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
     run(["systemd-run", "--unit", unit, "--collect",
          "-p", "Restart=always", "-p", "RestartSec=3",
          CORE_BIN, "--config", _cfg_path(name, ".json")])
     for _ in range(80):          # up to 8s: must exceed RestartSec=3 so one restart cycle
-        if run(["ip", "link", "show", name])[0] == 0:   # (a slow/first-launch core) isn't misread as failure
-            break
+        if os.path.exists("/sys/class/net/" + name):    # (a slow/first-launch core) isn't misread as failure
+            return True
         time.sleep(0.1)
+    return False
 
 
 # ---------------------------------------------------------------- orphaned firewall rules
@@ -3047,8 +3052,13 @@ def op_core_restart(d):
     if not _as_bool(cfg.get("enabled", True)):
         # Restarting one the operator switched OFF would put its data path back up behind their back.
         return {"ok": False, "msg": "تونل غیرفعال است"}
-    _core_relaunch(name)
-    return {"ok": True, "active": _core_running(name)}
+    if not os.path.exists(_cfg_path(name, ".json")):
+        # No core config = nothing to launch on. systemd-run would still succeed and Restart=always
+        # would spin the failure every 3s, which reads as "running" from the outside.
+        return {"ok": False, "msg": "کانفیگِ هسته روی این نود نیست — تونل را بازسازی کن"}
+    if not _core_relaunch(name):
+        return {"ok": False, "msg": "هسته بالا نیامد (اینترفیس ظاهر نشد)"}
+    return {"ok": True}
 
 
 def op_wipe(d):
