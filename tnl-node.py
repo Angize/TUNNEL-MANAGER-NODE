@@ -3868,6 +3868,22 @@ OPS = {"ping": op_ping, "list": op_list, "check": op_check, "tunnel": op_tunnel,
 # mutate no stored config — a forged-packet send is a side effect the CSRF guard should cover.
 READ_ONLY = {"ping", "list", "check", "portcheck", "spoof-probe", "edge-status", "peer-status"}
 
+# The name on the WIRE, which is not the name in the code. This control channel is plain HTTP, so the
+# request line crosses the border in the clear — and MEASURED on the Iran→Germany path, a URI containing
+# the string "tunnel" is dropped (5/5 lost; `tunne1` and `xunnel` arrive 5/5). Every other op worked,
+# which is why only BUILDING a tunnel on a foreign node ever timed out. So the URL carries an opaque
+# token and the readable name stays in the code. Panel side: NODE_WIRE in tnl-central.py, kept in step by
+# tools/wire_names_check.py.
+WIRE = {
+    "pg": "ping", "ls": "list", "ck": "check", "mk": "tunnel", "dl": "delete", "ap": "apply",
+    "up": "update", "wz": "wipe", "pf": "portfw", "pe": "portfw-edit", "pn": "portfw-next",
+    "pc": "portcheck", "es": "edge-status", "ps": "peer-status", "pl": "peer-select",
+    "pp": "peer-probe-now", "qp": "pool-probe-now", "qs": "pool-select", "eu": "ech-update",
+    "ci": "core-install", "sp": "spoof-probe", "sl": "spoof-egress-listen", "ss": "spoof-egress-send",
+    "sr": "spoof-egress-result", "sk": "set-update-key", "kt": "kernel-tune", "le": "link-enable",
+    "cr": "core-restart",
+}
+
 # ----------------------------------------------------------------------------- HTTP
 
 class Handler(BaseHTTPRequestHandler):
@@ -3950,7 +3966,7 @@ class Handler(BaseHTTPRequestHandler):
         if not path.startswith("/api/"):
             self._send(404, {"error": "not found"})
             return
-        cmd = path[5:]
+        cmd = WIRE.get(path[5:], "")
         if not self._authed():
             self._send(401, {"error": "bad or missing node token"})
             return
