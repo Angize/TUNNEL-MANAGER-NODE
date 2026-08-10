@@ -2361,7 +2361,43 @@ def note_central(ip, port):
     if not _central_ip_ok(ip):
         return
     with _central_cb_lock:
+        if _central_cb == (ip, p):
+            return          # steady state: never touch node.conf on a request that changes nothing
         _central_cb = (ip, p)
+    _save_central_cb(ip, p)
+
+
+def _save_central_cb(ip, p):
+    """Persist where to phone home. A node that REBOOTS with a new IP is otherwise stuck for good: the
+    panel cannot reach it at the stored host, so it never sends us a request, so we never re-learn the
+    callback and never check in. Only runs when the pair actually changed."""
+    with _apply_lock:
+        try:
+            conf = load_conf()
+            if conf.get("central_cb") == [ip, p]:
+                return
+            conf["central_cb"] = [ip, p]
+            save_conf(conf)
+        except Exception as e:
+            logline(f"central_cb persist: {e}")
+
+
+def _seed_central_cb():
+    """Restore the callback at startup, so checking in does not depend on the panel reaching us first."""
+    global _central_cb
+    try:
+        cb = load_conf().get("central_cb")
+    except Exception:
+        return
+    if not (isinstance(cb, list) and len(cb) == 2):
+        return
+    try:
+        p = int(cb[1])
+    except (TypeError, ValueError):
+        return
+    if is_ipv4(str(cb[0])) and 1 <= p <= 65535:
+        with _central_cb_lock:
+            _central_cb = (str(cb[0]), p)
 
 
 def get_central():
@@ -4191,6 +4227,7 @@ def serve():
         logline(f"startup apply_all: {e}")
     threading.Thread(target=rotation_loop, daemon=True).start()
     threading.Thread(target=health_loop, daemon=True).start()  # keep the health snapshot fresh (O(1) op_list)
+    _seed_central_cb()   # know the callback BEFORE the first check-in, so a reboot with a new IP is not fatal
     threading.Thread(target=checkin_loop, daemon=True).start()  # phone home to the panel if our IP changes
     httpd = ThreadingHTTPServer(("0.0.0.0", int(conf.get("port", 8099))), Handler)
     httpd.conf = conf
