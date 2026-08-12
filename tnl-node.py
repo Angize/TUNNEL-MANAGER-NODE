@@ -1597,7 +1597,7 @@ PROBE_MIN_PCT = 15     # percent of the sample set that must answer for the tunn
                        # that carries no value. A RATIO, not a count, so changing PROBE_COUNT cannot
                        # silently redefine it. 1 means "any single reply", which is what this was before
                        # the knob existed; 100 means every sample must answer.
-PROBE_MIN_PCT_RANGE = (1, 100)
+PROBE_MIN_PCT_RANGE = (5, 100)
 RED_SWEEPS = 2         # consecutive bad sweeps before a GREEN tunnel is repainted red. Green publishes
                        # at once -- an outage must show fast, one unlucky sweep must not.
 _SO_BINDTODEVICE = getattr(socket, "SO_BINDTODEVICE", 25)   # absent off Linux, where the guards run
