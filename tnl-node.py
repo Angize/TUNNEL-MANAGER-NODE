@@ -714,11 +714,11 @@ def _core_config(cfg):
         # Spoof forges the whole outer IPv4 header itself (IP_HDRINCL), bare-like: IP20, no L4 header.
         outer = 20
     elif transport == "flux":
-        # IP20 + the carrier header. udp adds 8. The raw carrier adds none. stun is NOT 8+20: buildSTUN
-        # wraps the frame as a STUN attribute, so the real cost is UDP 8 + STUN header 20 + attribute
-        # header 4 + the 4-byte alignment pad (0..3). Under-counting makes the crafted IPv4 packet exceed
-        # the egress MTU, and an oversize IP_HDRINCL send is refused with EMSGSIZE.
-        outer = 20 + {"udp": 8, "stun": 8 + 20 + 4 + 3}.get(flux_carrier, 0)
+        # IP20 + the carrier header. Both carriers ride UDP, so 8 is the floor. stun is NOT 8+20:
+        # buildSTUN wraps the frame as a STUN attribute, so the real cost is UDP 8 + STUN header 20 +
+        # attribute header 4 + the 4-byte alignment pad (0..3). Under-counting makes the crafted IPv4
+        # packet exceed the egress MTU, and an oversize IP_HDRINCL send is refused with EMSGSIZE.
+        outer = 20 + (8 + 20 + 4 + 3 if flux_carrier == "stun" else 8)
     elif transport == "ws":
         outer = 40 + 14        # IP20 + TCP20 + up to a 14-byte WebSocket frame header
     else:
@@ -2775,7 +2775,7 @@ def op_tunnel(d):
                 obj["raw_proto"] = rproto
         if transport == "flux":       # polymorphic moving-target carrier: persist carrier/shape/epoch
             carrier = str(d.get("flux_carrier") or "udp").strip().lower()
-            if carrier not in ("udp", "raw", "stun"):
+            if carrier not in ("udp", "stun"):
                 raise ValueError("bad flux_carrier")
             obj["flux_carrier"] = carrier
             rot = int(d.get("flux_rotate_secs") or 600)
