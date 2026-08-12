@@ -2089,8 +2089,9 @@ def _cpu_pct():
     node, for ever. A remembered snapshot is also a BETTER measurement: the window is the real poll
     interval (seconds) instead of a 100 ms sliver, so a brief spike no longer reads as sustained load.
 
-    A window shorter than 200 ms reuses the last answer rather than dividing by a near-zero interval, so
-    two callers arriving together cannot produce a nonsense number."""
+    Two callers arriving in the same jiffy would divide by a zero window, so a call that finds no tick since
+    the last one reuses the last answer and leaves the older snapshot in place — the next call then measures
+    across something real instead of restarting the window each time."""
     global _cpu_prev, _cpu_last
     with _cpu_lock:
         cur = _cpu_snap()
