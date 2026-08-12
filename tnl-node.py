@@ -2449,7 +2449,7 @@ def op_ping(d):
         stats["net"] = net
     except Exception:
         pass
-    return {"ok": True, "agent": "tnl-node", "version": 26, "ready": True,
+    return {"ok": True, "agent": "tnl-node", "version": 1, "ready": True,
             "hostname": socket.gethostname(), "ips": all_ips(), "sha256": _SELF_SHA,
             "tunnels": len([c for c in cfgs if c.get("type") != "portfw"]),
             "portfw": len([c for c in cfgs if c.get("type") == "portfw"]),
