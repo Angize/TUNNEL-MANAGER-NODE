@@ -2076,13 +2076,43 @@ def _cpu_snap():
     return sum(v), idle
 
 
+_cpu_prev = None            # (total, idle) of the last snapshot; the window is the gap BETWEEN calls
+_cpu_last = 0.0             # the last percentage computed, returned while a fresh window is too short
+_cpu_lock = threading.Lock()
+
+
 def _cpu_pct():
-    """Live CPU utilisation over a short 100ms window (stateless, so concurrent callers never clash)."""
-    t1, i1 = _cpu_snap()
-    time.sleep(0.1)
-    t2, i2 = _cpu_snap()
-    dt = t2 - t1
-    return round((1 - (i2 - i1) / dt) * 100, 1) if dt > 0 else 0.0
+    """CPU utilisation since the PREVIOUS call, with no sleep of its own.
+
+    It used to sleep 100 ms between two snapshots. `op_ping` calls this through read_stats, and the panel
+    times that whole RPC as the node's ping — so every ping the operator saw was ~100 ms too high, on every
+    node, for ever. A remembered snapshot is also a BETTER measurement: the window is the real poll
+    interval (seconds) instead of a 100 ms sliver, so a brief spike no longer reads as sustained load.
+
+    A window shorter than 200 ms reuses the last answer rather than dividing by a near-zero interval, so
+    two callers arriving together cannot produce a nonsense number."""
+    global _cpu_prev, _cpu_last
+    with _cpu_lock:
+        cur = _cpu_snap()
+        prev = _cpu_prev
+        if prev is None:
+            # First call of the process: pay ONE short window so the first ping reports something real
+            # rather than 0. Every later call is free.
+            time.sleep(0.1)
+            prev, cur = cur, _cpu_snap()
+        elif cur[0] - prev[0] <= 0:
+            # No jiffy has ticked since the last call. Reuse the last answer and KEEP the old snapshot, so
+            # the next call measures across a window long enough to mean something. Sleeping here instead
+            # would put the 100 ms straight back into every rapid caller.
+            return _cpu_last
+        _cpu_prev = cur
+        t2, i2 = cur
+        t1, i1 = prev
+        dt = t2 - t1
+        if dt <= 0:
+            return _cpu_last
+        _cpu_last = round((1 - (i2 - i1) / dt) * 100, 1)
+        return _cpu_last
 
 
 def _read_os():
