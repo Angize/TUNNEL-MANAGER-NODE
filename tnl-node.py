@@ -640,7 +640,7 @@ def _core_port(cfg):
 
 # Carrier-header bytes each raw encapsulation profile prepends, mirroring the core's rawHeaderLens.
 RAW_HEADER_LEN = {"bare": 0, "ipip": 0, "etherip": 2, "ipcomp": 4, "gre": 4, "icmp": 8, "udp": 8,
-                  "esp": 8, "l2tpv3": 8, "tcp": 20, "ah": 24}
+                  "esp": 8, "l2tpv3": 8, "tcp": 32, "ah": 24}  # tcp = 20 + NOP,NOP,Timestamp(10)
 
 _TUNING_INT_KEYS = ("dead_retest_secs",
                     "dead_mult",
