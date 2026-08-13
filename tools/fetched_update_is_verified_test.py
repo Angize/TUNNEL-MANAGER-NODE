@@ -217,7 +217,10 @@ def main():
         mod.urllib.request.urlopen = fake_urlopen
         try:
             for name, url, payload, cap, want in [
-                ("a plaintext http:// URL", "http://example/a.py", b"x" * 10, 1024, "https"),
+                ("a plaintext http:// URL to somewhere else", "http://evil.example/a.py", b"x" * 10, 1024, "https"),
+                ("a plaintext URL at the panel's IP but the wrong port",
+                 "http://10.9.9.9:9999/a.py", b"x" * 10, 1024, "https"),
+                ("a URL that is neither http nor https", "file:///etc/passwd", b"x" * 10, 1024, "https"),
                 ("a body over the cap", "https://example/a.py", b"x" * 2048, 1024, "larger"),
                 ("an empty body", "https://example/a.py", b"", 1024, "empty"),
             ]:
@@ -243,6 +246,34 @@ def main():
                 fail("_fetch_url did not return the body it downloaded")
             else:
                 ok("_fetch_url returns the body of an acceptable download")
+
+            # The ONE plaintext exception: the panel's own origin, and only while the node really has
+            # one pinned. The panel runs plain HTTP today; nothing else may be fetched that way.
+            saved_cb = mod._central_cb
+            try:
+                mod._central_cb = None
+                try:
+                    mod._fetch_url("http://10.9.9.9:2053/api/artifact", 1024)
+                    fail("_fetch_url accepted plaintext with NO panel origin pinned — anyone could claim it")
+                except ValueError:
+                    ok("_fetch_url refuses plaintext when no panel origin is pinned")
+
+                mod._central_cb = ("10.9.9.9", 2053)
+                opened.clear()
+                if mod._fetch_url("http://10.9.9.9:2053/api/artifact", 1024) != b"fine" or not opened:
+                    fail("_fetch_url refused plaintext from the panel's OWN origin, so a plain-HTTP "
+                         "panel could never serve the artifacts")
+                else:
+                    ok("_fetch_url allows plaintext from the panel's own origin")
+                for bad, why in [("http://10.9.9.9:9999/a", "a different port"),
+                                 ("http://10.9.9.8:2053/a", "a different host")]:
+                    try:
+                        mod._fetch_url(bad, 1024)
+                        fail("_fetch_url accepted plaintext from %s" % why)
+                    except ValueError:
+                        ok("_fetch_url still refuses plaintext from %s" % why)
+            finally:
+                mod._central_cb = saved_cb
         finally:
             mod.urllib.request.urlopen = saved_open
 

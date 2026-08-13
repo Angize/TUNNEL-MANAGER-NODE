@@ -34,6 +34,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, wait as futures_wait
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -3453,15 +3454,38 @@ FETCH_MAX_AGENT = 262144
 FETCH_MAX_CORE = 64 << 20
 
 
+def _is_central_origin(u):
+    """True when u points at the PANEL's own callback origin -- the (ip, port) it reaches us from, which
+    _central_ip_ok pinned on first contact. That is the one origin whose plaintext we accept, and only
+    because the panel itself runs plain HTTP today; it is not a name the caller can claim, it is the
+    address we already talk to."""
+    with _central_cb_lock:
+        cb = _central_cb
+    if not cb:
+        return False
+    try:
+        p = urllib.parse.urlsplit(u)
+        return p.hostname == cb[0] and int(p.port or 80) == int(cb[1])
+    except ValueError:
+        return False
+
+
 def _fetch_url(url, max_bytes, timeout=180):
     """Download url and return its bytes. Used ONLY in the panel's "let the node fetch it" delivery mode:
     the panel still sends the sha256 and its signature over that sha, and the caller checks both before
     anything is installed -- so this function is not trusted, it only saves the panel's uplink.
 
-    https only. The signature is what makes the bytes safe, but a plaintext fetch would also hand an
-    on-path observer a free record of which version every node runs."""
+    https, with ONE exception: the panel's own origin, which runs plain HTTP today. The signature is
+    what makes the bytes safe either way, but for anything else a plaintext fetch would hand an on-path
+    observer a free record of which version every node runs -- and that is not worth giving away to
+    save the panel a certificate. When the panel gets TLS its URL is https and this exception simply
+    stops being taken."""
     u = str(url or "").strip()
-    if not u.lower().startswith("https://"):
+    low = u.lower()
+    if low.startswith("http://"):
+        if not _is_central_origin(u):
+            raise ValueError("update url must be https (plaintext is allowed only for the panel's own origin)")
+    elif not low.startswith("https://"):
         raise ValueError("update url must be https")
     req = urllib.request.Request(u, headers={"User-Agent": "tnl-node"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
