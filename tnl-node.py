@@ -3447,6 +3447,31 @@ def op_pool_probe_now(d):
 CORE_VER_RE = re.compile(r"^(?!.*\.\.)[A-Za-z0-9._-]{1,40}$")  # negative-lookahead rejects any '..' → no path traversal in the release URL
 CORE_SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 
+# An agent source the panel accepts is capped at 256 KB; a core binary is ~3 MB. The caps are here so a
+# URL that answers with something enormous cannot fill the disk before the sha256 gate ever runs.
+FETCH_MAX_AGENT = 262144
+FETCH_MAX_CORE = 64 << 20
+
+
+def _fetch_url(url, max_bytes, timeout=180):
+    """Download url and return its bytes. Used ONLY in the panel's "let the node fetch it" delivery mode:
+    the panel still sends the sha256 and its signature over that sha, and the caller checks both before
+    anything is installed -- so this function is not trusted, it only saves the panel's uplink.
+
+    https only. The signature is what makes the bytes safe, but a plaintext fetch would also hand an
+    on-path observer a free record of which version every node runs."""
+    u = str(url or "").strip()
+    if not u.lower().startswith("https://"):
+        raise ValueError("update url must be https")
+    req = urllib.request.Request(u, headers={"User-Agent": "tnl-node"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        buf = r.read(max_bytes + 1)
+    if len(buf) > max_bytes:
+        raise ValueError("downloaded file is larger than %d bytes" % max_bytes)
+    if not buf:
+        raise ValueError("downloaded file is empty")
+    return buf
+
 
 def _verify_update_sig(msg, sig_b64):
     """Verify an RSA-SHA256 signature (base64) over `msg` (bytes) with the panel PUBLIC key stored in
@@ -3509,14 +3534,23 @@ def op_core_install(d):
     """Install a raw core binary pushed from the panel (base64), not a published release. Verify its
     sha256, swap it in atomically, pin the node to a custom label, then rebuild the core tunnels so they
     relaunch on it. NEVER install a binary whose checksum does not verify (it runs as root)."""
-    _require(d, ["data", "sha256"])
+    _require(d, ["sha256"])
     want = str(d.get("sha256") or "").strip().lower()
     if not CORE_SHA_RE.match(want):
         raise ValueError("bad sha256")
-    try:
-        raw = base64.b64decode(d["data"], validate=True)
-    except Exception:
-        raise ValueError("bad base64 payload")
+    if d.get("data") is None and d.get("url"):
+        # Delivery mode "node": fetch the release asset ourselves. `want` and the signature over it still
+        # decide what may be installed, so a hostile mirror gets no further than a checksum mismatch.
+        try:
+            raw = _fetch_url(d["url"], FETCH_MAX_CORE)
+        except Exception as e:
+            return {"ok": False, "msg": "download failed: " + str(e)[:140]}
+    else:
+        _require(d, ["data"])
+        try:
+            raw = base64.b64decode(d["data"], validate=True)
+        except Exception:
+            raise ValueError("bad base64 payload")
     if len(raw) < 100000:                         # an core binary is ~3 MB; anything tiny is a mistake, never install it
         return {"ok": False, "msg": "binary too small"}
     got = hashlib.sha256(raw).hexdigest()
@@ -3567,8 +3601,21 @@ def op_update(d):
     """Replace this agent with new source pushed from the panel. VALIDATE-BEFORE-SWAP is the brick guard:
     a bad upload is rejected and the currently-running file is left untouched. Restart is fired by the
     handler AFTER this 200 is flushed, so the central's push call gets its {ok:true} before the bounce."""
-    _require(d, ["code"])
-    src = d["code"]
+    src = d.get("code")
+    if src is None and d.get("url"):
+        # Delivery mode "node": the panel sent a URL instead of the bytes. The sha256 is REQUIRED here --
+        # it is the only thing tying what we download to what the panel decided to install -- and the
+        # signature below is over exactly that sha, so the trust chain is the same as a byte push.
+        if not CORE_SHA_RE.match(str(d.get("sha256") or "").strip().lower()):
+            return {"ok": False, "msg": "url mode needs the sha256 of the agent to install"}
+        try:
+            raw = _fetch_url(d["url"], FETCH_MAX_AGENT)
+        except Exception as e:
+            return {"ok": False, "msg": "download failed: " + str(e)[:140]}
+        try:
+            src = raw.decode()
+        except UnicodeDecodeError:
+            return {"ok": False, "msg": "downloaded agent is not utf-8 text"}
     if not isinstance(src, str) or not src.strip():
         raise ValueError("empty code")
     h = hashlib.sha256(src.encode()).hexdigest()
