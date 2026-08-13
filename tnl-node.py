@@ -3489,11 +3489,21 @@ def _fetch_url(url, max_bytes, timeout=180):
         raise ValueError("update url must be https")
     req = urllib.request.Request(u, headers={"User-Agent": "tnl-node"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
+        try:
+            want = int(r.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            want = 0
         buf = r.read(max_bytes + 1)
     if len(buf) > max_bytes:
         raise ValueError("downloaded file is larger than %d bytes" % max_bytes)
     if not buf:
         raise ValueError("downloaded file is empty")
+    # A server that closes mid-body leaves read() returning SHORT and raising nothing, so without this
+    # the truncation is only noticed by the sha256 gate below -- which reports «checksum mismatch», i.e.
+    # it blames the file the panel staged for a transfer that was cut. MEASURED against a real panel:
+    # 5613896 of 11243704 bytes arrived, silently, behind a correct Content-Length.
+    if want and len(buf) != want:
+        raise ValueError("download truncated: got %d of %d bytes" % (len(buf), want))
     return buf
 
 
