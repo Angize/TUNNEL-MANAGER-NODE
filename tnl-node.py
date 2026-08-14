@@ -63,7 +63,7 @@ MAX_CONNS = 64                  # cap concurrent request handlers so an unauth s
 _conn_sem = threading.BoundedSemaphore(MAX_CONNS)
 _apply_lock = threading.Lock()  # serialize all state mutations (API writes + rotation thread)
 _restart_pending = threading.Event()  # set once op_update swaps the binary → reject NEW mutating ops until the bounce
-_central_cb = None              # (ip, port) the panel last reached us from → where we call back /api/checkin
+_central_cb = None              # (ip, port, tls) the panel announces → where we call back /api/checkin
 _central_cb_lock = threading.Lock()
 _last_reported_ips = None       # last IP set we successfully checked in with (skip redundant check-ins)
 CHECKIN_GAP = 20                # seconds between our own IP-change checks
@@ -2453,7 +2453,10 @@ def _central_ip_ok(ip):
         return True
 
 
-def note_central(ip, port):
+def note_central(ip, port, tls):
+    """Learn where the panel is from the request it just made: the address it reached us from, the port
+    it advertises, and whether that port speaks TLS. Nothing here is configured on the node, so the
+    panel can move — address, port or scheme — and we follow on its next request."""
     global _central_cb
     try:
         p = int(port)
@@ -2461,41 +2464,48 @@ def note_central(ip, port):
         return
     if not (1 <= p <= 65535):  # X-Central-Port is fully attacker-controlled — bound it
         return
+    cb = (ip, p, bool(tls))
     # _central_ip_ok is lock-free on the common read path and takes _apply_lock ITSELF only for the
     # rare first-contact TOFU write (re-checking under the lock to stay race-safe). Don't wrap it here,
     # or every request — including read-only pings — would serialize behind a long core build.
     if not _central_ip_ok(ip):
         return
     with _central_cb_lock:
-        if _central_cb == (ip, p):
+        if _central_cb == cb:
             return          # steady state: never touch node.conf on a request that changes nothing
-        _central_cb = (ip, p)
-    _save_central_cb(ip, p)
+        _central_cb = cb
+    _save_central_cb(cb)
 
 
-def _save_central_cb(ip, p):
+def _save_central_cb(cb):
     """Persist where to phone home. A node that REBOOTS with a new IP is otherwise stuck for good: the
     panel cannot reach it at the stored host, so it never sends us a request, so we never re-learn the
-    callback and never check in. Only runs when the pair actually changed."""
+    callback and never check in. Only runs when it actually changed."""
     with _apply_lock:
         try:
             conf = load_conf()
-            if conf.get("central_cb") == [ip, p]:
+            want = [cb[0], cb[1], cb[2]]
+            if conf.get("central_cb") == want:
                 return
-            conf["central_cb"] = [ip, p]
+            conf["central_cb"] = want
             save_conf(conf)
         except Exception as e:
             logline(f"central_cb persist: {e}")
 
 
 def _seed_central_cb():
-    """Restore the callback at startup, so checking in does not depend on the panel reaching us first."""
+    """Restore the callback at startup, so checking in does not depend on the panel reaching us first.
+
+    A stored pair without the scheme is ignored rather than assumed: the panel re-teaches the whole
+    origin on its very next request, which is one poll away, and guessing http for a panel that has
+    moved to https would send a check-in — and the node's own address list — at a TLS port in the
+    clear."""
     global _central_cb
     try:
         cb = load_conf().get("central_cb")
     except Exception:
         return
-    if not (isinstance(cb, list) and len(cb) == 2):
+    if not (isinstance(cb, list) and len(cb) == 3):
         return
     try:
         p = int(cb[1])
@@ -2503,7 +2513,17 @@ def _seed_central_cb():
         return
     if is_ipv4(str(cb[0])) and 1 <= p <= 65535:
         with _central_cb_lock:
-            _central_cb = (str(cb[0]), p)
+            _central_cb = (str(cb[0]), p, bool(cb[2]))
+
+
+def central_origin():
+    """"http://ip:port" the node currently believes the panel is at, or "" if it has never been told.
+    THE one place that origin is rendered, so check-in, the plaintext-fetch gate and what ping reports
+    can never describe different panels."""
+    cb = get_central()
+    if not cb:
+        return ""
+    return "%s://%s:%d" % ("https" if cb[2] else "http", cb[0], cb[1])
 
 
 def get_central():
@@ -2521,7 +2541,7 @@ def do_checkin():
         return False
     body = json.dumps({"token": conf.get("token", ""), "ips": all_ips(),
                        "hostname": socket.gethostname()}).encode()
-    url = f"http://{cb[0]}:{cb[1]}/api/checkin"
+    url = central_origin() + "/api/checkin"
     req = urllib.request.Request(url, data=body, method="POST",
                                  headers={"Content-Type": "application/json"})
     try:
@@ -2556,6 +2576,10 @@ def op_ping(d):
     except Exception:
         pass
     return {"ok": True, "agent": "tnl-node", "version": 1, "ready": True,
+            # Where this node thinks the panel is. The panel shows it so a fleet being moved to a new
+            # address can be watched arriving, instead of the operator guessing when it is safe to
+            # retire the old one.
+            "central": central_origin(),
             "hostname": socket.gethostname(), "ips": all_ips(), "sha256": _SELF_SHA,
             "tunnels": len([c for c in cfgs if c.get("type") != "portfw"]),
             "portfw": len([c for c in cfgs if c.get("type") == "portfw"]),
@@ -3529,13 +3553,15 @@ FETCH_MAX_CORE = 64 << 20
 
 
 def _is_central_origin(u):
-    """True when u points at the PANEL's own callback origin -- the (ip, port) it reaches us from, which
-    _central_ip_ok pinned on first contact. That is the one origin whose plaintext we accept, and only
-    because the panel itself runs plain HTTP today; it is not a name the caller can claim, it is the
-    address we already talk to."""
+    """True when u is the PANEL's own origin AND that origin is a plaintext one.
+
+    This is the single exception to the https rule, and it exists only because the panel may still run
+    plain HTTP. It is not a name a caller can claim -- it is the address the panel itself announced. Once
+    the panel announces TLS, its origin is https and this returns False for any http url, so the
+    exception closes itself the moment it stops being needed."""
     with _central_cb_lock:
         cb = _central_cb
-    if not cb:
+    if not cb or cb[2]:
         return False
     try:
         p = urllib.parse.urlsplit(u)
@@ -4195,7 +4221,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
         cp = self.headers.get("X-Central-Port")
         if cp:
-            note_central(self.client_address[0], cp)  # learn where to call /api/checkin back from
+            # X-Central-TLS says whether that port speaks TLS; absent or "0" means plain http.
+            note_central(self.client_address[0], cp,
+                         str(self.headers.get("X-Central-TLS", "")).strip() not in ("", "0"))
         if cmd not in OPS:
             self._send(404, {"error": "unknown endpoint"})
             return

@@ -58,11 +58,11 @@ def main():
     m.save_conf = lambda c: (writes.__setitem__("n", writes["n"] + 1), real_save(c))[1]
 
     # first contact: the panel's IP is pinned (TOFU) and the callback is learned AND written down
-    m.note_central(PANEL_IP, PANEL_PORT)
-    chk("the callback is learned", m.get_central(), (PANEL_IP, PANEL_PORT))
+    m.note_central(PANEL_IP, PANEL_PORT, False)
+    chk("the callback is learned", m.get_central(), (PANEL_IP, PANEL_PORT, False))
     with open(conf_path) as f:
         conf = json.load(f)
-    chk("and written to node.conf", conf.get("central_cb"), [PANEL_IP, PANEL_PORT])
+    chk("and written to node.conf", conf.get("central_cb"), [PANEL_IP, PANEL_PORT, False])
 
     # The steady state is EVERY request, including read-only pings. Nothing may be written there -- and
     # nothing may take _apply_lock either, or a ping would block behind a core build that holds it for
@@ -81,16 +81,16 @@ def main():
     m._apply_lock = CountingLock(m._apply_lock)
     before = writes["n"]
     for _ in range(50):
-        m.note_central(PANEL_IP, PANEL_PORT)
+        m.note_central(PANEL_IP, PANEL_PORT, False)
     chk("an unchanged callback writes nothing", writes["n"] - before, 0)
     chk("and never takes the lock a core build holds", m._apply_lock.n, 0)
 
     # the panel moved to another port -> one write, not fifty, and that write IS serialized with every
     # other node.conf writer (the TOFU pin, the ops) so it cannot clobber one of them
     locks_before = m._apply_lock.n
-    m.note_central(PANEL_IP, 8443)
+    m.note_central(PANEL_IP, 8443, False)
     with open(conf_path) as f:
-        chk("a changed callback is persisted", json.load(f).get("central_cb"), [PANEL_IP, 8443])
+        chk("a changed callback is persisted", json.load(f).get("central_cb"), [PANEL_IP, 8443, False])
     chk("exactly one write for one change", writes["n"] - before, 1)
     chk("the write is serialized with the other conf writers", m._apply_lock.n - locks_before, 1)
 
@@ -98,7 +98,7 @@ def main():
     m2 = load(conf_path)
     chk("a fresh process starts out blind", m2.get_central(), None)
     m2._seed_central_cb()
-    chk("seeding restores the callback from node.conf", m2.get_central(), (PANEL_IP, 8443))
+    chk("seeding restores the callback from node.conf", m2.get_central(), (PANEL_IP, 8443, False))
 
     called = {}
     m2.urllib.request.urlopen = lambda req, timeout=8: (_ for _ in ()).throw(
@@ -124,10 +124,28 @@ def main():
     chk("the check-in succeeds after a reboot", m2.do_checkin(), True)
     chk("and it goes to the persisted address", called.get("url"),
         "http://%s:%d/api/checkin" % (PANEL_IP, 8443))
+
+    # ---- the scheme is part of the origin, and it decides where the check-in is sent
+    m2.note_central(PANEL_IP, 9443, True)
+    chk("a TLS panel is learned as one", m2.get_central(), (PANEL_IP, 9443, True))
+    chk("...and the rendered origin is https", m2.central_origin(), "https://%s:9443" % PANEL_IP)
+    m2.do_checkin()
+    chk("...so the check-in goes to https, not to a TLS port in the clear", called.get("url"),
+        "https://%s:9443/api/checkin" % PANEL_IP)
+    # ...and the one plaintext exception closes itself the moment the panel is TLS
+    chk("a plaintext fetch from the panel's own address is now refused",
+        m2._is_central_origin("http://%s:9443/api/dl" % PANEL_IP), False)
+    m2.note_central(PANEL_IP, 2053, False)
+    chk("...and allowed again when the panel really is plain http",
+        m2._is_central_origin("http://%s:2053/api/dl" % PANEL_IP), True)
     chk("carrying our token so the panel can identify us", called["body"].get("token"), "tok")
 
     # a junk value in node.conf must not crash the agent or invent a callback
-    for junk in ("nonsense", [PANEL_IP], [PANEL_IP, "x"], ["not-an-ip", 2053], [PANEL_IP, 99999]):
+    # A pair with no scheme is junk too: it is what an older agent wrote, and guessing http for a
+    # panel that has since moved to https would send the check-in at a TLS port in the clear. The
+    # panel re-teaches the whole origin on its next request, one poll away.
+    for junk in ("nonsense", [PANEL_IP], [PANEL_IP, "x", False], ["not-an-ip", 2053, False],
+                 [PANEL_IP, 99999, False], [PANEL_IP, 2053]):
         with open(conf_path) as f:
             c = json.load(f)
         c["central_cb"] = junk
