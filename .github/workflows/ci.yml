@@ -56,3 +56,5 @@ jobs:
         env:
           CORE_REPO: ${{ github.workspace }}/core-checkout
         run: python tools/pooled_raw_binds_wildcard_test.py
+      - name: a signed request cannot be replayed or forged
+        run: python tools/signed_request_test.py
