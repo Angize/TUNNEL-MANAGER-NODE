@@ -3549,6 +3549,18 @@ def _is_central_origin(u):
         return False
 
 
+def _resumes_at(resp, offset):
+    """True when this response really is the rest of the file from `offset`.
+
+    A 206 alone is not enough: the status says "partial" while the body may be a full copy, and taking
+    it on trust appends one to what is already held. Only Content-Range says where the bytes actually
+    start, so a 206 without a readable one is refused too."""
+    if resp.status != 206:
+        return False
+    m = re.match(r"\s*bytes\s+(\d+)-", resp.headers.get("Content-Range", "") or "")
+    return bool(m) and int(m.group(1)) == offset
+
+
 def _fetch_url(url, max_bytes, timeout=45, budget=FETCH_BUDGET):
     """Download url and return its bytes. Used ONLY in the panel's "let the node fetch it" delivery mode:
     the panel still sends the sha256 and its signature over that sha, and the caller checks both before
@@ -3579,8 +3591,9 @@ def _fetch_url(url, max_bytes, timeout=45, budget=FETCH_BUDGET):
     # every attempt starts from zero -- MEASURED on the real path, that is exactly what happened. Ask
     # for the rest instead, so each attempt only has to carry what is left. A server with no Range
     # support answers 200 with the whole body, which is the same as never having asked.
+    done = False
     for _ in range(FETCH_TRIES):
-        if time.monotonic() >= deadline:
+        if done or time.monotonic() >= deadline:
             break
         hdrs = {"User-Agent": "tnl-node"}
         if got:
@@ -3588,8 +3601,13 @@ def _fetch_url(url, max_bytes, timeout=45, budget=FETCH_BUDGET):
         req = urllib.request.Request(u, headers=hdrs)
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:
-                if got and r.status != 206:
-                    chunks, got = [], 0   # served from the start again: keeping the old bytes would splice
+                # Keep what we hold only if this really is the continuation we asked for. A 200 is the
+                # whole file again; so is a 206 whose Content-Range starts anywhere but where we
+                # stopped -- and THAT one is the dangerous shape, because the status says "partial"
+                # while the body is a full copy. Appending either one splices, and the sha gate then
+                # reports «checksum mismatch» about a file that was never wrong.
+                if got and not _resumes_at(r, got):
+                    chunks, got = [], 0
                 try:
                     n = int(r.headers.get("Content-Length") or 0)
                 except (TypeError, ValueError):
@@ -3604,15 +3622,21 @@ def _fetch_url(url, max_bytes, timeout=45, budget=FETCH_BUDGET):
                     # the rate measured on the real path, minutes. read1 returns what has arrived.
                     c = r.read1(FETCH_CHUNK)
                     if not c:
+                        # The body ended. That is the ONLY reliable "finished" signal: a server may
+                        # send no Content-Length at all, and treating its absence as "not finished"
+                        # re-fetches a complete file until the attempts run out -- MEASURED: six
+                        # requests for a file served whole on the first, and a 416 on the last of them
+                        # thrown in place of the bytes already in hand. Where the size IS declared, an
+                        # end short of it is the close-mid-body case instead, and resuming is exactly
+                        # what that wants.
+                        done = not want or got >= want
                         break
                     chunks.append(c)
                     got += len(c)
             err = None
         except Exception as e:
             err = e          # a cut mid-body: whatever arrived is kept, and the next try asks for the rest
-        if want and got >= want:
-            break
-    if err is not None and not (want and got >= want):
+    if err is not None and not done:
         raise err
     buf = b"".join(chunks)
     if len(buf) > max_bytes:

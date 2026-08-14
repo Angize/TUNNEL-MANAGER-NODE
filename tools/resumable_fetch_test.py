@@ -120,6 +120,66 @@ class NoRange(Base):
         self.wfile.write(BLOB)
 
 
+class NoLength(Base):
+    """Serves the whole file close-framed, with NO Content-Length -- and answers 416 for a start past
+    the end, exactly as this panel's own /api/dl does."""
+    hits = [0]
+
+    def do_GET(self):
+        NoLength.hits[0] += 1
+        s = self.start()
+        if s >= len(BLOB):
+            self.send_response(416)
+            self.send_header("Content-Range", "bytes */%d" % len(BLOB))
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.end_headers()
+        try:
+            self.wfile.write(BLOB[s:])
+            self.wfile.flush()
+        except OSError:
+            pass
+        self.close_connection = True
+
+
+class LyingRange(Base):
+    """Answers 206 -- and sends from byte 0 whatever offset was asked for.
+
+    The dangerous shape: the STATUS says partial while the BODY is a full copy, so a client that trusts
+    the status appends one to what it already holds. Nothing bad is installed (the sha gate stops it),
+    but it reports «checksum mismatch» about a file that was never wrong."""
+    hits = [0]
+    drop_cr = False
+
+    def do_GET(self):
+        type(self).hits[0] += 1
+        if type(self).hits[0] == 1:
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(BLOB)))
+            self.end_headers()
+            try:
+                self.wfile.write(BLOB[:1000])
+                self.wfile.flush()
+                self.connection.close()
+            except OSError:
+                pass
+            return
+        self.send_response(206)
+        self.send_header("Content-Length", str(len(BLOB)))
+        if not type(self).drop_cr:
+            self.send_header("Content-Range", "bytes 0-%d/%d" % (len(BLOB) - 1, len(BLOB)))
+        self.end_headers()
+        self.wfile.write(BLOB)
+
+
+class NoContentRange(LyingRange):
+    """A 206 with no Content-Range at all — nothing says where the bytes start, so it cannot be trusted
+    as a continuation either."""
+    hits = [0]
+    drop_cr = True
+
+
 class Instant(Base):
     """Accepts the connection and drops it with nothing at all. The pathological case."""
     hits = [0]
@@ -171,6 +231,45 @@ def main():
         check("the file is exactly one copy", False, "%s: %s" % (type(e).__name__, e))
     finally:
         srv.shutdown()
+
+    print("== a server that declares no size is fetched ONCE, not until the tries run out ==")
+    # Content-Length is not the finish line; the body ENDING is. Reading it as the finish line makes a
+    # complete file look unfinished, so the node asks for a range past the end -- and this panel answers
+    # 416 there, which was then raised in place of the bytes already in hand. MEASURED before the fix:
+    # six requests for a file served whole on the first, and an exception instead of the file.
+    srv, url = serve(NoLength)
+    try:
+        buf = None
+        try:
+            buf = N._fetch_url(url, 8 << 20, timeout=5, budget=30)
+        except Exception as e:
+            check("the file comes back rather than an exception", False, "%s: %s" % (type(e).__name__, e))
+        if buf is not None:
+            check("the file comes back rather than an exception", len(buf) == len(BLOB),
+                  "%d of %d" % (len(buf), len(BLOB)))
+            check("...intact", hashlib.sha256(buf).hexdigest() == SHA)
+        # OUTSIDE the success path: the request COUNT is what says the file was not re-fetched, and it
+        # is recorded whether the fetch ended with bytes or with an exception. Inside, the mutation
+        # that reintroduces the bug raises before this line and leaves the claim unmade.
+        check("...in ONE request", NoLength.hits[0] == 1, "%d requests" % NoLength.hits[0])
+    finally:
+        srv.shutdown()
+
+    print("== a 206 that is NOT the continuation must not be spliced either ==")
+    # Checking the STATUS is not enough. MEASURED before this: 263,144 bytes and a wrong hash, from a
+    # server that answered 206 and sent from zero.
+    for H, label in ((LyingRange, "a 206 from the wrong offset"),
+                     (NoContentRange, "a 206 with no Content-Range")):
+        srv, url = serve(H)
+        try:
+            buf = N._fetch_url(url, 8 << 20, timeout=5, budget=30)
+            check("%s is taken as a fresh start" % label, len(buf) == len(BLOB),
+                  "%d of %d" % (len(buf), len(BLOB)))
+            check("...so the file still hashes correctly", hashlib.sha256(buf).hexdigest() == SHA)
+        except Exception as e:
+            check("%s is taken as a fresh start" % label, False, "%s: %s" % (type(e).__name__, e))
+        finally:
+            srv.shutdown()
 
     print("== a path that gives nothing at all is bounded, and says so ==")
     srv, url = serve(Instant)
