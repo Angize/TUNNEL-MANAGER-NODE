@@ -196,8 +196,11 @@ def main():
         opened = []
 
         class FakeResp:
-            def __init__(self, body):
+            def __init__(self, body, declared=None):
                 self.body = body
+                # A real server announces the full size and can still close mid-body; read() then
+                # returns SHORT and raises nothing. `declared` is how that is reproduced here.
+                self.headers = {"Content-Length": str(len(body) if declared is None else declared)}
 
             def read(self, n=-1):
                 return self.body[:n] if n and n > 0 else self.body
@@ -210,9 +213,9 @@ def main():
 
         def fake_urlopen(req, timeout=None):
             opened.append(getattr(req, "full_url", req))
-            return FakeResp(body[0])
+            return FakeResp(body[0], declared[0])
 
-        body = [b"x" * 10]
+        body, declared = [b"x" * 10], [None]
         saved_open = mod.urllib.request.urlopen
         mod.urllib.request.urlopen = fake_urlopen
         try:
@@ -246,6 +249,27 @@ def main():
                 fail("_fetch_url did not return the body it downloaded")
             else:
                 ok("_fetch_url returns the body of an acceptable download")
+
+            # A CUT TRANSFER MUST SAY SO. Without this the short body reaches the sha256 gate and comes
+            # back as «checksum mismatch», which blames the file the panel staged for a transfer that
+            # was cut -- measured against a real panel at 5613896 of 11243704 bytes.
+            body[0], declared[0] = b"x" * 400, 1000
+            try:
+                mod._fetch_url("https://example/core", 65536)
+                fail("_fetch_url accepted a body shorter than its own Content-Length")
+            except ValueError as e:
+                msg = str(e).lower()
+                if "truncated" in msg and "400" in msg and "1000" in msg:
+                    ok("_fetch_url refuses a truncated download and names both sizes")
+                else:
+                    fail("_fetch_url refused the truncation but said %r" % str(e))
+            # ...and it must not turn a server that declares nothing into a failure.
+            body[0], declared[0] = b"fine", 0
+            if mod._fetch_url("https://example/a.py", 1024) != b"fine":
+                fail("_fetch_url refused a download whose server declared no Content-Length")
+            else:
+                ok("_fetch_url still accepts a body with no Content-Length declared")
+            declared[0] = None
 
             # The ONE plaintext exception: the panel's own origin, and only while the node really has
             # one pinned. The panel runs plain HTTP today; nothing else may be fetched that way.
