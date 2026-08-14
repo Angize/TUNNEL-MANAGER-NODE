@@ -2323,11 +2323,19 @@ _SELF_SHA = _self_sha()
 #
 # The body's hash rides in a HEADER on purpose: the signature can then be checked before a single byte
 # of the body is read, so an unauthenticated caller cannot make the node buffer 20 MB to be rejected.
-# The counter must strictly increase, which is what makes a captured request useless the second time.
-REQ_CTR_STEP = 256      # how far AHEAD of the last accepted counter the file on disk is kept
+# Each counter is single-use, which is what makes a captured request useless the second time.
+#
+# Single-use, NOT strictly increasing. The panel talks to one node from several background loops at
+# once, so two requests routinely leave together and arrive in the other order; demanding an increase
+# refuses the one that lost the race even though it is a first-time request. So the mark is a sliding
+# window with a bitmask of what inside it was spent -- the anti-replay IPsec and WireGuard use.
+REQ_CTR_STEP = 256          # how far AHEAD of the last accepted counter the file on disk is kept
+REQ_CTR_WINDOW = 4096       # counters are milliseconds, so this is ~4 s of reordering tolerance
+_REQ_CTR_MASK = (1 << REQ_CTR_WINDOW) - 1
 
 _req_ctr_lock = threading.Lock()
 _req_ctr = 0            # highest counter accepted in this process
+_req_seen = 0           # bit i set == counter (_req_ctr - i) was already spent
 _req_ctr_hwm = 0        # highest counter written to node.conf
 
 
@@ -2338,14 +2346,18 @@ _req_ctr_hwm = 0        # highest counter written to node.conf
 
 def _seed_req_ctr():
     """Resume the counter at the persisted mark, which is deliberately AHEAD of anything accepted, so a
-    restart cannot reopen a window the panel has already spent."""
-    global _req_ctr, _req_ctr_hwm
+    restart cannot reopen a window the panel has already spent.
+
+    The window comes back FULL, not empty: an empty one would treat every counter below the mark as
+    unspent and hand a restart back the replay window the mark exists to close."""
+    global _req_ctr, _req_seen, _req_ctr_hwm
     try:
         v = int(load_conf().get("req_ctr") or 0)
     except Exception:
         v = 0
     with _req_ctr_lock:
         _req_ctr = _req_ctr_hwm = v
+        _req_seen = _REQ_CTR_MASK
 
 
 def _persist_req_ctr(hwm):
@@ -2362,15 +2374,26 @@ def _persist_req_ctr(hwm):
 
 
 def _accept_ctr(ctr):
-    """True when `ctr` is new. Advances the mark on disk in steps, not per request."""
-    global _req_ctr, _req_ctr_hwm
+    """True when `ctr` has not been spent before. Advances the mark on disk in steps, not per request.
+
+    Ahead of the window: slide up to it. Inside it: accept once, refuse the second time. Below it:
+    refuse -- too old to still be tracked, and the panel resyncs off the 409 rather than being stranded."""
+    global _req_ctr, _req_seen, _req_ctr_hwm
     hwm = None
     with _req_ctr_lock:
-        if ctr <= _req_ctr:
-            return False
-        _req_ctr = ctr
-        if ctr >= _req_ctr_hwm:
-            _req_ctr_hwm = hwm = ctr + REQ_CTR_STEP
+        if ctr > _req_ctr:
+            step = ctr - _req_ctr
+            # A jump past the whole window leaves nothing worth shifting in, and shifting by it would
+            # build an integer that many bits wide.
+            _req_seen = 1 if step >= REQ_CTR_WINDOW else ((_req_seen << step) | 1) & _REQ_CTR_MASK
+            _req_ctr = ctr
+            if ctr >= _req_ctr_hwm:
+                _req_ctr_hwm = hwm = ctr + REQ_CTR_STEP
+        else:
+            bit = _req_ctr - ctr
+            if bit >= REQ_CTR_WINDOW or (_req_seen >> bit) & 1:
+                return False
+            _req_seen |= 1 << bit
     if hwm is not None:
         threading.Thread(target=_persist_req_ctr, args=(hwm,), daemon=True).start()
     return True
