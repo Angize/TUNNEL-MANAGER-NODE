@@ -138,7 +138,19 @@ def main():
     m2.note_central(PANEL_IP, 2053, False)
     chk("...and allowed again when the panel really is plain http",
         m2._is_central_origin("http://%s:2053/api/dl" % PANEL_IP), True)
-    chk("carrying our token so the panel can identify us", called["body"].get("token"), "tok")
+    # The check-in used to POST the raw token. It carries a FINGERPRINT of it now, plus an HMAC over
+    # the rest of the claim -- so the secret does not cross the wire in this direction either, and a
+    # listener who copies the fingerprint still cannot produce the signature.
+    import base64 as _b64, hashlib as _h, hmac as _hm, json as _j
+    body = called["body"]
+    chk("the check-in carries no token", "token" in body, False)
+    chk("...it identifies us by a fingerprint of it", body.get("fp"), _h.sha256(b"tok").hexdigest())
+    signed = {k: v for k, v in body.items() if k != "sig"}
+    want = _b64.b64encode(_hm.new(b"tok", _j.dumps(signed, sort_keys=True, separators=(",", ":")).encode(),
+                                  _h.sha256).digest()).decode()
+    chk("...and is signed with it", body.get("sig"), want)
+    chk("...and carries a counter, so a captured check-in cannot be replayed",
+        isinstance(body.get("ctr"), int) and body["ctr"] > 0, True)
 
     # a junk value in node.conf must not crash the agent or invent a callback
     # A pair with no scheme is junk too: it is what an older agent wrote, and guessing http for a

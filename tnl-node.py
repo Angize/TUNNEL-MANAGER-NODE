@@ -12,8 +12,10 @@
 #   sudo python3 tnl-node.py --show            # print host / port / token for the central panel
 #   sudo python3 tnl-node.py                   # run (used by systemd): re-apply configs, then serve
 #
-# Auth: every request must carry header  X-Node-Token: <token>  (constant-time compared). Plain HTTP —
-# expose the agent port to the central server only.
+# Auth: the panel SIGNS every request -- X-Ctr + X-Body + X-Sig, an HMAC keyed on this node's token
+# over the method, path, counter and body hash. The token itself never crosses the wire, in either
+# direction, and a captured request cannot be replayed. Plain HTTP -- expose the agent port to the
+# central server only.
 
 import base64
 import errno
@@ -2471,11 +2473,22 @@ def do_checkin():
         conf = load_conf()
     except Exception:
         return False
-    # The PORT goes with the addresses. Without it the self-heal chain covers only half of "where this
-    # node is": a node whose agent port changed is unreachable and cannot say so, and the operator has
-    # to find it and edit the record by hand.
-    body = json.dumps({"token": conf.get("token", ""), "ips": all_ips(),
-                       "port": conf.get("port"), "hostname": socket.gethostname()}).encode()
+    # The check-in used to POST the raw token, which made this the one direction where the secret still
+    # crossed the wire. Whoever saw it could not command the node -- that needs a signature -- but they
+    # could tell the panel "this node moved to my address", answer its signed probe with the key they
+    # had just been handed, and take over the node's control traffic. So it is signed like everything
+    # else, and identified by a FINGERPRINT of the token, which proves nothing on its own.
+    #
+    # The PORT rides along: without it the self-heal covers only half of "where this node is" -- an
+    # agent that moved port is unreachable and cannot say so.
+    tok = conf.get("token", "")
+    claim = {"fp": hashlib.sha256(tok.encode()).hexdigest(), "ips": all_ips(),
+             "port": conf.get("port"), "hostname": socket.gethostname(),
+             "ctr": int(time.time() * 1000)}
+    claim["sig"] = base64.b64encode(hmac.new(
+        tok.encode(), json.dumps(claim, sort_keys=True, separators=(",", ":")).encode(),
+        hashlib.sha256).digest()).decode()
+    body = json.dumps(claim).encode()
     url = central_origin() + "/api/checkin"
     req = urllib.request.Request(url, data=body, method="POST",
                                  headers={"Content-Type": "application/json"})
