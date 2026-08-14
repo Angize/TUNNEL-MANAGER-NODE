@@ -282,7 +282,7 @@ def main():
                 except ValueError:
                     ok("_fetch_url refuses plaintext when no panel origin is pinned")
 
-                mod._central_cb = ("10.9.9.9", 2053)
+                mod._central_cb = ("10.9.9.9", 2053, False)
                 opened.clear()
                 if mod._fetch_url("http://10.9.9.9:2053/api/artifact", 1024) != b"fine" or not opened:
                     fail("_fetch_url refused plaintext from the panel's OWN origin, so a plain-HTTP "
@@ -296,6 +296,14 @@ def main():
                         fail("_fetch_url accepted plaintext from %s" % why)
                     except ValueError:
                         ok("_fetch_url still refuses plaintext from %s" % why)
+                # ...and once the panel announces TLS, its own origin is https, so the plaintext
+                # exception has nothing left to apply to and closes itself.
+                mod._central_cb = ("10.9.9.9", 2053, True)
+                try:
+                    mod._fetch_url("http://10.9.9.9:2053/api/artifact", 1024)
+                    fail("_fetch_url accepted plaintext from a panel that announced TLS")
+                except ValueError:
+                    ok("_fetch_url refuses plaintext once the panel announces TLS")
             finally:
                 mod._central_cb = saved_cb
         finally:
