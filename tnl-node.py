@@ -2339,6 +2339,80 @@ def _ip_in_allow(ip, allow):
     return False
 
 
+# ----------------------------------------------------------------------------- signed control requests
+# The panel proves it is the panel by SIGNING the request instead of handing over the shared secret.
+# What is signed is the method, the path, a counter and the sha256 of the body:
+#
+#     X-Ctr:  8241
+#     X-Body: <sha256 hex of the body, "" when there is none>
+#     X-Sig:  base64 HMAC-SHA256(token, "METHOD\npath\nctr\nbodysha")
+#
+# The body's hash rides in a HEADER on purpose: the signature can then be checked before a single byte
+# of the body is read, so an unauthenticated caller cannot make the node buffer 20 MB to be rejected.
+# The counter must strictly increase, which is what makes a captured request useless the second time.
+REQ_CTR_STEP = 256      # how far AHEAD of the last accepted counter the file on disk is kept
+
+_req_ctr_lock = threading.Lock()
+_req_ctr = 0            # highest counter accepted in this process
+_req_ctr_hwm = 0        # highest counter written to node.conf
+
+
+def _seed_req_ctr():
+    """Resume the counter at the persisted mark, which is deliberately AHEAD of anything accepted, so a
+    restart cannot reopen a window the panel has already spent."""
+    global _req_ctr, _req_ctr_hwm
+    try:
+        v = int(load_conf().get("req_ctr") or 0)
+    except Exception:
+        v = 0
+    with _req_ctr_lock:
+        _req_ctr = _req_ctr_hwm = v
+
+
+def _persist_req_ctr(hwm):
+    """Write the mark OFF the request path. _apply_lock is held by a core build for 8-16 s at worst, and
+    a health ping that waited for it would read as a dead node."""
+    with _apply_lock:
+        try:
+            conf = load_conf()
+            if int(conf.get("req_ctr") or 0) < hwm:
+                conf["req_ctr"] = hwm
+                save_conf(conf)
+        except Exception as e:
+            logline(f"req_ctr persist: {e}")
+
+
+def _accept_ctr(ctr):
+    """True when `ctr` is new. Advances the mark on disk in steps, not per request."""
+    global _req_ctr, _req_ctr_hwm
+    hwm = None
+    with _req_ctr_lock:
+        if ctr <= _req_ctr:
+            return False
+        _req_ctr = ctr
+        if ctr >= _req_ctr_hwm:
+            _req_ctr_hwm = hwm = ctr + REQ_CTR_STEP
+    if hwm is not None:
+        threading.Thread(target=_persist_req_ctr, args=(hwm,), daemon=True).start()
+    return True
+
+
+def _sig_msg(method, path, ctr, body_sha):
+    return "%s\n%s\n%s\n%s" % (method, path, ctr, body_sha)
+
+
+def _sig_ok(secret, method, path, ctr, body_sha, sig_b64):
+    """Constant-time check of the panel's HMAC over this request's own header values."""
+    try:
+        want = hmac.new(secret.encode("utf-8"),
+                        _sig_msg(method, path, ctr, body_sha).encode("utf-8"),
+                        hashlib.sha256).digest()
+        got = base64.b64decode(sig_b64, validate=True)
+    except Exception:
+        return False
+    return hmac.compare_digest(want, got)
+
+
 def _central_ip_ok(ip):
     """Gate which source IP may become our check-in callback. An explicit `central_allow`
     (host/CIDR list) in node.conf wins; otherwise the panel IP is pinned on first contact and
@@ -4034,17 +4108,30 @@ class Handler(BaseHTTPRequestHandler):
             return
         BaseHTTPRequestHandler.handle(self)   # normal (keep-alive) request loop, holding one permit
 
-    def _authed(self):
-        tok = self.headers.get("X-Node-Token", "")
+    def _authed(self, method):
+        """How this request proved it came from the panel: "sig", "token", or "" for neither.
+
+        Both are accepted for exactly one release. The signature is the destination -- it never puts the
+        secret on the wire and a captured request cannot be replayed -- and the bare token is what every
+        deployed panel still sends. Keeping both for one release is what lets the changeover happen
+        without every node being reachable in the same minute; the token half goes once the whole fleet
+        is on this version."""
         want = self.server.conf.get("token", "")
-        if not tok or not want:
-            return False
+        if not want:
+            return ""
+        sig = self.headers.get("X-Sig", "")
+        if sig:
+            return "sig" if _sig_ok(want, method, self.path, self.headers.get("X-Ctr", ""),
+                                    self.headers.get("X-Body", ""), sig) else ""
+        tok = self.headers.get("X-Node-Token", "")
+        if not tok:
+            return ""
         try:
             # compare on bytes: a non-ASCII X-Node-Token would make compare_digest(str, str) raise
             # TypeError (→ connection reset). Encoding first keeps it constant-time and fail-closed.
-            return hmac.compare_digest(tok.encode("utf-8"), want.encode("utf-8"))
+            return "token" if hmac.compare_digest(tok.encode("utf-8"), want.encode("utf-8")) else ""
         except Exception:
-            return False
+            return ""
 
     def _send(self, code, body):
         data = json.dumps(body).encode()
@@ -4062,11 +4149,21 @@ class Handler(BaseHTTPRequestHandler):
             n = 0
         n = min(max(n, 0), cap)   # default 1MB — headroom for a pushed agent source (JSON-escaped); raised for core uploads
         raw = self.rfile.read(n) if n > 0 else b""
+        self._raw = raw           # kept for the signature's body check, which needs the bytes not the dict
         try:
             obj = json.loads(raw.decode()) if raw else {}
         except Exception:
             return {}
         return obj if isinstance(obj, dict) else {}   # a top-level array/string/number must not reach ops as non-dict
+
+    def _body_matches_sig(self):
+        """The body really is the one X-Body claimed — and therefore the one the signature covered."""
+        raw = getattr(self, "_raw", b"")
+        try:
+            return hmac.compare_digest(self.headers.get("X-Body", "") or "",
+                                       hashlib.sha256(raw).hexdigest() if raw else "")
+        except Exception:   # a non-ASCII header makes compare_digest(str, str) raise
+            return False
 
     def _handle(self, method):
         # The _conn_sem permit is already held for the whole connection (see setup()/handle()), so the
@@ -4079,9 +4176,23 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, {"error": "not found"})
             return
         cmd = WIRE.get(path[5:], "")
-        if not self._authed():
+        how = self._authed(method)
+        if not how:
             self._send(401, {"error": "bad or missing node token"})
             return
+        if how == "sig":
+            try:
+                ctr = int(self.headers.get("X-Ctr", ""))
+            except (TypeError, ValueError):
+                ctr = -1
+            if not _accept_ctr(ctr):
+                # Told ONLY to a caller whose signature already verified. The mark is not a secret, and
+                # handing it back is what lets a panel whose own counter fell behind catch up in one
+                # retry instead of locking itself out of the node for good.
+                with _req_ctr_lock:
+                    cur = _req_ctr
+                self._send(409, {"error": "stale counter", "ctr": cur})
+                return
         cp = self.headers.get("X-Central-Port")
         if cp:
             note_central(self.client_address[0], cp)  # learn where to call /api/checkin back from
@@ -4095,6 +4206,11 @@ class Handler(BaseHTTPRequestHandler):
         # would truncate it and fail the JSON parse, so raise the cap for that op only.
         cap = 20971520 if cmd == "core-install" else 1048576
         d = self._body(cap) if method == "POST" else {}
+        if how == "sig" and not self._body_matches_sig():
+            # The signature covers X-Body, so this is what binds the bytes that arrived to the ones the
+            # panel signed for. A body cut short by the cap above lands here too, which is correct.
+            self._send(401, {"error": "body does not match the signature"})
+            return
         try:
             if cmd in READ_ONLY:
                 res = OPS[cmd](d)
@@ -4356,6 +4472,7 @@ def serve():
     threading.Thread(target=rotation_loop, daemon=True).start()
     threading.Thread(target=health_loop, daemon=True).start()  # keep the health snapshot fresh (O(1) op_list)
     _seed_central_cb()   # know the callback BEFORE the first check-in, so a reboot with a new IP is not fatal
+    _seed_req_ctr()      # resume the replay counter ahead of anything already accepted
     threading.Thread(target=checkin_loop, daemon=True).start()  # phone home to the panel if our IP changes
     httpd = ThreadingHTTPServer(("0.0.0.0", int(conf.get("port", 8099))), Handler)
     httpd.conf = conf
