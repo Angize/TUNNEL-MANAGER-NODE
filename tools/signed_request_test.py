@@ -12,8 +12,9 @@ Four properties, all of which a plausible-looking implementation can lose:
   2. a captured request REPLAYED verbatim is refused -- this is the counter's whole job;
   3. a signature that does not cover THIS request is refused: wrong method, wrong path, wrong body,
      wrong counter, or a signature made with someone else's secret;
-  4. the bare token still works, because a fleet cannot change over in one instant -- and the node
-     must not read the body of a request that proved nothing.
+  4. the bare token proves NOTHING any more -- the changeover window is closed, and a token is exactly
+     what an observer of this wire would have -- and the node must not read the body of a request that
+     proved nothing.
 
 Driven against the REAL handler over a REAL socket. Nothing is stubbed but the config directory.
 
@@ -186,17 +187,32 @@ def main():
             st, dd = call(port, method, path, headers, b)
             check("refuses " + name, st == 401, "got %s %s" % (st, dd))
 
+        # THE DOWNGRADE. Every case above sends a signature ALONE, so none of them can catch a node
+        # that falls back to the token when the signature does not verify. That fallback is exactly the
+        # attack the signature exists to stop: whoever watched this wire before the changeover holds a
+        # valid token, and could pair it with any garbage signature.
+        st, dd = call(port, "GET", "/api/pg",
+                      dict(sign("not-the-token", "GET", "/api/pg", base + 30), **{"X-Node-Token": TOKEN}))
+        check("a bad signature does NOT fall back to a valid token", st == 401, "got %s %s" % (st, dd))
+        st, dd = call(port, "GET", "/api/pg",
+                      {"X-Ctr": str(base + 31), "X-Body": "", "X-Sig": "", "X-Node-Token": TOKEN})
+        check("...nor does an empty one", st == 401, "got %s %s" % (st, dd))
+
         # The body is the one place where the signature and the bytes can drift apart.
         real = json.dumps({"name": "real"}).encode()
         swapped = json.dumps({"name": "swap"}).encode()
         st, dd = call(port, "POST", "/api/ls", sign(TOKEN, "POST", "/api/ls", base + 20, real), swapped)
         check("refuses a body swapped for the one that was signed", st == 401, "got %s %s" % (st, dd))
 
-        print("== 4) the token still works, and an unproven request never reaches the body ==")
+        print("== 4) the token proves nothing any more, and an unproven request never reaches the body ==")
+        # The changeover window is closed. A bearer token is exactly what an observer of this wire
+        # WOULD have, so accepting one would hand the control plane to anyone who watched a request
+        # before the switch -- and the tokens themselves have not been rotated.
         st, d = call(port, "GET", "/api/pg", {"X-Node-Token": TOKEN})
-        check("a bare-token request is still accepted (the changeover window)", served(st), "%s %s" % (st, d))
+        check("the CORRECT bare token is refused: only a signature proves the panel now",
+              st == 401, "%s %s" % (st, d))
         st, _ = call(port, "GET", "/api/pg", {"X-Node-Token": "wrong"})
-        check("a wrong token is still refused", st == 401, str(st))
+        check("...and a wrong one, obviously", st == 401, str(st))
 
         # An unauthenticated caller announcing 20 MB must be answered from the headers alone. If the
         # node reads the body first, this blocks until the socket times out instead.

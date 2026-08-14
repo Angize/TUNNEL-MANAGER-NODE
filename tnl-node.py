@@ -2311,34 +2311,6 @@ def _self_sha():
 _SELF_SHA = _self_sha()
 
 
-# ----------------------------------------------------------------------------- central check-in
-# The panel reaches us at host:port from its registry, so if our public IP changes we phone home. We
-# learn the panel's callback from its INCOMING requests — and because the check-in POSTs the node's
-# bearer token, that callback is pinned to one source IP (persisted, or set via `central_allow`).
-
-def _ip_in_allow(ip, allow):
-    """True if ip matches any host/CIDR in `allow` (a str list or a comma/space-separated string)."""
-    if isinstance(allow, str):
-        allow = re.split(r"[,\s]+", allow.strip())
-    try:
-        a = ipaddress.ip_address(ip)
-    except ValueError:
-        return False
-    for entry in allow or []:
-        entry = str(entry).strip()
-        if not entry:
-            continue
-        try:
-            if "/" in entry:
-                if a in ipaddress.ip_network(entry, strict=False):
-                    return True
-            elif a == ipaddress.ip_address(entry):
-                return True
-        except ValueError:
-            continue
-    return False
-
-
 # ----------------------------------------------------------------------------- signed control requests
 # The panel proves it is the panel by SIGNING the request instead of handing over the shared secret.
 # What is signed is the method, the path, a counter and the sha256 of the body:
@@ -2356,6 +2328,11 @@ _req_ctr_lock = threading.Lock()
 _req_ctr = 0            # highest counter accepted in this process
 _req_ctr_hwm = 0        # highest counter written to node.conf
 
+
+# ----------------------------------------------------------------------------- central check-in
+# The panel reaches us at host:port from its registry, so if our public IP changes we phone home. Where
+# to phone is learned from the panel's own INCOMING requests, which are signed — so it moves when the
+# panel does, and only the holder of our key can move it.
 
 def _seed_req_ctr():
     """Resume the counter at the persisted mark, which is deliberately AHEAD of anything accepted, so a
@@ -2413,46 +2390,6 @@ def _sig_ok(secret, method, path, ctr, body_sha, sig_b64):
     return hmac.compare_digest(want, got)
 
 
-def _central_ip_ok(ip):
-    """Gate which source IP may become our check-in callback. An explicit `central_allow`
-    (host/CIDR list) in node.conf wins; otherwise the panel IP is pinned on first contact and
-    persisted, so a later token-bearing request from a DIFFERENT host cannot hijack the callback
-    and exfiltrate our token."""
-    # Fast, LOCK-FREE read path — runs for EVERY request (incl. read-only ping/list). Only the
-    # rare first-contact TOFU write needs _apply_lock; never take it on the steady-state path,
-    # or a slow core build (holding _apply_lock ~8-16s) would make every health ping block and
-    # the panel read the node as down mid-build.
-    try:
-        conf = load_conf()
-    except Exception:
-        return False
-    allow = conf.get("central_allow")
-    if allow:
-        return _ip_in_allow(ip, allow)
-    pinned = conf.get("central_ip")
-    if pinned:
-        return ip == pinned
-    # No pin yet: a persist IS required. Take _apply_lock only now and RE-CHECK under it (a
-    # concurrent request may have pinned meanwhile) so we can't lose a write / clobber a peer's.
-    with _apply_lock:
-        try:
-            conf = load_conf()
-        except Exception:
-            return False
-        allow = conf.get("central_allow")
-        if allow:
-            return _ip_in_allow(ip, allow)
-        pinned = conf.get("central_ip")
-        if pinned:
-            return ip == pinned
-        try:                   # trust-on-first-use: remember the first panel IP we ever learn
-            conf["central_ip"] = ip
-            save_conf(conf)
-        except Exception:
-            pass
-        return True
-
-
 def note_central(ip, port, tls):
     """Learn where the panel is from the request it just made: the address it reached us from, the port
     it advertises, and whether that port speaks TLS. Nothing here is configured on the node, so the
@@ -2465,11 +2402,6 @@ def note_central(ip, port, tls):
     if not (1 <= p <= 65535):  # X-Central-Port is fully attacker-controlled — bound it
         return
     cb = (ip, p, bool(tls))
-    # _central_ip_ok is lock-free on the common read path and takes _apply_lock ITSELF only for the
-    # rare first-contact TOFU write (re-checking under the lock to stay race-safe). Don't wrap it here,
-    # or every request — including read-only pings — would serialize behind a long core build.
-    if not _central_ip_ok(ip):
-        return
     with _central_cb_lock:
         if _central_cb == cb:
             return          # steady state: never touch node.conf on a request that changes nothing
@@ -4138,29 +4070,22 @@ class Handler(BaseHTTPRequestHandler):
         BaseHTTPRequestHandler.handle(self)   # normal (keep-alive) request loop, holding one permit
 
     def _authed(self, method):
-        """How this request proved it came from the panel: "sig", "token", or "" for neither.
+        """"sig" when this request proved it came from the panel, "" otherwise.
 
-        Both are accepted for exactly one release. The signature is the destination -- it never puts the
-        secret on the wire and a captured request cannot be replayed -- and the bare token is what every
-        deployed panel still sends. Keeping both for one release is what lets the changeover happen
-        without every node being reachable in the same minute; the token half goes once the whole fleet
-        is on this version."""
+        A SIGNATURE is now the only proof. The bearer token is gone from the wire entirely: it was a
+        secret that crossed a censored path on every request and could be replayed forever, and the
+        changeover window that accepted both has closed.
+
+        The token is still the shared secret -- it is what the HMAC is keyed on -- it is simply never
+        transmitted again."""
         want = self.server.conf.get("token", "")
         if not want:
             return ""
         sig = self.headers.get("X-Sig", "")
-        if sig:
-            return "sig" if _sig_ok(want, method, self.path, self.headers.get("X-Ctr", ""),
-                                    self.headers.get("X-Body", ""), sig) else ""
-        tok = self.headers.get("X-Node-Token", "")
-        if not tok:
+        if not sig:
             return ""
-        try:
-            # compare on bytes: a non-ASCII X-Node-Token would make compare_digest(str, str) raise
-            # TypeError (→ connection reset). Encoding first keeps it constant-time and fail-closed.
-            return "token" if hmac.compare_digest(tok.encode("utf-8"), want.encode("utf-8")) else ""
-        except Exception:
-            return ""
+        return "sig" if _sig_ok(want, method, self.path, self.headers.get("X-Ctr", ""),
+                                self.headers.get("X-Body", ""), sig) else ""
 
     def _send(self, code, body):
         data = json.dumps(body).encode()
