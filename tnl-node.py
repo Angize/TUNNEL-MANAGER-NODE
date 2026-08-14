@@ -2539,8 +2539,11 @@ def do_checkin():
         conf = load_conf()
     except Exception:
         return False
+    # The PORT goes with the addresses. Without it the self-heal chain covers only half of "where this
+    # node is": a node whose agent port changed is unreachable and cannot say so, and the operator has
+    # to find it and edit the record by hand.
     body = json.dumps({"token": conf.get("token", ""), "ips": all_ips(),
-                       "hostname": socket.gethostname()}).encode()
+                       "port": conf.get("port"), "hostname": socket.gethostname()}).encode()
     url = central_origin() + "/api/checkin"
     req = urllib.request.Request(url, data=body, method="POST",
                                  headers={"Content-Type": "application/json"})
