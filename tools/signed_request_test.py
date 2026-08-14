@@ -236,6 +236,55 @@ def main():
         mod._seed_req_ctr()                      # what a restart does
         st, _ = call(port, "GET", "/api/pg", sign(TOKEN, "GET", "/api/pg", highest))
         check("after a restart, a counter already spent is still refused", st == 409, str(st))
+        with mod._req_ctr_lock:
+            mark = mod._req_ctr
+        # The window comes back from a restart FULL. An empty one would call everything below the mark
+        # unspent and hand back exactly the replay window the mark exists to close.
+        st, _ = call(port, "GET", "/api/pg", sign(TOKEN, "GET", "/api/pg", mark - 1))
+        check("...and so is one just under the mark, not only the mark itself", st == 409, str(st))
+
+        print("== 6) requests that arrive out of ORDER are all served, each still only once ==")
+        # The panel talks to one node from five background loops plus the operator's own click, so two
+        # requests routinely leave together and arrive in the other order. Demanding a strict increase
+        # refused whichever one lost the race -- a first-time request, not a replay. Measured live before
+        # this was fixed: 7 of 8 concurrent signed requests came back 409.
+        base = mark + 10000
+        rev = list(range(9, -1, -1))             # highest FIRST: every later one lands inside the window
+        codes = [call(port, "GET", "/api/pg", sign(TOKEN, "GET", "/api/pg", base + i))[0] for i in rev]
+        check("ten counters delivered newest-first are ALL served",
+              all(served(s) for s in codes), " ".join(str(s) for s in codes))
+
+        st, _ = call(port, "GET", "/api/pg", sign(TOKEN, "GET", "/api/pg", base + 5))
+        check("...and replaying one of them is still refused", st == 409, str(st))
+
+        with mod._req_ctr_lock:
+            top = mod._req_ctr
+        st, _ = call(port, "GET", "/api/pg", sign(TOKEN, "GET", "/api/pg", top - mod.REQ_CTR_WINDOW))
+        check("a counter older than the whole window is refused", st == 409, str(st))
+        st, _ = call(port, "GET", "/api/pg", sign(TOKEN, "GET", "/api/pg", top - mod.REQ_CTR_WINDOW + 1))
+        check("...and the one just inside it is served, so the edge is where it is claimed",
+              served(st), str(st))
+
+        # The same thing the panel actually does: distinct increasing counters, spent from threads that
+        # then race each other to the node. Arrival order is the OS's to decide; every one of them is a
+        # first-time request and every one must be served.
+        alloc = [base + 1000 + i for i in range(24)]
+        got = {}
+        lk = threading.Lock()
+
+        def fire(c):
+            s, _d = call(port, "GET", "/api/pg", sign(TOKEN, "GET", "/api/pg", c))
+            with lk:
+                got[c] = s
+
+        ts = [threading.Thread(target=fire, args=(c,)) for c in alloc]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        refused = sorted(c for c, s in got.items() if s == 409)
+        check("24 concurrent signed requests: none refused as stale",
+              not refused, "%d refused: %s" % (len(refused), refused[:6]))
     finally:
         srv.shutdown()
         srv.server_close()
