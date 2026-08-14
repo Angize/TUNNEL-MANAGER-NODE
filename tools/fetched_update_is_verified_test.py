@@ -205,6 +205,15 @@ def main():
             def read(self, n=-1):
                 return self.body[:n] if n and n > 0 else self.body
 
+            # _fetch_url reads with read1, not read: read() blocks until the buffer is FULL, which
+            # makes the fetch budget overshoot by a whole chunk. The stub follows the real interface,
+            # and drains so the resume loop sees an end.
+            def read1(self, n=-1):
+                out, self.body = (self.body[:n] if n and n > 0 else self.body), b""
+                return out
+
+            status = 200
+
             def __enter__(self):
                 return self
 

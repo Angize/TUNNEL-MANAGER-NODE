@@ -3521,6 +3521,14 @@ CORE_SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 # URL that answers with something enormous cannot fill the disk before the sha256 gate ever runs.
 FETCH_MAX_AGENT = 262144
 FETCH_MAX_CORE = 64 << 20
+# How long the whole fetch may take, and how much is read per call. The budget has to sit UNDER the
+# panel's own wait for this op's answer, or the panel gives up first and reports a failure for an
+# install that is still running -- see _fetch_url.
+FETCH_BUDGET = 150
+FETCH_CHUNK = 256 * 1024
+# How many times a cut transfer may pick up where it stopped. The BUDGET is what really ends it; this
+# only stops a path that resets instantly from spinning through the whole budget one byte at a time.
+FETCH_TRIES = 6
 
 
 def _is_central_origin(u):
@@ -3541,10 +3549,29 @@ def _is_central_origin(u):
         return False
 
 
-def _fetch_url(url, max_bytes, timeout=180):
+def _resumes_at(resp, offset):
+    """True when this response really is the rest of the file from `offset`.
+
+    A 206 alone is not enough: the status says "partial" while the body may be a full copy, and taking
+    it on trust appends one to what is already held. Only Content-Range says where the bytes actually
+    start, so a 206 without a readable one is refused too."""
+    if resp.status != 206:
+        return False
+    m = re.match(r"\s*bytes\s+(\d+)-", resp.headers.get("Content-Range", "") or "")
+    return bool(m) and int(m.group(1)) == offset
+
+
+def _fetch_url(url, max_bytes, timeout=45, budget=FETCH_BUDGET):
     """Download url and return its bytes. Used ONLY in the panel's "let the node fetch it" delivery mode:
     the panel still sends the sha256 and its signature over that sha, and the caller checks both before
     anything is installed -- so this function is not trusted, it only saves the panel's uplink.
+
+    TWO deadlines, because they answer different questions. `timeout` is the socket's, and a socket
+    timeout applies PER READ -- so it only ever catches a peer that has gone silent, and a stream
+    crawling at a few KB/s is never cut by it however long it takes. `budget` is the one that bounds
+    the whole fetch. Without it this call had no total at all: on a path measured delivering 365 KB in
+    200 s, the node kept reading long past the panel's own wait for the answer, so the operator was
+    told the install had FAILED while it was still running and would go on to succeed.
 
     https, with ONE exception: the panel's own origin, which runs plain HTTP today. The signature is
     what makes the bytes safe either way, but for anything else a plaintext fetch would hand an on-path
@@ -3558,13 +3585,60 @@ def _fetch_url(url, max_bytes, timeout=180):
             raise ValueError("update url must be https (plaintext is allowed only for the panel's own origin)")
     elif not low.startswith("https://"):
         raise ValueError("update url must be https")
-    req = urllib.request.Request(u, headers={"User-Agent": "tnl-node"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    deadline = time.monotonic() + budget
+    chunks, got, want, err = [], 0, 0, None
+    # RESUME. A path that cuts a transfer at four megabytes never finishes an eleven-megabyte one if
+    # every attempt starts from zero -- MEASURED on the real path, that is exactly what happened. Ask
+    # for the rest instead, so each attempt only has to carry what is left. A server with no Range
+    # support answers 200 with the whole body, which is the same as never having asked.
+    done = False
+    for _ in range(FETCH_TRIES):
+        if done or time.monotonic() >= deadline:
+            break
+        hdrs = {"User-Agent": "tnl-node"}
+        if got:
+            hdrs["Range"] = "bytes=%d-" % got
+        req = urllib.request.Request(u, headers=hdrs)
         try:
-            want = int(r.headers.get("Content-Length") or 0)
-        except (TypeError, ValueError):
-            want = 0
-        buf = r.read(max_bytes + 1)
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                # Keep what we hold only if this really is the continuation we asked for. A 200 is the
+                # whole file again; so is a 206 whose Content-Range starts anywhere but where we
+                # stopped -- and THAT one is the dangerous shape, because the status says "partial"
+                # while the body is a full copy. Appending either one splices, and the sha gate then
+                # reports «checksum mismatch» about a file that was never wrong.
+                if got and not _resumes_at(r, got):
+                    chunks, got = [], 0
+                try:
+                    n = int(r.headers.get("Content-Length") or 0)
+                except (TypeError, ValueError):
+                    n = 0
+                want = got + n if n else want
+                while got <= max_bytes:
+                    if time.monotonic() > deadline:
+                        raise ValueError("download gave up after %ds with %d of %d bytes"
+                                         % (budget, got, want))
+                    # read1, not read: read() blocks until it has the WHOLE chunk, so the budget is
+                    # only checked once per chunk and overshoots it by however long that takes -- at
+                    # the rate measured on the real path, minutes. read1 returns what has arrived.
+                    c = r.read1(FETCH_CHUNK)
+                    if not c:
+                        # The body ended. That is the ONLY reliable "finished" signal: a server may
+                        # send no Content-Length at all, and treating its absence as "not finished"
+                        # re-fetches a complete file until the attempts run out -- MEASURED: six
+                        # requests for a file served whole on the first, and a 416 on the last of them
+                        # thrown in place of the bytes already in hand. Where the size IS declared, an
+                        # end short of it is the close-mid-body case instead, and resuming is exactly
+                        # what that wants.
+                        done = not want or got >= want
+                        break
+                    chunks.append(c)
+                    got += len(c)
+            err = None
+        except Exception as e:
+            err = e          # a cut mid-body: whatever arrived is kept, and the next try asks for the rest
+    if err is not None and not done:
+        raise err
+    buf = b"".join(chunks)
     if len(buf) > max_bytes:
         raise ValueError("downloaded file is larger than %d bytes" % max_bytes)
     if not buf:
