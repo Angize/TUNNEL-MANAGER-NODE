@@ -644,6 +644,9 @@ def _core_port(cfg):
 # Carrier-header bytes each raw encapsulation profile prepends, mirroring the core's rawHeaderLens.
 RAW_HEADER_LEN = {"bare": 0, "ipip": 0, "etherip": 2, "ipcomp": 4, "gre": 4, "icmp": 8, "udp": 8,
                   "esp": 8, "l2tpv3": 8, "tcp": 32, "ah": 24}  # tcp = 20 + NOP,NOP,Timestamp(10)
+# The most TUN queues one tunnel may take, mirroring the core's maxWorkers. The core clamps silently, so
+# refusing here is what makes an out-of-range request visible instead of quietly halved.
+MAX_WORKERS = 4
 
 _TUNING_INT_KEYS = ("dead_retest_secs",
                     "dead_mult",
@@ -816,6 +819,16 @@ def _core_config(cfg):
         # one constant, so a stateful box cannot burn a single 4-tuple and take the carrier with it.
         if raw_profile in ("udp", "tcp") and _as_bool(cfg.get("raw_sport_random")):
             corecfg["raw_sport_random"] = True
+        # Extra TUN queues for the receive path, so arriving packets are written by several goroutines
+        # instead of queueing behind one file's lock. NOT with FEC: its decoder rebuilds a block out of
+        # consecutive frames, and the core gates its own queue count on the same pair. 0/1 = absent,
+        # which is the core's single-queue default.
+        try:
+            _wk = int(cfg.get("workers") or 0)
+        except (TypeError, ValueError):
+            _wk = 0
+        if 2 <= _wk <= MAX_WORKERS and not bool(cfg.get("fec")):
+            corecfg["workers"] = _wk
     if transport == "spoof":
         # The spoof carrier is bare-like (no raw_profile — the core forces it); it only carries the
         # optional outer IP protocol number override, exactly like a bare raw carrier.
@@ -2837,6 +2850,11 @@ def op_tunnel(d):
                     obj["raw_port"] = rport
                 if _as_bool(d.get("raw_sport_random")):   # ...and whether the SOURCE port rolls
                     obj["raw_sport_random"] = True
+            wk = int(d.get("workers") or 0)   # extra TUN queues; 0/1 is the core's single-queue default
+            if wk and not (1 <= wk <= MAX_WORKERS):
+                raise ValueError("bad workers")
+            if wk > 1:
+                obj["workers"] = wk
         if transport == "spoof":      # standalone IP-spoofing carrier: bare-like, so only the proto override (no profile)
             rproto = int(d.get("raw_proto") or 0)
             if rproto and not (1 <= rproto <= 255):
