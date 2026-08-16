@@ -647,6 +647,9 @@ RAW_HEADER_LEN = {"bare": 0, "ipip": 0, "etherip": 2, "ipcomp": 4, "gre": 4, "ic
 # The most TUN queues one tunnel may take, mirroring the core's maxWorkers. The core clamps silently, so
 # refusing here is what makes an out-of-range request visible instead of quietly halved.
 MAX_WORKERS = 4
+# The carriers that drain every queue they are given, mirroring the core's queueingCarrier. Sending the
+# key to any other carrier is a setting the wire ignores.
+QUEUEING_TRANSPORTS = ("raw", "udp")
 
 _TUNING_INT_KEYS = ("dead_retest_secs",
                     "dead_mult",
@@ -819,10 +822,11 @@ def _core_config(cfg):
         # one constant, so a stateful box cannot burn a single 4-tuple and take the carrier with it.
         if raw_profile in ("udp", "tcp") and _as_bool(cfg.get("raw_sport_random")):
             corecfg["raw_sport_random"] = True
-        # Extra TUN queues for the receive path, so arriving packets are written by several goroutines
-        # instead of queueing behind one file's lock. NOT with FEC: its decoder rebuilds a block out of
-        # consecutive frames, and the core gates its own queue count on the same pair. 0/1 = absent,
-        # which is the core's single-queue default.
+    if transport in QUEUEING_TRANSPORTS:
+        # Extra TUN queues, so a tunnel's packets are read and written by several goroutines instead of
+        # queueing behind one file's lock. NOT with FEC: its decoder rebuilds a block out of consecutive
+        # frames, and the core gates its own queue count on the same pair. 0/1 = absent, which is the
+        # core's single-queue default.
         try:
             _wk = int(cfg.get("workers") or 0)
         except (TypeError, ValueError):
