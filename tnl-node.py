@@ -935,7 +935,6 @@ def _core_config(cfg):
                                          "path": str(s.get("path") or "").strip()} for s in snis]
                 _wrs = cfg.get("ws_rotate_secs")   # 0 = rotation OFF (failover-only); a truthiness `or 600` would wrongly force 600
                 corecfg["ws_rotate_secs"] = 600 if _wrs is None else max(0, min(28800, int(_wrs)))
-                corecfg["ws_auto_burn"] = bool(cfg.get("ws_auto_burn"))
                 corecfg["ws_status_path"] = _cfg_path(name, ".status")
     # FEC (forward error correction): reconstructs lost carrier datagrams from parity so a
     # throttled/high-loss link stays usable. Datagram carriers only (udp/raw/flux/spoof) — on
@@ -983,7 +982,6 @@ def _core_config(cfg):
         if len(ordered) >= 2:
             corecfg["peer_ips"] = [f"{ip}:{port}" if transport in ("udp", "tcp") else ip for ip in ordered]
             corecfg["peer_rotate_secs"] = max(0, int(cfg.get("peer_rotate_secs") or 0))
-            corecfg["peer_auto_burn"] = bool(cfg.get("peer_auto_burn"))
             corecfg["peer_status_path"] = _cfg_path(name, ".peerpool")
         # Source rotation pool (client): this node's OWN IPs to send FROM, cycled alongside peer_ips. local_ip
         # goes first so the pool's start matches the client's default source; bare IPv4 for every carrier. The
@@ -994,7 +992,6 @@ def _core_config(cfg):
         if _src_sel and sord:
             corecfg["src_ips"] = sord
             corecfg.setdefault("peer_rotate_secs", max(0, int(cfg.get("peer_rotate_secs") or 0)))
-            corecfg.setdefault("peer_auto_burn", bool(cfg.get("peer_auto_burn")))
             # The source pool writes its own live state / pin cmd file so the panel can show and pin both
             # sides (destination = .peerpool, source = .srcpool).
             corecfg["src_status_path"] = _cfg_path(name, ".srcpool")
@@ -2828,7 +2825,6 @@ def op_tunnel(d):
                         obj["ws_edge_snis"] = clean_snis
                         _rs = d.get("ws_rotate_secs")   # 0 = rotation off (failover-only) — a truthiness `or 600` would wrongly force 600
                         obj["ws_rotate_secs"] = max(0, min(28800, int(_rs))) if _rs is not None else 600
-                        obj["ws_auto_burn"] = _as_bool(d.get("ws_auto_burn"))
             edge = str(d.get("edge_ip") or "").strip()   # CDN edge the client dials instead of the origin
             if edge:
                 host = edge.rpartition(":")[0] or edge
@@ -2904,7 +2900,6 @@ def op_tunnel(d):
                     obj["src_ips"] = sips
                 _prs = d.get("peer_rotate_secs")   # 0 = failover-only; a truthiness `or N` would wrongly force N
                 obj["peer_rotate_secs"] = max(0, min(86400, int(_prs))) if _prs is not None else 0
-                obj["peer_auto_burn"] = _as_bool(d.get("peer_auto_burn"))
         # pool_listen (server side): the client rotates the destination across THIS server's selected IPs.
         # udp/tcp bind EACH of them explicitly rather than 0.0.0.0 — see _core_config — and listen_ips carries
         # that set as bare IPv4. raw needs the FLAG but not listen_ips, which the core ignores for raw: a
