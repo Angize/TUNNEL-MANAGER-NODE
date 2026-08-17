@@ -58,6 +58,8 @@ def main():
     m._is_ws_pool = lambda name: True
     m._is_peer_pool = lambda name: False
     m._read_core_cfg = lambda name: {"role": "client", "ws_status_path": "x"}
+    # a core publishing a stable path with a session on it: what every verdict here is keyed to
+    m._read_path_state = lambda _n: (1, True)
     m._read_ws_pool = lambda name: {
         "ip": "e1", "sni": "only.example",
         "ips": ["e1", "e2", "e3"], "snis": ["only.example"],
@@ -76,18 +78,18 @@ def main():
     for _ in range(2):          # RED_SWEEPS to confirm the tunnel is really dead
         clock["t"] += 4.0
         sweep()
-    want(len(sent) == 1 and sent[0][1] == {"cmd": "fail", "ip": "e1", "sni": "only.example"},
+    want(len(sent) == 1 and sent[0][1] == {"cmd": "fail", "ip": "e1", "sni": "only.example", "epoch": 1},
          f"a 3-edge / 1-domain pool must still be judged: with one SNI the walk varies the EDGE, and "
          f"silencing it leaves the operator with a pool that rotates forever and blacklists nothing. "
          f"got {sent}")
 
-    clock["t"] += m.FAILOVER_SETTLE + 1
+    clock["t"] += 4.0
     sweep()
     want(len(sent) == 2 and sighups == [],
          f"3 edges x 1 SNI is 3 combinations, so the second ask is still inside the walk. "
          f"got {len(sent)} asks, sighups={sighups}")
 
-    clock["t"] += m.FAILOVER_SETTLE + 1
+    clock["t"] += 4.0
     sweep()
     want(len(sent) == 2 and sighups == ["w1"],
          f"...and the third completes it: every combination has been tried, so the edges were never the "
@@ -105,6 +107,8 @@ def main():
     m2._is_ws_pool = lambda name: False
     m2._is_peer_pool = lambda name: True
     m2._read_core_cfg = lambda name: {"role": "client"}
+    # a core publishing a stable path with a session on it: what every verdict here is keyed to
+    m2._read_path_state = lambda _n: (1, True)
     m2._read_peer_pool = lambda name, suf: (
         {"active": "d1", "addrs": ["d1"],
          "health": [{"key": "d1", "state": "healthy"}]} if suf == ".peerpool" else
@@ -122,7 +126,7 @@ def main():
     for _ in range(2):
         clock2["t"] += 4.0
         sweep2()
-    want(len(sent2) == 1 and sent2[0][1] == {"cmd": "fail", "key": "d1"},
+    want(len(sent2) == 1 and sent2[0][1] == {"cmd": "fail", "key": "d1", "epoch": 1},
          f"one destination and three sources must still be judged -- the destination axis cannot vary, "
          f"so the core answers by walking the SOURCE, and a node that stays silent here leaves a tunnel "
          f"with three source IPs stuck on the one that does not work. got {sent2}")
@@ -130,7 +134,7 @@ def main():
          f"and it must go to the destination pool's own command file, got {sent2[0][0]}")
 
     for _ in range(2):
-        clock2["t"] += m2.FAILOVER_SETTLE + 1
+        clock2["t"] += 4.0
         sweep2()
     want(len(sent2) == 2 and sighups2 == ["p1"],
          f"1 destination x 3 sources is 3 combinations: two asks, then the walk is complete and every "
@@ -147,6 +151,8 @@ def main():
     m3._is_ws_pool = lambda name: False
     m3._is_peer_pool = lambda name: True
     m3._read_core_cfg = lambda name: {"role": "client"}
+    # a core publishing a stable path with a session on it: what every verdict here is keyed to
+    m3._read_path_state = lambda _n: (1, True)
     m3._read_peer_pool = lambda name, suf: (
         {"active": "d1", "addrs": ["d1"], "health": [{"key": "d1", "state": "healthy"}]} if suf == ".peerpool"
         else {"active": "s1", "addrs": ["s1"], "health": [{"key": "s1", "state": "healthy"}]})
@@ -156,7 +162,7 @@ def main():
     clock3 = {"t": 1000.0}
     m3.time.monotonic = lambda: clock3["t"]
     for _ in range(6):
-        clock3["t"] += m3.FAILOVER_SETTLE + 1
+        clock3["t"] += 4.0
         m3.health_of({"type": "core", "name": "p2", "tunnel_ip": "192.168.9.2/24"})
     want(sent3 == [],
          f"one destination and one source have nowhere to go: a verdict there can only take the tunnel "
@@ -172,6 +178,8 @@ def main():
     m4._is_ws_pool = lambda name: True
     m4._is_peer_pool = lambda name: False
     m4._read_core_cfg = lambda name: {"role": "server", "ws_status_path": "x"}
+    # a core publishing a stable path with a session on it: what every verdict here is keyed to
+    m4._read_path_state = lambda _n: (1, True)
     m4._read_ws_pool = lambda name: {
         "ip": "e1", "sni": "only.example", "ips": ["e1", "e2", "e3"], "snis": ["only.example"],
         "health": [{"key": k, "kind": "ip", "state": "healthy"} for k in ("e1", "e2", "e3")]}
@@ -181,7 +189,7 @@ def main():
     clock4 = {"t": 1000.0}
     m4.time.monotonic = lambda: clock4["t"]
     for _ in range(6):
-        clock4["t"] += m4.FAILOVER_SETTLE + 1
+        clock4["t"] += 4.0
         m4.health_of({"type": "core", "name": "w2", "tunnel_ip": "192.168.9.2/24"})
     want(sent4 == [],
          f"only the dialling end chooses endpoints; a server that judged its own pool would fight the "

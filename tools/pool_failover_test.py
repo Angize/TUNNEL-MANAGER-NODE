@@ -56,6 +56,19 @@ def main():
         {"active": "", "addrs": STATE["srcs"], "health": [], "pin": "", "ts": 0} if suffix == ".srcpool"
         else {"active": STATE["active"], "addrs": STATE["addrs"], "health": [], "pin": "", "ts": 0})
 
+    # The core's published path: the epoch a verdict is keyed on, and whether a session is up on it.
+    # health_of reads this twice per sweep — once either side of the probe — so `moves_mid_probe` is
+    # what a rotation landing DURING a measurement looks like from here.
+    PATH = {"epoch": 1, "ready": True, "moves_mid_probe": False}
+
+    def read_path(_name):
+        e = PATH["epoch"]
+        if PATH["moves_mid_probe"]:
+            PATH["epoch"] += 1
+        return e, PATH["ready"]
+
+    m._read_path_state = read_path
+
     real_exists, real_flow = os.path.exists, m._flow_sample
     os.path.exists = lambda p: True if str(p).startswith("/sys/class/net/") else real_exists(p)
     m._flow_sample = lambda n: (0.0, 0.0)
@@ -82,28 +95,45 @@ def main():
     # --- confirmed dead -> exactly ONE burn, then silence while it settles -------------------------
     clock["t"] += 4.0
     sweep()
-    want(len(sent) == 1 and sent[0][1] == {"cmd": "fail", "key": "10.0.0.1"},
+    want(len(sent) == 1 and sent[0][1] == {"cmd": "fail", "key": "10.0.0.1", "epoch": 1},
          f"a confirmed-dead tunnel must ask the core to fail the destination BY NAME, got {sent}")
     want(sent[0][0].endswith(".peerpool.cmd"),
          f"and it must go to the DESTINATION pool's command file, got {sent[0][0]}")
 
-    dead_sweeps(2, step=2.0)   # 4 s later: still inside the settle window
+    # --- what swallows the sweeps right after a jump is the carrier's own report, not a clock -------
+    # The burn clears the session, so the core publishes ready=false until it has re-handshaked on the
+    # endpoint it moved to. Nothing may be asked for in that window: the silence a probe measures there
+    # belongs to the handshake, not to the path. This replaced a fixed settle timer, which could only
+    # ever guess how long a handshake takes.
+    PATH["ready"] = False
+    dead_sweeps(2, step=2.0)
     want(len(sent) == 1,
-         f"the settle window must swallow the sweeps right after a jump -- the fresh handshake disturbs "
-         f"traffic by itself and reading that as failure walks the pool in seconds. got {len(sent)} burns")
+         f"while the carrier reports no session on the path, nothing may be asked -- the probe is "
+         f"measuring the handshake. got {len(sent)} burns")
+    PATH["ready"] = True
+
+    # --- a probe that STRADDLES a path change is charged to neither side of it ----------------------
+    # The epoch moves between the two reads of one sweep, which is exactly a rotation landing mid-probe.
+    PATH["moves_mid_probe"] = True
+    n_straddle = len(sent)
+    dead_sweeps(2, step=2.0)
+    want(len(sent) == n_straddle,
+         f"a probe that spanned a path change measured two paths and may be charged to neither, "
+         f"got {len(sent) - n_straddle} asks")
+    PATH["moves_mid_probe"] = False
 
     # --- past the settle window it asks again. The active endpoint deliberately does NOT change here:
     # the carrier fails over on its own timers too, so between our decision and the core acting it can
     # already have moved. A walk keyed on identity burns the same address forever and never finishes --
     # measured live on 2026-08-04 before this was counted instead.
     STATE["active"] = "10.0.0.1"
-    clock["t"] += m.FAILOVER_SETTLE + 1
+    clock["t"] += 4.0
     sweep()
     want(len(sent) == 2, f"past the settle window the next endpoint may be failed too, got {len(sent)}")
 
     # --- the WHOLE pool walked and still dead -> hand everything back, do not burn the last one ----
     STATE["active"] = "10.0.0.1"
-    clock["t"] += m.FAILOVER_SETTLE + 1
+    clock["t"] += 4.0
     sweep()
     want(len(sent) == 2,
          f"the third endpoint must NOT be burned: every entry has now been tried, so the destination "
@@ -113,7 +143,7 @@ def main():
 
     # --- and it stands down, instead of chewing through the pool again -----------------------------
     before = (len(sent), len(sighups))
-    clock["t"] += m.FAILOVER_SETTLE + 1
+    clock["t"] += 4.0
     dead_sweeps(3)
     want((len(sent), len(sighups)) == before,
          f"after a full walk it must stand down for the cooldown, got {(len(sent), len(sighups))}")
@@ -155,7 +185,7 @@ def main():
     STATE["hits"] = 0
     n0, s0 = len(sent), len(sighups)
     for _ in range(9):
-        clock["t"] += m.FAILOVER_SETTLE + 1
+        clock["t"] += 4.0
         sweep("t-matrix")
     # N combinations take N-1 asks, not N: each ask MOVES you from one combination to the next, so by
     # the time the last one is standing there is nothing left to ask for -- that is where it gives up.
@@ -175,13 +205,13 @@ def main():
     # 2026-08-05. Its own tunnel, 3 dst x 2 src, so five asks fit before the walk completes.
     STATE["srcs"] = ["10.9.0.1", "10.9.0.2"]
     STATE["is_pool"], STATE["hits"] = True, 0
-    clock["t"] += m.FAILOVER_COOLDOWN + m.FAILOVER_SETTLE + 10
+    clock["t"] += m.FAILOVER_COOLDOWN + 4.00
     STATE["active"] = "10.0.0.1"
     dead_sweeps(2, name="t-key")                      # confirm red, first ask
     for want_key in ("10.0.0.2", "10.0.0.3", "10.0.0.1"):
         STATE["active"] = want_key                    # the reading this sweep is measured on
         n = len(sent)
-        clock["t"] += m.FAILOVER_SETTLE + 1
+        clock["t"] += 4.0
         sweep("t-key")
         got = [o for _, o in sent[n:]]
         want(len(got) == 1 and got[0].get("key") == want_key,
@@ -193,7 +223,7 @@ def main():
     # while carrying nothing. So the probe that condemns an endpoint is the only thing that clears it.
     STATE["srcs"] = ["10.9.0.1", "10.9.0.2"]
     STATE["active"], STATE["is_pool"], STATE["hits"] = "10.0.0.2", True, 0
-    clock["t"] += m.FAILOVER_COOLDOWN + m.FAILOVER_SETTLE + 10
+    clock["t"] += m.FAILOVER_COOLDOWN + 4.00
     dead_sweeps(2, name="t-ok")                      # confirm red so there is something to recover from
     n0 = len(sent)
     want(n0 > 0 and sent[-1][1]["cmd"] == "fail", f"setup: expected a burn first, got {sent[-1:]}")
@@ -225,7 +255,7 @@ def main():
     n2 = len(sent)
     real_probe = m.tun_probe
     m.tun_probe = lambda *a, **k: (0, 0, None)        # the probe socket could not be set up
-    clock["t"] += m.FAILOVER_SETTLE + 4.0
+    clock["t"] += 8.0
     sweep("t-ok")
     m.tun_probe = real_probe
     want(len(sent) == n2,
