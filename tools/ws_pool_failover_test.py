@@ -56,6 +56,9 @@ def main():
     m._is_ws_pool = lambda name: STATE["is_ws"]
     m._is_peer_pool = lambda name: False
     m._read_core_cfg = lambda name: {"role": STATE["role"], "ws_status_path": "x"}
+    # The core's published path: the epoch a verdict is keyed to, and whether a session is up on it.
+    PATH = {"ready": True}
+    m._read_path_state = lambda _n: (1, PATH["ready"])
     m._read_ws_pool = lambda name: {
         "ip": STATE["ip"], "sni": STATE["sni"], "ips": STATE["ips"], "snis": STATE["snis"],
         "health": ([{"key": k, "kind": d, "state": "suspect"} for k, d in STATE["burned"]]
@@ -83,22 +86,27 @@ def main():
     # --- confirmed dead -> exactly ONE ask, naming BOTH axes ---------------------------------------
     clock["t"] += 4.0
     sweep()
-    want(len(sent) == 1 and sent[0][1] == {"cmd": "fail", "ip": "1.1.1.1", "sni": "a.example"},
+    want(len(sent) == 1 and sent[0][1] == {"cmd": "fail", "ip": "1.1.1.1", "sni": "a.example", "epoch": 1},
          f"a confirmed-dead tunnel must name the COMBINATION it measured, not just one axis, got {sent}")
     want(sent[0][0].endswith(".status.cmd"),
          f"and it must go to the edge pool's own command file, got {sent[0][0]}")
 
-    # --- the settle window swallows the sweeps right after a jump ----------------------------------
+    # --- what swallows the sweeps right after a jump is the carrier's report, not a clock -----------
+    # The burn drops the connection, so the core publishes ready=false until it has re-dialled and
+    # re-upgraded on the combination it moved to. A probe in that window is measuring the TLS+upgrade,
+    # not the edge, and may not be charged to either axis.
+    PATH["ready"] = False
     for _ in range(2):
         clock["t"] += 2.0
         sweep()
     want(len(sent) == 1,
-         f"the settle window must swallow the sweeps right after a jump -- a fresh TLS+upgrade disturbs "
-         f"traffic by itself and reading that as failure walks the matrix in seconds. got {len(sent)}")
+         f"while the carrier reports no session on the combination, nothing may be asked -- the probe "
+         f"is measuring the re-dial. got {len(sent)}")
+    PATH["ready"] = True
 
     # --- the walk is the MATRIX (2 edges x 2 SNIs = 4 combinations = 3 asks) -----------------------
     for _ in range(2):
-        clock["t"] += m.FAILOVER_SETTLE + 1
+        clock["t"] += 4.0
         sweep()
     want(len(sent) == 3,
          f"2 edges x 2 SNIs is 4 combinations, covered in 3 asks -- got {len(sent)}")
@@ -106,7 +114,7 @@ def main():
          f"and nothing may be handed back before the matrix is done, got sighups={sighups}")
 
     # --- matrix exhausted -> hand everything back, do not burn the last one ------------------------
-    clock["t"] += m.FAILOVER_SETTLE + 1
+    clock["t"] += 4.0
     sweep()
     want(len(sent) == 3,
          f"the last combination must NOT be asked for: every one has been tried, so the edges were "
@@ -116,7 +124,7 @@ def main():
     # --- and it stands down instead of chewing through the matrix again ----------------------------
     before = (len(sent), len(sighups))
     for _ in range(3):
-        clock["t"] += m.FAILOVER_SETTLE + 1
+        clock["t"] += 4.0
         sweep()
     want((len(sent), len(sighups)) == before,
          f"after a full walk it must stand down for the cooldown, got {(len(sent), len(sighups))}")
@@ -130,7 +138,7 @@ def main():
     n0 = len(sent)
     clock["t"] += 4.0
     sweep()
-    want(len(sent) == n0 + 1 and sent[-1][1] == {"cmd": "ok", "ip": "1.1.1.1", "sni": "a.example"},
+    want(len(sent) == n0 + 1 and sent[-1][1] == {"cmd": "ok", "ip": "1.1.1.1", "sni": "a.example", "epoch": 1},
          f"an edge that is CARRYING while its pool still has it condemned must be reported, naming both "
          f"axes -- a burn always rotates away from what it burns, so nothing else ever clears it. got "
          f"{sent[n0:]}")

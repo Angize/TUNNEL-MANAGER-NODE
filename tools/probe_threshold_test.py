@@ -65,6 +65,8 @@ def verdict_half(m):
     m._is_peer_pool = lambda name: True
     m._is_ws_pool = lambda name: False
     m._read_core_cfg = lambda name: {"role": "client"}
+    # a core publishing a stable path with a session on it: what every verdict here is keyed to
+    m._read_path_state = lambda _n: (1, True)
     m._read_peer_pool = lambda name, suffix: pool(suffix)
     m._flow_sample = lambda n: (0.0, 0.0)
     real_exists = os.path.exists
@@ -76,7 +78,7 @@ def verdict_half(m):
         """One real sweep: health_of -> tun_probe -> settle -> pool_failover."""
         state["hits"] = hits
         m.tun_probe = lambda *a, **k: (hits, m.PROBE_COUNT, 80.0 if hits else None)
-        clock["t"] += 400.0     # past FAILOVER_SETTLE and any cooldown from a previous case
+        clock["t"] += 400.0     # past any cooldown from a previous case
         n0 = len(sent)
         cfg = {"type": "core", "name": name, "tunnel_ip": "192.168.9.2/24"}
         cfg.update(cfg_extra)

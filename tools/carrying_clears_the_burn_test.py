@@ -60,6 +60,8 @@ def main():
 
     m._is_peer_pool = lambda name: ST["is_pool"]
     m._read_core_cfg = lambda name: {"role": "client", "peer_status_path": "x"}
+    # a core publishing a stable path with a session on it: what every verdict here is keyed to
+    m._read_path_state = lambda _n: (1, True)
     m._read_peer_pool = lambda name, suffix: pool("src" if suffix == ".srcpool" else "dst")
 
     real_exists = os.path.exists
@@ -90,7 +92,7 @@ def main():
     ST["src"]["state"] = "suspect"
     n0 = len(sent)
     sweep("t-src")
-    want(oks(n0) == [{"cmd": "ok", "key": "10.0.0.1", "src": "192.168.1.1"}],
+    want(oks(n0) == [{"cmd": "ok", "key": "10.0.0.1", "src": "192.168.1.1", "epoch": 1}],
          f"a condemned SOURCE that is carrying must be reported, naming both actives, got {oks(n0)}")
     want(sent[n0][0].endswith(".peerpool.cmd"),
          f"and it must go to the destination pool's command file, which is the one the core polls, "
@@ -100,7 +102,7 @@ def main():
     ST["src"]["state"], ST["dst"]["state"] = "healthy", "dead"
     n0 = len(sent)
     sweep("t-dst")
-    want(oks(n0) == [{"cmd": "ok", "key": "10.0.0.1", "src": "192.168.1.1"}],
+    want(oks(n0) == [{"cmd": "ok", "key": "10.0.0.1", "src": "192.168.1.1", "epoch": 1}],
          f"a DEAD destination that is carrying must be reported too -- dead is not a life sentence, "
          f"got {oks(n0)}")
 
@@ -140,7 +142,7 @@ def main():
     ST["hits"] = m.PROBE_COUNT
     n0 = len(sent)
     sweep("t-edge")
-    want(oks(n0) == [{"cmd": "ok", "key": "10.0.0.1", "src": "192.168.1.1"}],
+    want(oks(n0) == [{"cmd": "ok", "key": "10.0.0.1", "src": "192.168.1.1", "epoch": 1}],
          f"the red->green edge must still be reported on a clean pool, got {oks(n0)}")
 
     os.path.exists = real_exists

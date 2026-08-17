@@ -1751,15 +1751,33 @@ def settle(name, ok):
 
 
 # --- node-driven destination failover ---------------------------------------------------------------
-FAILOVER_SETTLE = 10.0      # s the verdict is ignored after a jump. The fresh handshake disturbs traffic
-                            # by itself; reading that as failure is a loop that walks the pool in seconds.
 FAILOVER_COOLDOWN = 300.0   # s of standing down after a whole pool was walked and the tunnel is STILL dead
 _fo_lock = threading.Lock()
-_fo = {}                    # tunnel -> {"burns": asks issued this round, "settle", "cooldown"}
+_fo = {}                    # tunnel -> {"burns": asks issued this round, "cooldown"}
 
 
 def _fo_state(name):
-    return _fo.setdefault(name, {"burns": 0, "settle": 0.0, "cooldown": 0.0, "red": False})
+    return _fo.setdefault(name, {"burns": 0, "cooldown": 0.0, "red": False})
+
+
+def _read_path_state(name):
+    """The core's published path epoch, and whether a session is up on that path.
+
+    (0, False) when the file is missing or says neither — a core that cannot name the path it is on is
+    one no verdict may be keyed against. `ready` is what replaced the old post-jump settle timer: the
+    carrier reports a session on the NEW path instead of us guessing how long a handshake takes."""
+    try:
+        with open(_cfg_path(name, ".status")) as f:
+            st = json.load(f)
+    except (OSError, ValueError):
+        return 0, False
+    if not isinstance(st, dict):
+        return 0, False
+    try:
+        epoch = int(st.get("epoch") or 0)
+    except (TypeError, ValueError):
+        return 0, False
+    return epoch, bool(st.get("ready"))
 
 
 WS_ACTIVE_SEP = " · "   # what wsPool.writeStatus joins the active edge and SNI with
@@ -1799,7 +1817,7 @@ def _condemned(pool, addr):
                               for h in (pool.get("health") or []))
 
 
-def _report_carrying(name, edge):
+def _report_carrying(name, edge, epoch):
     """Tell the core that traffic is CROSSING, naming the endpoints it crossed on.
 
     The core has no way to learn this for itself. Everything it can observe -- a frame coming back, a
@@ -1822,7 +1840,7 @@ def _report_carrying(name, edge):
             return
         if not edge and not (_ws_condemned(w, "ip", ip) or _ws_condemned(w, "sni", sni)):
             return
-        err = _atomic_write_json(_cfg_path(name, ".status.cmd"), {"cmd": "ok", "ip": ip, "sni": sni})
+        err = _atomic_write_json(_cfg_path(name, ".status.cmd"), {"cmd": "ok", "ip": ip, "sni": sni, "epoch": epoch})
         logline(f"{name}: probe found traffic crossing — told the core {ip or '?'} / {sni or '?'} are carrying"
                 + (f" [{err}]" if err else ""))
         return
@@ -1834,13 +1852,17 @@ def _report_carrying(name, edge):
         return
     if not edge and not (_condemned(dpool, dst) or _condemned(spool, src)):
         return
-    err = _atomic_write_json(_cfg_path(name, ".peerpool.cmd"), {"cmd": "ok", "key": dst, "src": src})
+    err = _atomic_write_json(_cfg_path(name, ".peerpool.cmd"), {"cmd": "ok", "key": dst, "src": src, "epoch": epoch})
     logline(f"{name}: probe found traffic crossing — told the core {dst or '?'} / {src or '?'} are carrying"
             + (f" [{err}]" if err else ""))
 
 
-def pool_failover(name, alive, crossed):
+def pool_failover(name, alive, crossed, epoch):
     """Ask the core to burn the destination when our probe says nothing crosses this tunnel.
+
+    `epoch` is the core's path counter, unchanged across the whole probe (health_of checks) and
+    stamped on every ask. The core drops one that no longer matches, so a verdict can never be charged
+    to a path it did not measure. Callers only reach here for a measurement that held still.
 
     `crossed` is THIS sweep's raw measurement, not the published colour: settle() keeps a green tunnel
     green through a bad sweep, and a smoothed green measured nothing, so it may never clear a burn.
@@ -1865,11 +1887,11 @@ def pool_failover(name, alive, crossed):
             st["red"] = True
     if alive is not False:
         if crossed:
-            _report_carrying(name, recovered)  # the other half of the verdict, off the lock: it writes a file
+            _report_carrying(name, recovered, epoch)  # the other half of the verdict, off the lock: it writes a file
         return
     with _fo_lock:
         st = _fo_state(name)
-        if now < st["settle"] or now < st["cooldown"]:
+        if now < st["cooldown"]:
             return
     with _verdict_lock:
         # A tunnel that was never green goes red on its FIRST bad sweep -- there was no green to protect.
@@ -1881,7 +1903,7 @@ def pool_failover(name, alive, crossed):
     if str(_read_core_cfg(name).get("role") or "") != "client":
         return                    # a server does not choose destinations; only the dialling end may rotate
     if _is_ws_pool(name):
-        _ws_failover(name, now)
+        _ws_failover(name, now, epoch)
         return
     if not _is_peer_pool(name):
         return
@@ -1905,7 +1927,6 @@ def pool_failover(name, alive, crossed):
         # The ask itself is still keyed, below; only this counter is blind to which endpoint it hit.
         st["burns"] += 1
         walked = st["burns"] >= combos
-        st["settle"] = now + FAILOVER_SETTLE
         if walked:
             st["burns"] = 0
             st["cooldown"] = now + FAILOVER_COOLDOWN
@@ -1921,14 +1942,14 @@ def pool_failover(name, alive, crossed):
     # measured and putting the tunnel back on the one that was.
     # Atomic (tmp+replace): the core polls this file once a second and deletes it, so a half-written
     # one would be read and dropped, and the failover silently lost.
-    err = _atomic_write_json(_cfg_path(name, ".peerpool.cmd"), {"cmd": "fail", "key": cur})
+    err = _atomic_write_json(_cfg_path(name, ".peerpool.cmd"), {"cmd": "fail", "key": cur, "epoch": epoch})
     logline(f"{name}: probe found nothing crossing — asked the core to fail destination "
             f"{cur or '?'} (ask {st['burns']} of {combos}: {len(addrs)} dst x {max(1, len(srcs))} src)"
             + (f" [{err}]" if err else ""))
 
 
 
-def _ws_failover(name, now):
+def _ws_failover(name, now, epoch):
     """pool_failover's edge-pool half: ask the core to burn the SNI when nothing crosses.
 
     Same experiment as the direct pools, on the CDN's two axes. The SNI is the low digit and the EDGE
@@ -1944,7 +1965,6 @@ def _ws_failover(name, now):
         st = _fo_state(name)
         st["burns"] += 1
         walked = st["burns"] >= combos
-        st["settle"] = now + FAILOVER_SETTLE
         if walked:
             st["burns"] = 0
             st["cooldown"] = now + FAILOVER_COOLDOWN
@@ -1954,7 +1974,7 @@ def _ws_failover(name, now):
                 f"standing down for {int(FAILOVER_COOLDOWN)}s")
         return
     err = _atomic_write_json(_cfg_path(name, ".status.cmd"),
-                             {"cmd": "fail", "ip": cur_ip, "sni": cur_sni})
+                             {"cmd": "fail", "ip": cur_ip, "sni": cur_sni, "epoch": epoch})
     logline(f"{name}: probe found nothing crossing — asked the core to fail edge "
             f"{cur_ip or '?'} / {cur_sni or '?'} (ask {st['burns']} of {combos}: "
             f"{max(1, len(ips))} edge x {max(1, len(snis))} sni)" + (f" [{err}]" if err else ""))
@@ -2071,6 +2091,11 @@ def health_of(cfg):
     alive, rtt, loss = None, None, None
     tip = cfg.get("tunnel_ip", "")
     if up and tip and tip != "N/A":
+        # Read the core's path epoch either side of the probe. A probe that straddles a rotation, a
+        # port roll or a re-dial measured two paths and can be charged to neither, so its VERDICT is
+        # dropped. The COLOUR is not: "is this tunnel carrying" stays a fair question across a move,
+        # and a dot that stops updating whenever the path shifts is worse than one that lags a sweep.
+        epoch_before, ready_before = _read_path_state(name)
         hits, sent, rtt = tun_probe(name, tip, ttype)
         if sent:
             # The verdict rests on the WHOLE sample set, never on one packet. A single reply used to
@@ -2081,7 +2106,12 @@ def health_of(cfg):
             loss = round((sent - hits) * 100.0 / sent, 1)
             crossed = carrying(hits, sent, probe_min_pct(cfg))
             alive = settle(name, crossed)
-            pool_failover(name, alive, crossed)
+            epoch, ready = _read_path_state(name)
+            # Ready on BOTH sides, not just at the end. A re-handshake moves no address, so a session
+            # that was down when the probe started and up by the time it finished leaves the epoch
+            # untouched — and the silence it measured belongs to the handshake, not to the path.
+            if ready_before and ready and epoch == epoch_before:
+                pool_failover(name, alive, crossed, epoch)
     return {"up": up, "alive": alive, "dead": alive is False, "rtt_ms": rtt, "loss_pct": loss,
             "rx_still": rx_still, "tx_still": tx_still, "live_win": int(LIVE_WINDOW)}
 
