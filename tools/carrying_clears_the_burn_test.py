@@ -94,8 +94,8 @@ def main():
     sweep("t-src")
     want(oks(n0) == [{"cmd": "ok", "key": "10.0.0.1", "src": "192.168.1.1", "epoch": 1}],
          f"a condemned SOURCE that is carrying must be reported, naming both actives, got {oks(n0)}")
-    want(sent[n0][0].endswith(".peerpool.cmd"),
-         f"and it must go to the destination pool's command file, which is the one the core polls, "
+    want(sent[n0][0].endswith(".status.verdict"),
+         f"and it must go to the tunnel's verdict mailbox, which is the one the core polls, "
          f"got {sent[n0][0]}")
 
     # --- the same for a condemned destination -------------------------------------------------------
@@ -125,12 +125,28 @@ def main():
     want(oks(n0) == [],
          f"a smoothed green measured nothing crossing and must not clear a burn, got {oks(n0)}")
 
-    # --- a tunnel with no pool is left alone --------------------------------------------------------
-    ST["is_pool"], ST["hits"] = False, m.PROBE_COUNT
+    # --- a tunnel with no pool: the occasion is the EDGE, and only the edge --------------------------
+    # It holds no entry that could be condemned, so "carrying while condemned" cannot arise for it and a
+    # green sweep must stay silent. The red->green edge below is a different question and is still sent:
+    # `ok` also refills the ladder's free steps, which this tunnel has like any other.
+    real_pool = m._read_peer_pool
+    m._read_peer_pool = lambda name, suffix: {"active": "", "addrs": [], "health": [], "pin": "", "ts": 0}
+    ST["hits"] = m.PROBE_COUNT
     n0 = len(sent)
     sweep("t-nopool")
-    want(oks(n0) == [], f"a tunnel with no pool must not be reported on, got {oks(n0)}")
-    ST["is_pool"] = True
+    sweep("t-nopool")
+    want(oks(n0) == [], f"a green pool-less tunnel has nothing to clear and must stay quiet, got {oks(n0)}")
+
+    ST["hits"] = 0
+    sweep("t-nopool")
+    sweep("t-nopool")            # confirmed red
+    ST["hits"] = m.PROBE_COUNT
+    n0 = len(sent)
+    sweep("t-nopool")
+    want(oks(n0) == [{"cmd": "ok", "key": "", "src": "", "epoch": 1}],
+         f"but its recovery must be told, naming no endpoint because it has none -- that is what "
+         f"refills the free rungs it just spent. got {oks(n0)}")
+    m._read_peer_pool = real_pool
 
     # --- the red->green edge still reports, even with nothing condemned ------------------------------
     # That is the original occasion and it must survive: after a jump the core has to hear that the pair

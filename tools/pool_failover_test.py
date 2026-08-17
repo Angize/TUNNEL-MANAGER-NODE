@@ -97,8 +97,12 @@ def main():
     sweep()
     want(len(sent) == 1 and sent[0][1] == {"cmd": "fail", "key": "10.0.0.1", "epoch": 1},
          f"a confirmed-dead tunnel must ask the core to fail the destination BY NAME, got {sent}")
-    want(sent[0][0].endswith(".peerpool.cmd"),
-         f"and it must go to the DESTINATION pool's command file, got {sent[0][0]}")
+    want(sent[0][0].endswith(".status.verdict"),
+         f"and it must go to the TUNNEL's verdict mailbox -- not a pool's pin file, which a pool-less "
+         f"tunnel does not have and which the operator's pin owns. got {sent[0][0]}")
+    want(sent[0][0] in [os.path.basename(p) for p in m._core_status_paths("t1")],
+         f"and that file must be one a relaunch sweeps, or the fresh core replays its predecessor's "
+         f"verdict. got {sent[0][0]} vs {[os.path.basename(p) for p in m._core_status_paths('t1')]}")
 
     # --- what swallows the sweeps right after a jump is the carrier's own report, not a clock -------
     # The burn clears the session, so the core publishes ready=false until it has re-handshaked on the
@@ -159,22 +163,36 @@ def main():
         want(m._fo["t1"]["burns"] == 0,
              "a tunnel that starts crossing again must forget the round it was in the middle of")
 
-    # --- the four conditions, each on its own tunnel so no state leaks between them ----------------
-    def burns_for(name, **over):
+    # --- who is told, and who is not, each on its own tunnel so no state leaks between them --------
+    def asks_for(name, **over):
         keep = {k: STATE[k] for k in over}
         STATE.update(over)
         STATE["hits"] = 0
         n0 = len(sent)
         dead_sweeps(2, name=name)
         STATE.update(keep)
-        return len(sent) - n0
+        return [o for _, o in sent[n0:]]
 
-    want(burns_for("t-server", role="server") == 0,
+    want(asks_for("t-server", role="server") == [],
          "a SERVER end must never ask: it does not choose the destination, and two ends both "
          "rotating would chase each other around the pool")
-    want(burns_for("t-one", addrs=["10.0.0.9"], active="10.0.0.9") == 0,
-         "a single destination with no source pool must never be burned -- there is nothing to move to "
-         "on either axis, so the burn would just take the tunnel down")
+
+    # A tunnel with nothing to rotate to is still TOLD. The verdict is about the path, and the core
+    # answers it with the free rungs -- redraw the port, handshake again -- which move the tunnel
+    # nowhere and blame nobody. Only the burn needs a second endpoint, and the core is what refuses it
+    # (its pool returns early below two entries). Withholding the measurement instead left every
+    # single-endpoint tunnel with no ladder at all.
+    one = asks_for("t-one", addrs=["10.0.0.9"], active="10.0.0.9")
+    want(len(one) == 1 and one[0]["cmd"] == "fail" and one[0]["key"] == "10.0.0.9",
+         f"a single-destination tunnel must still be told, naming what was measured, got {one}")
+    want(sighups == ["t1"],
+         f"and it must not reach the walk: there is no matrix to exhaust and nothing to hand back, "
+         f"got sighups={sighups}")
+
+    nopool = asks_for("t-nopool", addrs=[], active="")
+    want(len(nopool) == 1 and nopool[0]["cmd"] == "fail" and nopool[0]["key"] == "",
+         f"a tunnel with no pool at all must be told too, naming no endpoint because it has none to "
+         f"name -- an empty key is a verdict about the PATH, got {nopool}")
 
     # --- the walk is the MATRIX, not the destination list -----------------------------------------
     # The pools are nested: every destination is tried against the current source, and only then is
@@ -196,7 +214,6 @@ def main():
          f"and it must hand everything back exactly once, at the END of the matrix, got "
          f"{len(sighups) - s0}")
     STATE["srcs"] = []
-    want(burns_for("t-nopool", is_pool=False) == 0, "a tunnel with no pool at all must be left alone")
 
     # --- EVERY ask names the endpoint the probe was measured on, never "whatever is active later" ---
     # The core reads these on a one-second ticker and its own proactive rotation runs in that gap, so an

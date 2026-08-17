@@ -1169,7 +1169,10 @@ def _core_status_paths(name):
     # base + ".echcmd" is the live-ECH push sidecar (op ech-update writes it, the core polls it). It was
     # missing here, so it alone survived rebuild/disable/delete — and a stale key file outliving the core
     # that was meant to consume it is exactly the kind of leftover this list exists to prevent.
-    return base, base + ".cmd", base + ".echcmd", peer, peer + ".cmd", src, src + ".cmd"
+    # base + ".verdict" is the tun probe's mailbox: it belongs to the TUNNEL, not to a pool, so a
+    # pool-less core has one too and it must be swept with the rest.
+    return (base, base + ".cmd", base + ".echcmd", base + ".verdict",
+            peer, peer + ".cmd", src, src + ".cmd")
 
 
 def _read_core_cfg(name):
@@ -1844,21 +1847,25 @@ def _report_carrying(name, edge, epoch):
         logline(f"{name}: probe found traffic crossing — told the core {ip or '?'} / {sni or '?'} are carrying"
                 + (f" [{err}]" if err else ""))
         return
-    if not _is_peer_pool(name):
-        return
     dpool, spool = _read_peer_pool(name, ".peerpool"), _read_peer_pool(name, ".srcpool")
     dst, src = dpool.get("active") or "", spool.get("active") or ""
-    if not dst and not src:
-        return
+    # Both empty on a pool-less tunnel, and it is still sent: `ok` also refills the ladder's free steps,
+    # which every tunnel has whether or not it owns an endpoint to burn. Nothing to clear then, so the
+    # recovery is the only occasion -- there is no condemned entry to keep announcing.
     if not edge and not (_condemned(dpool, dst) or _condemned(spool, src)):
         return
-    err = _atomic_write_json(_cfg_path(name, ".peerpool.cmd"), {"cmd": "ok", "key": dst, "src": src, "epoch": epoch})
-    logline(f"{name}: probe found traffic crossing — told the core {dst or '?'} / {src or '?'} are carrying"
+    err = _atomic_write_json(_cfg_path(name, ".status.verdict"), {"cmd": "ok", "key": dst, "src": src, "epoch": epoch})
+    carrying = f"{dst or '?'} / {src or '?'} are carrying" if dst or src else "the path is carrying"
+    logline(f"{name}: probe found traffic crossing — told the core {carrying}"
             + (f" [{err}]" if err else ""))
 
 
 def pool_failover(name, alive, crossed, epoch):
-    """Ask the core to burn the destination when our probe says nothing crosses this tunnel.
+    """Tell the core our probe found nothing crossing this tunnel, so its ladder can answer.
+
+    EVERY client tunnel is told, pool or no pool. The verdict is about the path, and the cheap rungs
+    the core answers it with -- redraw the source port, handshake again -- move the tunnel nowhere and
+    need no second endpoint. Only the burn does, and this names an endpoint only when there is one.
 
     `epoch` is the core's path counter, unchanged across the whole probe (health_of checks) and
     stamped on every ask. The core drops one that no longer matches, so a verdict can never be charged
@@ -1876,6 +1883,8 @@ def pool_failover(name, alive, crossed, epoch):
     If the whole pool has been walked and it is still dead, the destination was never the problem: every
     entry is restored and this stands down, so a filtered path cannot chew through a healthy pool.
     """
+    if str(_read_core_cfg(name).get("role") or "") != "client":
+        return                    # a server neither chooses a path nor climbs a ladder; it only follows
     now = time.monotonic()
     with _fo_lock:
         st = _fo_state(name)
@@ -1900,51 +1909,53 @@ def pool_failover(name, alive, crossed, epoch):
         # same confirmation the colour gets, whatever the tunnel looked like before.
         if _verdict.get(name, {}).get("bad", 0) < RED_SWEEPS:
             return
-    if str(_read_core_cfg(name).get("role") or "") != "client":
-        return                    # a server does not choose destinations; only the dialling end may rotate
     if _is_ws_pool(name):
         _ws_failover(name, now, epoch)
-        return
-    if not _is_peer_pool(name):
         return
     dst = _read_peer_pool(name, ".peerpool")
     src = _read_peer_pool(name, ".srcpool")
     addrs, cur = dst.get("addrs") or [], dst.get("active") or ""
     srcs = src.get("addrs") or []
-    if len(addrs) < 2 and len(srcs) < 2:
-        return                    # nothing to rotate to on either axis: a burn could only take it down
-    # The pools are NESTED, not parallel: the core walks every destination against the current source,
-    # and only once they are all spent does it burn THAT SOURCE and move to the next -- which is the
-    # attribution, since a source that fails against every destination is the one thing that did not
-    # vary. So the matrix, not the destination list, is what "everything has been tried" means. Stopping
-    # at the destination count quits after the first row and undoes the source burn the core just earned.
-    combos = max(1, len(addrs)) * max(1, len(srcs))
-    with _fo_lock:
-        st = _fo_state(name)
-        # COUNT the asks, do not track WHICH endpoint each landed on. The carrier fails over on its own
-        # timers too, so between our decision and the core acting the active endpoint can already have
-        # moved -- keying the WALK on identity made it burn the same address repeatedly and never finish.
-        # The ask itself is still keyed, below; only this counter is blind to which endpoint it hit.
-        st["burns"] += 1
-        walked = st["burns"] >= combos
+    # The WALK spends endpoints, so it only exists where there are endpoints to spend. A tunnel with one
+    # destination and one source has no matrix to exhaust and no cooldown to serve -- but it does have a
+    # path, and the core answers a verdict about it with the ladder's free steps, which move the tunnel
+    # nowhere and condemn nobody. Withholding the verdict from it left it with no ladder at all.
+    walk = ""
+    if len(addrs) >= 2 or len(srcs) >= 2:
+        # The pools are NESTED, not parallel: the core walks every destination against the current source,
+        # and only once they are all spent does it burn THAT SOURCE and move to the next -- which is the
+        # attribution, since a source that fails against every destination is the one thing that did not
+        # vary. So the matrix, not the destination list, is what "everything has been tried" means. Stopping
+        # at the destination count quits after the first row and undoes the source burn the core just earned.
+        combos = max(1, len(addrs)) * max(1, len(srcs))
+        with _fo_lock:
+            st = _fo_state(name)
+            # COUNT the asks, do not track WHICH endpoint each landed on. The carrier fails over on its own
+            # timers too, so between our decision and the core acting the active endpoint can already have
+            # moved -- keying the WALK on identity made it burn the same address repeatedly and never finish.
+            # The ask itself is still keyed, below; only this counter is blind to which endpoint it hit.
+            st["burns"] += 1
+            walked = st["burns"] >= combos
+            if walked:
+                st["burns"] = 0
+                st["cooldown"] = now + FAILOVER_COOLDOWN
         if walked:
-            st["burns"] = 0
-            st["cooldown"] = now + FAILOVER_COOLDOWN
-    if walked:
-        # Every endpoint tried and still nothing crosses -> not the endpoints. Hand them all back.
-        _pool_sighup(name, _is_peer_pool, "")
-        logline(f"{name}: whole destination pool tried and still dead — restoring every entry, "
-                f"standing down for {int(FAILOVER_COOLDOWN)}s")
-        return
+            # Every endpoint tried and still nothing crosses -> not the endpoints. Hand them all back.
+            _pool_sighup(name, _is_peer_pool, "")
+            logline(f"{name}: whole destination pool tried and still dead — restoring every entry, "
+                    f"standing down for {int(FAILOVER_COOLDOWN)}s")
+            return
+        walk = f" (ask {st['burns']} of {combos}: {len(addrs)} dst x {max(1, len(srcs))} src)"
     # NAME the endpoint the probe measured, exactly as the ok verdict does. That poll is a one-second
     # ticker and the probe before it takes most of a second, so every proactive rotate beat is a window
     # where an unnamed verdict lands on whatever the core moved to -- condemning an endpoint nothing
-    # measured and putting the tunnel back on the one that was.
+    # measured and putting the tunnel back on the one that was. Empty names no endpoint, which is the
+    # honest answer for a tunnel that has none: the core spends a free step and blames nobody.
     # Atomic (tmp+replace): the core polls this file once a second and deletes it, so a half-written
     # one would be read and dropped, and the failover silently lost.
-    err = _atomic_write_json(_cfg_path(name, ".peerpool.cmd"), {"cmd": "fail", "key": cur, "epoch": epoch})
-    logline(f"{name}: probe found nothing crossing — asked the core to fail destination "
-            f"{cur or '?'} (ask {st['burns']} of {combos}: {len(addrs)} dst x {max(1, len(srcs))} src)"
+    err = _atomic_write_json(_cfg_path(name, ".status.verdict"), {"cmd": "fail", "key": cur, "epoch": epoch})
+    asked = f"fail destination {cur}{walk}" if cur else "spend a free step — this tunnel has no endpoint to burn"
+    logline(f"{name}: probe found nothing crossing — asked the core to {asked}"
             + (f" [{err}]" if err else ""))
 
 
