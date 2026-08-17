@@ -155,6 +155,8 @@ def main():
 
     # --- the conditions, each on its own tunnel so no state leaks between them ---------------------
     def asks_for(name, **over):
+        """The EDGE-pool asks this sweep produced. A tunnel that is not an edge pool is judged on the
+        direct path instead, which writes elsewhere and is that file's business, not this one's."""
         keep = {k: STATE[k] for k in over}
         STATE.update(over)
         STATE["hits"] = 0
@@ -163,7 +165,7 @@ def main():
             clock["t"] += 4.0
             sweep(name)
         STATE.update(keep)
-        return len(sent) - n0
+        return len([p for p, _o in sent[n0:] if p.endswith(".status.cmd")])
 
     want(asks_for("w-server", role="server") == 0,
          "a SERVER end must never ask: it does not dial, and two ends both rotating would chase each "
@@ -171,7 +173,9 @@ def main():
     want(asks_for("w-one", ips=["1.1.1.9"], snis=["only.example"], ip="1.1.1.9", sni="only.example") == 0,
          "a single edge and a single SNI must never be burned -- there is nothing to move to on either "
          "axis, so the ask would just take the tunnel down")
-    want(asks_for("w-nopool", is_ws=False) == 0, "a tunnel with no edge pool at all must be left alone")
+    want(asks_for("w-nopool", is_ws=False) == 0,
+         "a tunnel that is not an edge pool must never be judged on the EDGE axes -- it has none, and "
+         "the ip/sni keys would name nothing")
 
     os.path.exists = real_exists
     print()

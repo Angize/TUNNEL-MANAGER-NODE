@@ -130,8 +130,8 @@ def main():
          f"one destination and three sources must still be judged -- the destination axis cannot vary, "
          f"so the core answers by walking the SOURCE, and a node that stays silent here leaves a tunnel "
          f"with three source IPs stuck on the one that does not work. got {sent2}")
-    want(sent2[0][0].endswith(".peerpool.cmd"),
-         f"and it must go to the destination pool's own command file, got {sent2[0][0]}")
+    want(sent2[0][0].endswith(".status.verdict"),
+         f"and it must go to the tunnel's own verdict mailbox, got {sent2[0][0]}")
 
     for _ in range(2):
         clock2["t"] += 4.0
@@ -144,8 +144,8 @@ def main():
     m3 = load()
     m3.CONFIG_DIR = tempfile.mkdtemp()
     m3.logline = lambda _msg: None
-    sent3 = []
-    m3._pool_sighup = lambda name, is_pool, msg: {"ok": True}
+    sent3, sighups3 = [], []
+    m3._pool_sighup = lambda name, is_pool, msg: sighups3.append(name) or {"ok": True}
     m3._atomic_write_json = lambda path, obj: sent3.append((os.path.basename(path), obj)) and None
     ST3 = {"hits": 0}
     m3._is_ws_pool = lambda name: False
@@ -164,9 +164,16 @@ def main():
     for _ in range(6):
         clock3["t"] += 4.0
         m3.health_of({"type": "core", "name": "p2", "tunnel_ip": "192.168.9.2/24"})
-    want(sent3 == [],
-         f"one destination and one source have nowhere to go: a verdict there can only take the tunnel "
-         f"down and mark the only endpoint it has as dead. got {sent3}")
+    # One destination and one source have nowhere to GO, and are still told. The measurement is about
+    # the path; what the core does with it there is the ladder's free steps, which move the tunnel
+    # nowhere and condemn nobody -- the pool itself refuses to burn below two entries. Staying silent
+    # was what left this shape, the commonest one on the fleet, with no recovery but a 45s clock.
+    want(len(sent3) >= 1 and all(o == {"cmd": "fail", "key": "d1", "epoch": 1} for _p, o in sent3),
+         f"a tunnel with one of each must still be judged, every ask naming what was measured, got {sent3}")
+    want(all(p.endswith(".status.verdict") for p, _o in sent3),
+         f"and into the tunnel's verdict mailbox, got {[p for p, _o in sent3]}")
+    want(sighups3 == [],
+         f"there is no matrix here, so it must never reach the walk or its cooldown, got {sighups3}")
 
     # ---------------------------------------------------------------- a SERVER never judges
     m4 = load()
