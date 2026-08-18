@@ -5,8 +5,8 @@ is why. Wire it straight to a burn and a filtered path or a peer that is simply 
 the whole pool and leave every entry burned, which is a worse outage than the one it was chasing.
 
 So the jump is the experiment: burn, move, let the next sweep judge, and if the whole pool has been
-walked and it is STILL dead, hand every entry back and stand down. What this file defends is that
-chain, plus the four conditions that must hold before a single burn is asked for at all.
+walked it keeps reporting: there is no ask ceiling here and nothing is handed back on the decision
+path. What this file defends is that, plus the four conditions that must hold before a single ask.
 
 It drives health_of -- the sweep's own path -- not pool_failover directly, because a guard that calls
 the helper says nothing about whether the sweep still calls it.
@@ -135,33 +135,28 @@ def main():
     sweep()
     want(len(sent) == 2, f"past the settle window the next endpoint may be failed too, got {len(sent)}")
 
-    # --- the WHOLE pool walked and still dead -> hand everything back, do not burn the last one ----
-    STATE["active"] = "10.0.0.1"
-    clock["t"] += 4.0
-    sweep()
-    want(len(sent) == 2,
-         f"the third endpoint must NOT be burned: every entry has now been tried, so the destination "
-         f"was never the problem. got {len(sent)} burns")
-    want(sighups == ["t1"],
-         f"instead every burned entry must be handed back at once, got sighups={sighups}")
-
-    # --- and it stands down, instead of chewing through the pool again -----------------------------
-    before = (len(sent), len(sighups))
-    clock["t"] += 4.0
-    dead_sweeps(3)
-    want((len(sent), len(sighups)) == before,
-         f"after a full walk it must stand down for the cooldown, got {(len(sent), len(sighups))}")
-    clock["t"] += m.FAILOVER_COOLDOWN + 1
-    sweep()
-    want(len(sent) == 3, f"and pick up again once the cooldown lapses, got {len(sent)}")
+    # --- the node never rations asks, and never hands the pool back itself -------------------------
+    # This is the class the old walk policy belonged to. It counted ITS OWN asks and assumed one ask
+    # == one burn; when the core's ladder grew free rungs that stopped being true and the core never
+    # received enough verdicts to reach a burn at all. Asserting a COUNT here would rebuild the same
+    # coupling, so what is asserted is that there is no ceiling: every bad sweep is reported, whatever
+    # the pool's shape and however many rungs the core spends. Releasing a burn is the core's backoff.
+    n0, s0 = len(sent), len(sighups)
+    for _ in range(6):
+        STATE["active"] = "10.0.0.1"
+        clock["t"] += 4.0
+        sweep()
+    want(len(sent) == n0 + 6, f"every bad sweep must reach the core, got {len(sent) - n0} of 6")
+    want(len(sighups) == s0,
+         f"and the node must never hand the pool back on the decision path, got sighups={sighups}")
 
     # --- a tunnel that recovers clears the round --------------------------------------------------
     STATE["hits"] = m.PROBE_COUNT
     clock["t"] += 4.0
     sweep()
-    with m._fo_lock:
-        want(m._fo["t1"]["burns"] == 0,
-             "a tunnel that starts crossing again must forget the round it was in the middle of")
+    with m._verdict_lock:
+        want(m._verdict["t1"].get("red") is False,
+             "a tunnel that starts crossing again must no longer be remembered as red")
 
     # --- who is told, and who is not, each on its own tunnel so no state leaks between them --------
     def asks_for(name, **over):
@@ -185,34 +180,22 @@ def main():
     one = asks_for("t-one", addrs=["10.0.0.9"], active="10.0.0.9")
     want(len(one) == 1 and one[0]["cmd"] == "fail" and one[0]["key"] == "10.0.0.9",
          f"a single-destination tunnel must still be told, naming what was measured, got {one}")
-    want(sighups == ["t1"],
-         f"and it must not reach the walk: there is no matrix to exhaust and nothing to hand back, "
-         f"got sighups={sighups}")
+    want(sighups == [],
+         f"and the node hands nothing back on the decision path, whatever the shape, got {sighups}")
 
-    nopool = asks_for("t-nopool", addrs=[], active="")
-    want(len(nopool) == 1 and nopool[0]["cmd"] == "fail" and nopool[0]["key"] == "",
-         f"a tunnel with no pool at all must be told too, naming no endpoint because it has none to "
-         f"name -- an empty key is a verdict about the PATH, got {nopool}")
-
-    # --- the walk is the MATRIX, not the destination list -----------------------------------------
-    # The pools are nested: every destination is tried against the current source, and only then is
-    # THAT SOURCE burned and the next one taken. Bounding the walk by the destination count quits after
-    # the first row and hands back the source burn the core had just earned -- which is the one correct
-    # conclusion in the whole sequence.
-    STATE["srcs"] = ["192.168.1.1", "192.168.1.2"]   # 3 destinations x 2 sources = 6 combinations
-    STATE["hits"] = 0
+    # --- a 3x2 pool is judged on every bad sweep too, with no ceiling and no hand-back ------------
+    STATE["srcs"] = ["192.168.1.1", "192.168.1.2"]
+    STATE["active"], STATE["hits"] = "10.0.0.1", 0
+    dead_sweeps(2)                       # the first bad sweep only arms RED_SWEEPS; it asks for nothing
     n0, s0 = len(sent), len(sighups)
-    for _ in range(9):
+    for _ in range(6):
         clock["t"] += 4.0
-        sweep("t-matrix")
-    # N combinations take N-1 asks, not N: each ask MOVES you from one combination to the next, so by
-    # the time the last one is standing there is nothing left to ask for -- that is where it gives up.
-    want(len(sent) - n0 == 5,
-         f"with 3 destinations and 2 sources the walk must cover 6 combinations in 5 asks, not stop "
-         f"after the destination list -- got {len(sent) - n0}")
-    want(len(sighups) - s0 == 1,
-         f"and it must hand everything back exactly once, at the END of the matrix, got "
-         f"{len(sighups) - s0}")
+        sweep()
+    want(len(sent) - n0 == 6,
+         f"3 destinations x 2 sources changes nothing: one ask per bad sweep once red is confirmed, "
+         f"got {len(sent) - n0} of 6")
+    want(len(sighups) - s0 == 0,
+         f"and still no hand-back, got {len(sighups) - s0}")
     STATE["srcs"] = []
 
     # --- EVERY ask names the endpoint the probe was measured on, never "whatever is active later" ---
@@ -222,7 +205,7 @@ def main():
     # 2026-08-05. Its own tunnel, 3 dst x 2 src, so five asks fit before the walk completes.
     STATE["srcs"] = ["10.9.0.1", "10.9.0.2"]
     STATE["is_pool"], STATE["hits"] = True, 0
-    clock["t"] += m.FAILOVER_COOLDOWN + 4.00
+    clock["t"] += 4.0
     STATE["active"] = "10.0.0.1"
     dead_sweeps(2, name="t-key")                      # confirm red, first ask
     for want_key in ("10.0.0.2", "10.0.0.3", "10.0.0.1"):
@@ -240,7 +223,7 @@ def main():
     # while carrying nothing. So the probe that condemns an endpoint is the only thing that clears it.
     STATE["srcs"] = ["10.9.0.1", "10.9.0.2"]
     STATE["active"], STATE["is_pool"], STATE["hits"] = "10.0.0.2", True, 0
-    clock["t"] += m.FAILOVER_COOLDOWN + 4.00
+    clock["t"] += 4.0
     dead_sweeps(2, name="t-ok")                      # confirm red so there is something to recover from
     n0 = len(sent)
     want(n0 > 0 and sent[-1][1]["cmd"] == "fail", f"setup: expected a burn first, got {sent[-1:]}")
@@ -281,8 +264,8 @@ def main():
 
     # --- the memory must not outlive the tunnel ---------------------------------------------------
     m._prune_iface_state(set())
-    with m._fo_lock:
-        want(m._fo == {}, f"pruning must drop the per-tunnel failover memory, got {list(m._fo)}")
+    with m._verdict_lock:
+        want(all("red" not in v for v in m._verdict.values()), f"pruning must drop the per-tunnel red memory, got {list(m._verdict)}")
 
     os.path.exists, m._flow_sample = real_exists, real_flow
     print()

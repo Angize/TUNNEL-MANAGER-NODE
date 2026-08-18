@@ -1754,13 +1754,6 @@ def settle(name, ok):
 
 
 # --- node-driven destination failover ---------------------------------------------------------------
-FAILOVER_COOLDOWN = 300.0   # s of standing down after a whole pool was walked and the tunnel is STILL dead
-_fo_lock = threading.Lock()
-_fo = {}                    # tunnel -> {"burns": asks issued this round, "cooldown"}
-
-
-def _fo_state(name):
-    return _fo.setdefault(name, {"burns": 0, "cooldown": 0.0, "red": False})
 
 
 def _read_path_state(name):
@@ -1880,28 +1873,24 @@ def pool_failover(name, alive, crossed, epoch):
 
     What the probe CANNOT do is name the guilty endpoint -- it only knows the tunnel is dead. So the
     jump is the experiment and the next endpoint is the control: burn, move, let the next sweep judge.
-    If the whole pool has been walked and it is still dead, the destination was never the problem: every
-    entry is restored and this stands down, so a filtered path cannot chew through a healthy pool.
+
+    There is no walk policy here. This reports; the core decides how many free rungs to spend before a
+    burn, and a burned endpoint returns on the backoff the core stamped on it. Counting asks here and
+    calling that "the pool has been walked" assumed one ask == one burn, which stopped being true when
+    the ladder grew free rungs -- the core then never received enough verdicts to reach a burn at all.
     """
     if str(_read_core_cfg(name).get("role") or "") != "client":
         return                    # a server neither chooses a path nor climbs a ladder; it only follows
-    now = time.monotonic()
-    with _fo_lock:
-        st = _fo_state(name)
-        if alive is not False:
-            st["burns"] = 0       # something crosses again -- whatever we were chasing is over
-            # Only a MEASURED green is news. Anything else says nothing about any endpoint.
-            recovered, st["red"] = st["red"] and alive is True, False
-        else:
-            st["red"] = True
+    with _verdict_lock:
+        # `red` is the PREVIOUS published colour, which settle() has already overwritten in `pub` by the
+        # time this runs -- so it lives here beside it rather than in a second dict with its own lock.
+        # Only a MEASURED green is news; anything else says nothing about any endpoint.
+        st = _verdict.setdefault(name, {"pub": None, "bad": 0})
+        was_red, st["red"] = st.get("red", False), alive is False
     if alive is not False:
         if crossed:
-            _report_carrying(name, recovered, epoch)  # the other half of the verdict, off the lock: it writes a file
+            _report_carrying(name, was_red and alive is True, epoch)  # off the lock: it writes a file
         return
-    with _fo_lock:
-        st = _fo_state(name)
-        if now < st["cooldown"]:
-            return
     with _verdict_lock:
         # A tunnel that was never green goes red on its FIRST bad sweep -- there was no green to protect.
         # Right for the dot, wrong for burning: the agent restarts on every update, so one momentary
@@ -1910,42 +1899,9 @@ def pool_failover(name, alive, crossed, epoch):
         if _verdict.get(name, {}).get("bad", 0) < RED_SWEEPS:
             return
     if _is_ws_pool(name):
-        _ws_failover(name, now, epoch)
+        _ws_failover(name, epoch)
         return
-    dst = _read_peer_pool(name, ".peerpool")
-    src = _read_peer_pool(name, ".srcpool")
-    addrs, cur = dst.get("addrs") or [], dst.get("active") or ""
-    srcs = src.get("addrs") or []
-    # The WALK spends endpoints, so it only exists where there are endpoints to spend. A tunnel with one
-    # destination and one source has no matrix to exhaust and no cooldown to serve -- but it does have a
-    # path, and the core answers a verdict about it with the ladder's free steps, which move the tunnel
-    # nowhere and condemn nobody. Withholding the verdict from it left it with no ladder at all.
-    walk = ""
-    if len(addrs) >= 2 or len(srcs) >= 2:
-        # The pools are NESTED, not parallel: the core walks every destination against the current source,
-        # and only once they are all spent does it burn THAT SOURCE and move to the next -- which is the
-        # attribution, since a source that fails against every destination is the one thing that did not
-        # vary. So the matrix, not the destination list, is what "everything has been tried" means. Stopping
-        # at the destination count quits after the first row and undoes the source burn the core just earned.
-        combos = max(1, len(addrs)) * max(1, len(srcs))
-        with _fo_lock:
-            st = _fo_state(name)
-            # COUNT the asks, do not track WHICH endpoint each landed on. The carrier fails over on its own
-            # timers too, so between our decision and the core acting the active endpoint can already have
-            # moved -- keying the WALK on identity made it burn the same address repeatedly and never finish.
-            # The ask itself is still keyed, below; only this counter is blind to which endpoint it hit.
-            st["burns"] += 1
-            walked = st["burns"] >= combos
-            if walked:
-                st["burns"] = 0
-                st["cooldown"] = now + FAILOVER_COOLDOWN
-        if walked:
-            # Every endpoint tried and still nothing crosses -> not the endpoints. Hand them all back.
-            _pool_sighup(name, _is_peer_pool, "")
-            logline(f"{name}: whole destination pool tried and still dead — restoring every entry, "
-                    f"standing down for {int(FAILOVER_COOLDOWN)}s")
-            return
-        walk = f" (ask {st['burns']} of {combos}: {len(addrs)} dst x {max(1, len(srcs))} src)"
+    cur = _read_peer_pool(name, ".peerpool").get("active") or ""
     # NAME the endpoint the probe measured, exactly as the ok verdict does. That poll is a one-second
     # ticker and the probe before it takes most of a second, so every proactive rotate beat is a window
     # where an unnamed verdict lands on whatever the core moved to -- condemning an endpoint nothing
@@ -1954,41 +1910,21 @@ def pool_failover(name, alive, crossed, epoch):
     # Atomic (tmp+replace): the core polls this file once a second and deletes it, so a half-written
     # one would be read and dropped, and the failover silently lost.
     err = _atomic_write_json(_cfg_path(name, ".status.verdict"), {"cmd": "fail", "key": cur, "epoch": epoch})
-    asked = f"fail destination {cur}{walk}" if cur else "spend a free step — this tunnel has no endpoint to burn"
+    asked = f"fail destination {cur}" if cur else "spend a free step — this tunnel has no endpoint to burn"
     logline(f"{name}: probe found nothing crossing — asked the core to {asked}"
             + (f" [{err}]" if err else ""))
 
 
-
-def _ws_failover(name, now, epoch):
-    """pool_failover's edge-pool half: ask the core to burn the SNI when nothing crosses.
-
-    Same experiment as the direct pools, on the CDN's two axes. The SNI is the low digit and the EDGE
-    the high one, so a whole row of SNIs failing on one edge is what convicts that edge -- the probe
-    only ever sees silence, which names the COMBO and never one axis on its own. "Everything tried" is
-    therefore the matrix, not either list."""
+def _ws_failover(name, epoch):
+    """pool_failover's edge-pool half: ask the core to burn the edge/SNI when nothing crosses."""
     w = _read_ws_pool(name)
     ips, snis, cur_ip, cur_sni = w["ips"], w["snis"], w["ip"], w["sni"]
     if len(ips) < 2 and len(snis) < 2:
         return                    # nothing to rotate to on either axis: a burn could only take it down
-    combos = max(1, len(ips)) * max(1, len(snis))
-    with _fo_lock:
-        st = _fo_state(name)
-        st["burns"] += 1
-        walked = st["burns"] >= combos
-        if walked:
-            st["burns"] = 0
-            st["cooldown"] = now + FAILOVER_COOLDOWN
-    if walked:
-        _pool_sighup(name, _is_ws_pool, "")
-        logline(f"{name}: whole edge matrix tried and still dead — restoring every entry, "
-                f"standing down for {int(FAILOVER_COOLDOWN)}s")
-        return
     err = _atomic_write_json(_cfg_path(name, ".status.cmd"),
                              {"cmd": "fail", "ip": cur_ip, "sni": cur_sni, "epoch": epoch})
     logline(f"{name}: probe found nothing crossing — asked the core to fail edge "
-            f"{cur_ip or '?'} / {cur_sni or '?'} (ask {st['burns']} of {combos}: "
-            f"{max(1, len(ips))} edge x {max(1, len(snis))} sni)" + (f" [{err}]" if err else ""))
+            f"{cur_ip or '?'} / {cur_sni or '?'}" + (f" [{err}]" if err else ""))
 
 
 # --- directional liveness: bytes moving on the tunnel iface, counted per direction, whatever ICMP does ---
@@ -2016,9 +1952,7 @@ def _prune_iface_state(names):
     with _verdict_lock:
         for nm in [n for n in _verdict if n not in names]:
             _verdict.pop(nm, None)
-    with _fo_lock:
-        for nm in [n for n in _fo if n not in names]:
-            _fo.pop(nm, None)   # a recreated tunnel must not inherit a cooldown or a half-walked pool
+
 
 
 def _flow_sample(name):

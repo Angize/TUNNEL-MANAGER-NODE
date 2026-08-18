@@ -86,14 +86,14 @@ def main():
     clock["t"] += 4.0
     sweep()
     want(len(sent) == 2 and sighups == [],
-         f"3 edges x 1 SNI is 3 combinations, so the second ask is still inside the walk. "
+         f"a lopsided pool is judged on every bad sweep, with no ask ceiling and no hand-back. "
          f"got {len(sent)} asks, sighups={sighups}")
 
     clock["t"] += 4.0
     sweep()
-    want(len(sent) == 2 and sighups == ["w1"],
-         f"...and the third completes it: every combination has been tried, so the edges were never the "
-         f"problem and every entry is handed back. got {len(sent)} asks, sighups={sighups}")
+    want(len(sent) == 3 and sighups == [],
+         f"a third bad sweep is a third ask -- the node has no walk to complete and nothing to hand "
+         f"back. got {len(sent)} asks, sighups={sighups}")
 
     # ---------------------------------------------------------------- one destination, three sources
     m2 = load()
@@ -136,9 +136,9 @@ def main():
     for _ in range(2):
         clock2["t"] += 4.0
         sweep2()
-    want(len(sent2) == 2 and sighups2 == ["p1"],
-         f"1 destination x 3 sources is 3 combinations: two asks, then the walk is complete and every "
-         f"entry is handed back. got {len(sent2)} asks, sighups={sighups2}")
+    want(len(sent2) == 3 and sighups2 == [],
+         f"1 destination x 3 sources is judged the same way: one ask per bad sweep, no ceiling, no "
+         f"hand-back. got {len(sent2)} asks, sighups={sighups2}")
 
     # ---------------------------------------------------------------- nothing to rotate to at all
     m3 = load()

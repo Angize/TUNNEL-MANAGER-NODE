@@ -104,33 +104,19 @@ def main():
          f"is measuring the re-dial. got {len(sent)}")
     PATH["ready"] = True
 
-    # --- the walk is the MATRIX (2 edges x 2 SNIs = 4 combinations = 3 asks) -----------------------
-    for _ in range(2):
+    # --- the node never rations asks, and never hands the pool back itself -------------------------
+    # This is the class the old walk policy belonged to. It counted ITS OWN asks and assumed one ask
+    # == one burn; when the core's ladder grew free rungs that stopped being true and the core never
+    # received enough verdicts to reach a burn at all. Asserting a COUNT here would rebuild the same
+    # coupling, so what is asserted is that there is no ceiling: every bad sweep is reported, whatever
+    # the pool's shape and however many rungs the core spends. Releasing a burn is the core's backoff.
+    n0, s0 = len(sent), len(sighups)
+    for _ in range(4):
         clock["t"] += 4.0
         sweep()
-    want(len(sent) == 3,
-         f"2 edges x 2 SNIs is 4 combinations, covered in 3 asks -- got {len(sent)}")
-    want(sighups == [],
-         f"and nothing may be handed back before the matrix is done, got sighups={sighups}")
-
-    # --- matrix exhausted -> hand everything back, do not burn the last one ------------------------
-    clock["t"] += 4.0
-    sweep()
-    want(len(sent) == 3,
-         f"the last combination must NOT be asked for: every one has been tried, so the edges were "
-         f"never the problem. got {len(sent)} asks")
-    want(sighups == ["w1"], f"instead every entry must be handed back at once, got sighups={sighups}")
-
-    # --- and it stands down instead of chewing through the matrix again ----------------------------
-    before = (len(sent), len(sighups))
-    for _ in range(3):
-        clock["t"] += 4.0
-        sweep()
-    want((len(sent), len(sighups)) == before,
-         f"after a full walk it must stand down for the cooldown, got {(len(sent), len(sighups))}")
-    clock["t"] += m.FAILOVER_COOLDOWN + 1
-    sweep()
-    want(len(sent) == 4, f"and pick up again once the cooldown lapses, got {len(sent)}")
+    want(len(sent) == n0 + 4, f"every bad sweep must reach the core, got {len(sent) - n0} of 4")
+    want(len(sighups) == s0,
+         f"and the node must never hand the edge pool back itself, got sighups={sighups}")
 
     # --- the GREEN half: a carrying combination clears both burns ----------------------------------
     STATE["burned"] = [("1.1.1.1", "ip"), ("a.example", "sni")]
@@ -142,9 +128,9 @@ def main():
          f"an edge that is CARRYING while its pool still has it condemned must be reported, naming both "
          f"axes -- a burn always rotates away from what it burns, so nothing else ever clears it. got "
          f"{sent[n0:]}")
-    with m._fo_lock:
-        want(m._fo["w1"]["burns"] == 0,
-             "a tunnel that starts crossing again must forget the round it was in the middle of")
+    with m._verdict_lock:
+        want(m._verdict["w1"].get("red") is False,
+             "a tunnel that starts crossing again must no longer be remembered as red")
 
     # --- a healthy tunnel on healthy entries writes nothing ----------------------------------------
     STATE["burned"] = []
