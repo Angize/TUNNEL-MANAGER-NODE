@@ -652,7 +652,6 @@ MAX_WORKERS = 4
 QUEUEING_TRANSPORTS = ("raw", "udp")
 
 _TUNING_INT_KEYS = ("dead_retest_secs",
-                    "dead_mult",
                     # flux_rotate_default_secs intentionally omitted: every flux tunnel carries an explicit
                     # flux_rotate_secs, so the core's tuned default is unreachable; the panel offers no knob either.
                     "ping_loss_threshold", "min_liveness_secs", "probe_timeout_secs")
@@ -763,7 +762,6 @@ def _core_config(cfg):
         "tun_name": name,
         "tun_addr": cfg["tunnel_ip"],
         "mtu": mtu,
-        "keepalive": max(5, min(120, int(cfg.get("keepalive") or 15))),   # honor a configured value (clamped 5..120s); 15 default
         "crypto": {"enabled": crypto_on, "psk": cfg.get("psk", ""), "cipher": cipher},
     }
     # Operator-tuned operational timings (self-heal / pool-health): pass the panel's `tuning` object
@@ -2622,11 +2620,9 @@ def op_tunnel(d):
     if d.get("probe_min_pct") not in (None, ""):
         _lo, _hi = PROBE_MIN_PCT_RANGE
         obj["probe_min_pct"] = max(_lo, min(_hi, int(d["probe_min_pct"])))
-    if ttype == "core" and d.get("keepalive") not in (None, ""):   # optional; whitelist so a set value survives (else _core_config falls back to 15)
-        obj["keepalive"] = max(5, min(120, int(d["keepalive"])))
     # tuning (core, optional): the fleet-wide operational-timing overrides the panel stamps onto EVERY core
     # body. This whitelist entry is load-bearing — _core_config reads cfg["tuning"] from the PERSISTED
-    # config, so without it the key is dropped on the way in and every Settings knob but keepalive is a
+    # config, so without it the key is dropped on the way in and every Settings knob is a
     # silent fleet-wide no-op. Sanitized with the same helper _core_config uses.
     if ttype == "core":
         _tn = _core_tuning(d.get("tuning"))
