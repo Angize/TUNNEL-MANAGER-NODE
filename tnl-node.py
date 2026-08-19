@@ -1853,7 +1853,7 @@ def _report_carrying(name, edge, epoch):
             + (f" [{err}]" if err else ""))
 
 
-def pool_failover(name, alive, crossed, epoch):
+def pool_failover(name, alive, crossed, epoch, session_up):
     """Tell the core our probe found nothing crossing this tunnel, so its ladder can answer.
 
     EVERY client tunnel is told, pool or no pool. The verdict is about the path, and the cheap rungs
@@ -1863,6 +1863,14 @@ def pool_failover(name, alive, crossed, epoch):
     `epoch` is the core's path counter, unchanged across the whole probe (health_of checks) and
     stamped on every ask. The core drops one that no longer matches, so a verdict can never be charged
     to a path it did not measure. Callers only reach here for a measurement that held still.
+
+    `session_up` says the carrier reported an established session on this path BOTH sides of the probe.
+    Only the ok needs it. An ok CLEARS a burn, which is the strong claim, and it must not rest on a
+    silence the handshake explains. A fail is the weak one: it blames nobody until the core has spent
+    its free rungs, and the first of those rungs IS a handshake -- so requiring a session here meant
+    the ladder switched off the judge the moment it took its first step, and on a path that stays
+    blocked the handshake never completes, so no verdict ever arrived again and nothing was ever
+    burned. The order of the rungs is what answers that worry, not muting the probe.
 
     `crossed` is THIS sweep's raw measurement, not the published colour: settle() keeps a green tunnel
     green through a bad sweep, and a smoothed green measured nothing, so it may never clear a burn.
@@ -1888,7 +1896,7 @@ def pool_failover(name, alive, crossed, epoch):
         st = _verdict.setdefault(name, {"pub": None, "bad": 0})
         was_red, st["red"] = st.get("red", False), alive is False
     if alive is not False:
-        if crossed:
+        if crossed and session_up:
             _report_carrying(name, was_red and alive is True, epoch)  # off the lock: it writes a file
         return
     with _verdict_lock:
@@ -1899,7 +1907,13 @@ def pool_failover(name, alive, crossed, epoch):
         if _verdict.get(name, {}).get("bad", 0) < RED_SWEEPS:
             return
     if _is_ws_pool(name):
-        _ws_failover(name, epoch)
+        # The edge pool has no ladder: a fail burns an edge on the spot. So it keeps the stricter gate
+        # -- nothing is asked while the carrier reports no connection on this combination, because the
+        # silence a probe measures there belongs to the re-dial. What frees the DIRECT carriers is that
+        # their first rung is free and blames nobody; the edge pool has no such step, and its own
+        # bounded walk already covers a carrier that dies faster than the probe can judge it.
+        if session_up:
+            _ws_failover(name, epoch)
         return
     cur = _read_peer_pool(name, ".peerpool").get("active") or ""
     # NAME the endpoint the probe measured, exactly as the ok verdict does. That poll is a one-second
@@ -2052,11 +2066,12 @@ def health_of(cfg):
             crossed = carrying(hits, sent, probe_min_pct(cfg))
             alive = settle(name, crossed)
             epoch, ready = _read_path_state(name)
-            # Ready on BOTH sides, not just at the end. A re-handshake moves no address, so a session
-            # that was down when the probe started and up by the time it finished leaves the epoch
-            # untouched — and the silence it measured belongs to the handshake, not to the path.
-            if ready_before and ready and epoch == epoch_before:
-                pool_failover(name, alive, crossed, epoch)
+            # The EPOCH gates both verdicts: a probe that spanned a move measured two paths and can be
+            # charged to neither. `ready` gates only the ok — see pool_failover. Gating the fail on it
+            # too silenced the judge for the whole outage: the core's first free rung is a handshake,
+            # which turns ready false, and on a blocked path it never completes.
+            if epoch == epoch_before:
+                pool_failover(name, alive, crossed, epoch, ready_before and ready)
     return {"up": up, "alive": alive, "dead": alive is False, "rtt_ms": rtt, "loss_pct": loss,
             "rx_still": rx_still, "tx_still": tx_still, "live_win": int(LIVE_WINDOW)}
 
