@@ -104,17 +104,31 @@ def main():
          f"and that file must be one a relaunch sweeps, or the fresh core replays its predecessor's "
          f"verdict. got {sent[0][0]} vs {[os.path.basename(p) for p in m._core_status_paths('t1')]}")
 
-    # --- what swallows the sweeps right after a jump is the carrier's own report, not a clock -------
-    # The burn clears the session, so the core publishes ready=false until it has re-handshaked on the
-    # endpoint it moved to. Nothing may be asked for in that window: the silence a probe measures there
-    # belongs to the handshake, not to the path. This replaced a fixed settle timer, which could only
-    # ever guess how long a handshake takes.
+    # --- a carrier with no session on the path is still reported DEAD -----------------------------
+    # The core's cheapest rungs include giving the session up and handshaking again, which turns
+    # ready=false for exactly as long as the path stays blocked. Gating the fail on it meant the very
+    # first rung switched the judge off, so the walk that follows -- burn, move, re-judge -- was never
+    # reachable. A fail blames nobody until the free rungs are spent; the ORDER of the rungs is what
+    # protects the handshake, not silence from here.
     PATH["ready"] = False
+    n_nosess = len(sent)
     dead_sweeps(2, step=2.0)
-    want(len(sent) == 1,
-         f"while the carrier reports no session on the path, nothing may be asked -- the probe is "
-         f"measuring the handshake. got {len(sent)} burns")
+    want(len(sent) == n_nosess + 2,
+         f"a probe measuring a path the carrier has no session on is still a measurement of that path, "
+         f"got {len(sent) - n_nosess} of 2 asks")
+    want(all(o["cmd"] == "fail" for _, o in sent[n_nosess:]),
+         f"and every one of them must be a fail, got {sent[n_nosess:]}")
+
+    # --- but an OK still needs one: it CLEARS a burn, and that claim may not rest on a handshake ---
+    STATE["hits"] = m.PROBE_COUNT
+    n_ok = len(sent)
+    clock["t"] += 4.0
+    sweep()
+    want(len(sent) == n_ok,
+         f"traffic crossed while the carrier reported no session on this path and the node cleared a "
+         f"burn on it anyway, got {sent[n_ok:]}")
     PATH["ready"] = True
+    STATE["hits"] = 0
 
     # --- a probe that STRADDLES a path change is charged to neither side of it ----------------------
     # The epoch moves between the two reads of one sweep, which is exactly a rotation landing mid-probe.
@@ -131,9 +145,11 @@ def main():
     # already have moved. A walk keyed on identity burns the same address forever and never finishes --
     # measured live on 2026-08-04 before this was counted instead.
     STATE["active"] = "10.0.0.1"
+    n_again = len(sent)
     clock["t"] += 4.0
     sweep()
-    want(len(sent) == 2, f"past the settle window the next endpoint may be failed too, got {len(sent)}")
+    want(len(sent) == n_again + 1,
+         f"past the straddled window the next endpoint may be failed too, got {len(sent) - n_again}")
 
     # --- the node never rations asks, and never hands the pool back itself -------------------------
     # This is the class the old walk policy belonged to. It counted ITS OWN asks and assumed one ask
