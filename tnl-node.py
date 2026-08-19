@@ -1616,6 +1616,14 @@ PROBE_MIN_PCT = 15     # percent of the sample set that must answer for the tunn
                        # silently redefine it. 1 means "any single reply", which is what this was before
                        # the knob existed; 100 means every sample must answer.
 PROBE_MIN_PCT_RANGE = (5, 100)
+SWEEP_SLOW = 3.0       # s between sweeps of a tunnel whose last one crossed. Two samples this far
+                       # apart are what makes RED_SWEEPS a real guard: a loss burst, a scheduling
+                       # stall or an agent restart shows in one of them, not both.
+SWEEP_FAST = 1.0       # s after a sweep that found nothing crossing. Keyed on the RAW crossing, not
+                       # on the published colour -- settle() keeps a green tunnel green through the
+                       # first bad sweep, so waiting for red would spend the very gap this saves.
+                       # Every rung of the core's ladder costs one verdict, so this shortens the
+                       # whole walk, not just the detection: ~17s to ~9s on a raw/tcp tunnel.
 RED_SWEEPS = 2         # consecutive bad sweeps before a GREEN tunnel is repainted red. Green publishes
                        # at once -- an outage must show fast, one unlucky sweep must not.
 _SO_BINDTODEVICE = getattr(socket, "SO_BINDTODEVICE", 25)   # absent off Linux, where the guards run
@@ -2045,7 +2053,7 @@ def health_of(cfg):
     # and see whether anything comes back. That single exchange is the whole question — a packet crossed
     # in each direction, just now, through this tunnel and no other path.
     rx_still, tx_still = _flow_sample(name) if up else (None, None)   # throughput for the card; casts no vote
-    alive, rtt, loss = None, None, None
+    alive, rtt, loss, crossed = None, None, None, None
     tip = cfg.get("tunnel_ip", "")
     if up and tip and tip != "N/A":
         # Read the core's path epoch either side of the probe. A probe that straddles a rotation, a
@@ -2071,7 +2079,7 @@ def health_of(cfg):
             if epoch == epoch_before:
                 pool_failover(name, alive, crossed, epoch, ready_before and ready)
     return {"up": up, "alive": alive, "dead": alive is False, "rtt_ms": rtt, "loss_pct": loss,
-            "rx_still": rx_still, "tx_still": tx_still, "live_win": int(LIVE_WINDOW)}
+            "crossed": crossed, "rx_still": rx_still, "tx_still": tx_still, "live_win": int(LIVE_WINDOW)}
 
 
 def _cpu_snap():
@@ -2229,6 +2237,14 @@ _health_lock = threading.Lock()
 _health_inflight = {}
 
 
+_sweep_due = {}          # tunnel name -> monotonic time its next sweep is allowed to start
+
+
+def _sweep_gap(res):
+    """SWEEP_FAST while the last sweep found nothing crossing, SWEEP_SLOW otherwise."""
+    return SWEEP_FAST if (res or {}).get("crossed") is False else SWEEP_SLOW
+
+
 def _health_harvest(names):
     """Publish every FINISHED probe into the snapshot and prune tunnels that no longer exist.
 
@@ -2247,6 +2263,7 @@ def _health_harvest(names):
                 _health_cache[nm] = f.result()
             except Exception:
                 _health_cache.setdefault(nm, {"up": None})
+            _sweep_due[nm] = time.monotonic() + _sweep_gap(_health_cache.get(nm))
         for nm in [n for n in _health_cache if n not in names]:
             _health_cache.pop(nm, None)
 
@@ -2257,19 +2274,24 @@ def health_refresh_once(ex):
         with _health_lock:
             _health_cache.clear()
         _health_inflight.clear()
+        _sweep_due.clear()
         _prune_iface_state(set())
         return
     names = {c["name"] for c in cfgs}
     _health_harvest(names)                       # whatever finished since the last round, including stragglers
     for nm in [n for n in _health_inflight if n not in names]:
         _health_inflight.pop(nm, None)           # tunnel deleted while its probe was running
+    for nm in [n for n in _sweep_due if n not in names]:
+        _sweep_due.pop(nm, None)
     # ONE probe per tunnel in flight, never two. Submitting a full fresh batch every 3s regardless lets a
     # sweep that overran the deadline stack another N tasks onto the executor's unbounded queue behind its
     # own stragglers. Worst case is any mutating op: health_of takes _apply_lock, a core build holds it for
     # seconds, so every worker parks and zero futures complete.
+    now = time.monotonic()
     for c in cfgs:
-        if c["name"] not in _health_inflight:
-            _health_inflight[c["name"]] = ex.submit(health_of, c)
+        if c["name"] in _health_inflight or _sweep_due.get(c["name"], 0.0) > now:
+            continue
+        _health_inflight[c["name"]] = ex.submit(health_of, c)
     futures_wait(set(_health_inflight.values()), timeout=HEALTH_DEADLINE)
     _health_harvest(names)
     _prune_iface_state(names)
@@ -2282,7 +2304,10 @@ def health_loop():
             health_refresh_once(ex)   # blocks up to HEALTH_DEADLINE, so rounds never overlap/pile up
         except Exception as e:
             logline(f"health loop: {e}")
-        time.sleep(3)  # tighter sweep = faster status (the heartbeat/flow path is cheap; idle-ICMP stragglers keep last-known)
+        # The loop ticks at the FAST cadence and _sweep_due decides who is actually probed, so a
+        # carrying tunnel still costs one sweep every SWEEP_SLOW and only the ones that found
+        # nothing crossing are looked at more often -- where the extra samples are dropped anyway.
+        time.sleep(SWEEP_FAST)
 
 # ----------------------------------------------------------------------------- API ops
 
