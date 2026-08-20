@@ -2043,12 +2043,10 @@ def health_of(cfg):
             except Exception:      # (normal for a UDP forward: WireGuard/OpenVPN-UDP). timeout/other -> unreachable
                 reachable = False
         return {"active": active, "rule": rule, "reachable": reachable, "up": rule}
-    with _apply_lock:  # serialize with a rebuild (mutations hold this) so we don't read the brief
-        # A netdev exists iff /sys/class/net/<name> does — one stat(2), no fork. `ip link show` spawned
-        # a process per tunnel per 3s sweep AND held the global mutation lock for the whole fork+exec,
-        # so on a hub the health sweep alone owned that lock a large fraction of the time and every
-        # rebuild queued behind it. _flow_sample four lines down already reads this same directory.
-        up = os.path.exists("/sys/class/net/" + name)   # mid-teardown gap as a transient false 'down'
+    # No lock. A rebuild holds _apply_lock for seconds, and a probe that waits on it delivers no verdict
+    # for that whole window — for every tunnel on the node, not just the one being rebuilt. Mid-rebuild
+    # the netdev really is gone, so `up` is false and this one sweep skips the probe.
+    up = os.path.exists("/sys/class/net/" + name)
     # ONE verdict for every tunnel, core and system alike: send a TCP SYN out of the tunnel device itself
     # and see whether anything comes back. That single exchange is the whole question — a packet crossed
     # in each direction, just now, through this tunnel and no other path.
@@ -2285,8 +2283,7 @@ def health_refresh_once(ex):
         _sweep_due.pop(nm, None)
     # ONE probe per tunnel in flight, never two. Submitting a full fresh batch every 3s regardless lets a
     # sweep that overran the deadline stack another N tasks onto the executor's unbounded queue behind its
-    # own stragglers. Worst case is any mutating op: health_of takes _apply_lock, a core build holds it for
-    # seconds, so every worker parks and zero futures complete.
+    # own stragglers.
     now = time.monotonic()
     for c in cfgs:
         if c["name"] in _health_inflight or _sweep_due.get(c["name"], 0.0) > now:
