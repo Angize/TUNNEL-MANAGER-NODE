@@ -879,11 +879,11 @@ def _core_config(cfg):
             # over h2c and streams instead of buffering; needs ws_tls). Forwarded for both roles: the core
             # server auto-detects the client's style, but the client must be told.
 
-            # Upstream shape — the http-carrier CLIENT only. The server never POSTs, and the core
-            # REJECTS these on a server or in grpc mode, so emitting them there would refuse to
-            # build the tunnel rather than be ignored.
+            # Carrier shape — the http-carrier CLIENT only. The server never POSTs and never opens the
+            # download streams, and the core REJECTS these on a server or in grpc mode, so emitting
+            # them there would refuse to build the tunnel rather than be ignored.
             if cfg.get("role") == "client" and cdn == "http":
-                for _k in ("http_up_workers", "http_up_batch_kb", "http_up_rate"):
+                for _k in ("http_up_workers", "http_up_batch_kb", "http_up_rate", "http_down_workers"):
                     try:
                         _v = int(cfg.get(_k) or 0)
                     except (TypeError, ValueError):
@@ -2738,12 +2738,14 @@ def op_tunnel(d):
                     raise ValueError("bad cdn_carrier")
                 if _cdn != "ws":
                     obj["cdn_carrier"] = _cdn
-                # Upstream POST-ladder shape, chosen per CDN by the panel: workers x batch is the window, and
-                # the rate cap is a ceiling on POSTs/sec a worker count cannot express. A key not whitelisted
-                # here is dropped in SILENCE and the tunnel rebuilds on the default shape, which a WAF-protected
-                # CDN blocks. The ceilings are the CORE's own, because it REJECTS rather than clamps.
-                _up_max = {"http_up_workers": 16, "http_up_batch_kb": 512, "http_up_rate": 1000}
-                for _k in ("http_up_workers", "http_up_batch_kb", "http_up_rate"):
+                # Carrier shape, set by the operator: workers x batch is the upstream window, the rate cap
+                # is a ceiling on POSTs/sec a worker count cannot express, and the download stream count is
+                # the same lever the other way. A key not whitelisted here is dropped in SILENCE and the
+                # tunnel rebuilds on the default shape, which a WAF-protected CDN blocks. The ceilings are
+                # the CORE's own, because it REJECTS rather than clamps.
+                _up_max = {"http_up_workers": 16, "http_up_batch_kb": 512, "http_up_rate": 1000,
+                           "http_down_workers": 16}
+                for _k in ("http_up_workers", "http_up_batch_kb", "http_up_rate", "http_down_workers"):
                     if _k in d:
                         try:
                             _v = int(d.get(_k) or 0)
