@@ -55,19 +55,20 @@ def verdict_half(m):
 
     state = {"hits": 0, "dst_state": "healthy"}
 
-    def pool(suffix):
-        if suffix == ".srcpool":
-            return {"active": "", "addrs": [], "pin": "", "ts": 0, "health": []}
-        return {"active": "10.0.0.1", "addrs": ["10.0.0.1", "10.0.0.2"], "pin": "", "ts": 0,
-                "health": [{"key": "10.0.0.1", "state": state["dst_state"], "fails": 0,
-                            "next_retest_unix": 0}]}
+    def status(_name=None):
+        return {"active": "tcp · 10.0.0.1", "epoch": 1, "ready": True, "ts": 0, "events": [],
+                "pair": {"low": "10.0.0.1", "high": "", "low_kind": "dst", "high_kind": "src"},
+                "health": [{"key": "10.0.0.1", "kind": "dst", "state": state["dst_state"],
+                            "fails": 0, "next_retest_unix": 0},
+                           {"key": "10.0.0.2", "kind": "dst", "state": "healthy",
+                            "fails": 0, "next_retest_unix": 0}]}
 
     m._is_peer_pool = lambda name: True
     m._is_ws_pool = lambda name: False
     m._read_core_cfg = lambda name: {"role": "client"}
     # a core publishing a stable path with a session on it: what every verdict here is keyed to
     m._read_path_state = lambda _n: (1, True)
-    m._read_peer_pool = lambda name, suffix: pool(suffix)
+    m._read_status = status
     m._flow_sample = lambda n: (0.0, 0.0)
     real_exists = os.path.exists
     os.path.exists = lambda p: True if str(p).startswith("/sys/class/net/") else real_exists(p)
@@ -124,7 +125,7 @@ def verdict_half(m):
     _res, msgs = sweep("t-burn", 2, {})
     want(cmds(msgs, "fail") == [], "one bad sweep must not burn anything (RED_SWEEPS still applies)")
     _res, msgs = sweep("t-burn", 2, {})
-    want([o.get("key") for o in cmds(msgs, "fail")] == ["10.0.0.1"],
+    want([o.get("low") for o in cmds(msgs, "fail")] == ["10.0.0.1"],
          f"a second sweep under the line must burn the measured endpoint, got {msgs}")
     # The identical sample set burns NOTHING when the operator's line is below it.
     for _ in range(3):

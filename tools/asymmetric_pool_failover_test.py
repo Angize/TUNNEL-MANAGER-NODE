@@ -57,12 +57,12 @@ def main():
     ST = {"hits": 0}
     m._is_ws_pool = lambda name: True
     m._is_peer_pool = lambda name: False
-    m._read_core_cfg = lambda name: {"role": "client", "ws_status_path": "x"}
+    m._read_core_cfg = lambda name: {"role": "client", "ws_edge_ips": ["x"]}
     # a core publishing a stable path with a session on it: what every verdict here is keyed to
     m._read_path_state = lambda _n: (1, True)
-    m._read_ws_pool = lambda name: {
-        "ip": "e1", "sni": "only.example",
-        "ips": ["e1", "e2", "e3"], "snis": ["only.example"],
+    m._read_status = lambda name: {
+        "active": "e1 · only.example", "epoch": 1, "ready": True, "ts": 0, "events": [],
+        "pair": {"low": "only.example", "high": "e1", "low_kind": "sni", "high_kind": "ip"},
         "health": [{"key": k, "kind": "ip", "state": "healthy"} for k in ("e1", "e2", "e3")]
         + [{"key": "only.example", "kind": "sni", "state": "healthy"}]}
     real_exists = os.path.exists
@@ -78,7 +78,7 @@ def main():
     for _ in range(2):          # RED_SWEEPS to confirm the tunnel is really dead
         clock["t"] += 4.0
         sweep()
-    want(len(sent) == 1 and sent[0][1] == {"cmd": "fail", "ip": "e1", "sni": "only.example", "epoch": 1},
+    want(len(sent) == 1 and sent[0][1] == {"cmd": "fail", "low": "only.example", "high": "e1", "epoch": 1},
          f"a 3-edge / 1-domain pool must still be judged: with one SNI the walk varies the EDGE, and "
          f"silencing it leaves the operator with a pool that rotates forever and blacklists nothing. "
          f"got {sent}")
@@ -109,11 +109,11 @@ def main():
     m2._read_core_cfg = lambda name: {"role": "client"}
     # a core publishing a stable path with a session on it: what every verdict here is keyed to
     m2._read_path_state = lambda _n: (1, True)
-    m2._read_peer_pool = lambda name, suf: (
-        {"active": "d1", "addrs": ["d1"],
-         "health": [{"key": "d1", "state": "healthy"}]} if suf == ".peerpool" else
-        {"active": "s1", "addrs": ["s1", "s2", "s3"],
-         "health": [{"key": k, "state": "healthy"} for k in ("s1", "s2", "s3")]})
+    m2._read_status = lambda name: {
+        "active": "tcp · d1", "epoch": 1, "ready": True, "ts": 0, "events": [],
+        "pair": {"low": "d1", "high": "s1", "low_kind": "dst", "high_kind": "src"},
+        "health": [{"key": "d1", "kind": "dst", "state": "healthy"}]
+        + [{"key": k, "kind": "src", "state": "healthy"} for k in ("s1", "s2", "s3")]}
     os.path.exists = lambda p: True if str(p).startswith("/sys/class/net/") else real_exists(p)
     m2._flow_sample = lambda n: (0.0, 0.0)
     m2.tun_probe = lambda *a, **k: (ST2["hits"], m2.PROBE_COUNT, 80.0 if ST2["hits"] else None)
@@ -126,7 +126,7 @@ def main():
     for _ in range(2):
         clock2["t"] += 4.0
         sweep2()
-    want(len(sent2) == 1 and sent2[0][1] == {"cmd": "fail", "key": "d1", "epoch": 1},
+    want(len(sent2) == 1 and sent2[0][1] == {"cmd": "fail", "low": "d1", "high": "s1", "epoch": 1},
          f"one destination and three sources must still be judged -- the destination axis cannot vary, "
          f"so the core answers by walking the SOURCE, and a node that stays silent here leaves a tunnel "
          f"with three source IPs stuck on the one that does not work. got {sent2}")
@@ -153,9 +153,11 @@ def main():
     m3._read_core_cfg = lambda name: {"role": "client"}
     # a core publishing a stable path with a session on it: what every verdict here is keyed to
     m3._read_path_state = lambda _n: (1, True)
-    m3._read_peer_pool = lambda name, suf: (
-        {"active": "d1", "addrs": ["d1"], "health": [{"key": "d1", "state": "healthy"}]} if suf == ".peerpool"
-        else {"active": "s1", "addrs": ["s1"], "health": [{"key": "s1", "state": "healthy"}]})
+    m3._read_status = lambda name: {
+        "active": "tcp · d1", "epoch": 1, "ready": True, "ts": 0, "events": [],
+        "pair": {"low": "d1", "high": "s1", "low_kind": "dst", "high_kind": "src"},
+        "health": [{"key": "d1", "kind": "dst", "state": "healthy"},
+                   {"key": "s1", "kind": "src", "state": "healthy"}]}
     os.path.exists = lambda p: True if str(p).startswith("/sys/class/net/") else real_exists(p)
     m3._flow_sample = lambda n: (0.0, 0.0)
     m3.tun_probe = lambda *a, **k: (ST3["hits"], m3.PROBE_COUNT, None)
@@ -168,7 +170,7 @@ def main():
     # the path; what the core does with it there is the ladder's free steps, which move the tunnel
     # nowhere and condemn nobody -- the pool itself refuses to burn below two entries. Staying silent
     # was what left this shape, the commonest one on the fleet, with no recovery but a 45s clock.
-    want(len(sent3) >= 1 and all(o == {"cmd": "fail", "key": "d1", "epoch": 1} for _p, o in sent3),
+    want(len(sent3) >= 1 and all(o == {"cmd": "fail", "low": "d1", "high": "s1", "epoch": 1} for _p, o in sent3),
          f"a tunnel with one of each must still be judged, every ask naming what was measured, got {sent3}")
     want(all(p.endswith(".status.verdict") for p, _o in sent3),
          f"and into the tunnel's verdict mailbox, got {[p for p, _o in sent3]}")
@@ -184,11 +186,12 @@ def main():
     m4._atomic_write_json = lambda path, obj: sent4.append((os.path.basename(path), obj)) and None
     m4._is_ws_pool = lambda name: True
     m4._is_peer_pool = lambda name: False
-    m4._read_core_cfg = lambda name: {"role": "server", "ws_status_path": "x"}
+    m4._read_core_cfg = lambda name: {"role": "server", "ws_edge_ips": ["x"]}
     # a core publishing a stable path with a session on it: what every verdict here is keyed to
     m4._read_path_state = lambda _n: (1, True)
-    m4._read_ws_pool = lambda name: {
-        "ip": "e1", "sni": "only.example", "ips": ["e1", "e2", "e3"], "snis": ["only.example"],
+    m4._read_status = lambda name: {
+        "active": "e1 · only.example", "epoch": 1, "ready": True, "ts": 0, "events": [],
+        "pair": {"low": "only.example", "high": "e1", "low_kind": "sni", "high_kind": "ip"},
         "health": [{"key": k, "kind": "ip", "state": "healthy"} for k in ("e1", "e2", "e3")]}
     os.path.exists = lambda p: True if str(p).startswith("/sys/class/net/") else real_exists(p)
     m4._flow_sample = lambda n: (0.0, 0.0)

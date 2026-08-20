@@ -51,10 +51,14 @@ def main():
     STATE = {"role": "client", "addrs": ["10.0.0.1", "10.0.0.2", "10.0.0.3"], "active": "10.0.0.1",
              "srcs": [], "is_pool": True, "hits": 0}
     m._is_peer_pool = lambda name: STATE["is_pool"]
-    m._read_core_cfg = lambda name: {"role": STATE["role"], "peer_status_path": "x"}
-    m._read_peer_pool = lambda name, suffix: (
-        {"active": "", "addrs": STATE["srcs"], "health": [], "pin": "", "ts": 0} if suffix == ".srcpool"
-        else {"active": STATE["active"], "addrs": STATE["addrs"], "health": [], "pin": "", "ts": 0})
+    m._read_core_cfg = lambda name: {"role": STATE["role"], "peer_ips": ["x"]}
+    m._read_status = lambda name: {
+        "active": "tcp · " + STATE["active"], "epoch": PATH["epoch"], "ready": PATH["ready"],
+        "ts": 0, "events": [],
+        "pair": {"low": STATE["active"], "high": (STATE["srcs"][0] if STATE["srcs"] else ""),
+                 "low_kind": "dst", "high_kind": "src"},
+        "health": [{"key": a, "kind": "dst", "state": "healthy"} for a in STATE["addrs"]]
+        + [{"key": a, "kind": "src", "state": "healthy"} for a in STATE["srcs"]]}
 
     # The core's published path: the epoch a verdict is keyed on, and whether a session is up on it.
     # health_of reads this twice per sweep — once either side of the probe — so `moves_mid_probe` is
@@ -95,7 +99,7 @@ def main():
     # --- confirmed dead -> exactly ONE burn, then silence while it settles -------------------------
     clock["t"] += 4.0
     sweep()
-    want(len(sent) == 1 and sent[0][1] == {"cmd": "fail", "key": "10.0.0.1", "epoch": 1},
+    want(len(sent) == 1 and sent[0][1] == {"cmd": "fail", "low": "10.0.0.1", "high": "", "epoch": 1},
          f"a confirmed-dead tunnel must ask the core to fail the destination BY NAME, got {sent}")
     want(sent[0][0].endswith(".status.verdict"),
          f"and it must go to the TUNNEL's verdict mailbox -- not a pool's pin file, which a pool-less "
@@ -194,7 +198,7 @@ def main():
     # (its pool returns early below two entries). Withholding the measurement instead left every
     # single-endpoint tunnel with no ladder at all.
     one = asks_for("t-one", addrs=["10.0.0.9"], active="10.0.0.9")
-    want(len(one) == 1 and one[0]["cmd"] == "fail" and one[0]["key"] == "10.0.0.9",
+    want(len(one) == 1 and one[0]["cmd"] == "fail" and one[0]["low"] == "10.0.0.9",
          f"a single-destination tunnel must still be told, naming what was measured, got {one}")
     want(sighups == [],
          f"and the node hands nothing back on the decision path, whatever the shape, got {sighups}")
@@ -230,7 +234,7 @@ def main():
         clock["t"] += 4.0
         sweep("t-key")
         got = [o for _, o in sent[n:]]
-        want(len(got) == 1 and got[0].get("key") == want_key,
+        want(len(got) == 1 and got[0].get("low") == want_key,
              f"an ask measured on {want_key} must name {want_key}, got {got}")
     STATE["srcs"] = []
 
@@ -250,8 +254,10 @@ def main():
     got = [o for _, o in sent[n0:]]
     want(len(got) == 1 and got[0].get("cmd") == "ok",
          f"a tunnel that came back must tell the core so, exactly once, got {got}")
-    want(got and got[0].get("key") == "10.0.0.2" and got[0].get("src") == "",
-         f"and it must name the endpoints it crossed on, read from the pool files, got {got}")
+    want(got and got[0].get("low") == "10.0.0.2" and got[0].get("high") == "10.9.0.1",
+         f"and it must name BOTH halves of the pair it crossed on, read from the one status file "
+         f"the core publishes -- an ok that names only the destination leaves a burned source "
+         f"condemned while it is visibly carrying, got {got}")
 
     n1 = len(sent)
     clock["t"] += 4.0

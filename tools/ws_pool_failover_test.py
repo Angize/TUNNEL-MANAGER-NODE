@@ -55,12 +55,14 @@ def main():
              "ip": "1.1.1.1", "sni": "a.example", "is_ws": True, "hits": 0, "burned": []}
     m._is_ws_pool = lambda name: STATE["is_ws"]
     m._is_peer_pool = lambda name: False
-    m._read_core_cfg = lambda name: {"role": STATE["role"], "ws_status_path": "x"}
+    m._read_core_cfg = lambda name: {"role": STATE["role"], "ws_edge_ips": ["x"]}
     # The core's published path: the epoch a verdict is keyed to, and whether a session is up on it.
     PATH = {"ready": True}
     m._read_path_state = lambda _n: (1, PATH["ready"])
-    m._read_ws_pool = lambda name: {
-        "ip": STATE["ip"], "sni": STATE["sni"], "ips": STATE["ips"], "snis": STATE["snis"],
+    m._read_status = lambda name: {
+        "active": STATE["ip"] + " · " + STATE["sni"], "epoch": 1, "ready": PATH["ready"], "ts": 0,
+        "events": [],
+        "pair": {"low": STATE["sni"], "high": STATE["ip"], "low_kind": "sni", "high_kind": "ip"},
         "health": ([{"key": k, "kind": d, "state": "suspect"} for k, d in STATE["burned"]]
                    + [{"key": i, "kind": "ip", "state": "healthy"} for i in STATE["ips"]]
                    + [{"key": s, "kind": "sni", "state": "healthy"} for s in STATE["snis"]])}
@@ -86,9 +88,9 @@ def main():
     # --- confirmed dead -> exactly ONE ask, naming BOTH axes ---------------------------------------
     clock["t"] += 4.0
     sweep()
-    want(len(sent) == 1 and sent[0][1] == {"cmd": "fail", "ip": "1.1.1.1", "sni": "a.example", "epoch": 1},
+    want(len(sent) == 1 and sent[0][1] == {"cmd": "fail", "low": "a.example", "high": "1.1.1.1", "epoch": 1},
          f"a confirmed-dead tunnel must name the COMBINATION it measured, not just one axis, got {sent}")
-    want(sent[0][0].endswith(".status.cmd"),
+    want(sent[0][0].endswith(".status.verdict"),
          f"and it must go to the edge pool's own command file, got {sent[0][0]}")
 
     # --- the carrier's session report gates the OK, never the FAIL --------------------------------
@@ -137,7 +139,7 @@ def main():
     n0 = len(sent)
     clock["t"] += 4.0
     sweep()
-    want(len(sent) == n0 + 1 and sent[-1][1] == {"cmd": "ok", "ip": "1.1.1.1", "sni": "a.example", "epoch": 1},
+    want(len(sent) == n0 + 1 and sent[-1][1] == {"cmd": "ok", "low": "a.example", "high": "1.1.1.1", "epoch": 1},
          f"an edge that is CARRYING while its pool still has it condemned must be reported, naming both "
          f"axes -- a burn always rotates away from what it burns, so nothing else ever clears it. got "
          f"{sent[n0:]}")
@@ -164,7 +166,7 @@ def main():
             clock["t"] += 4.0
             sweep(name)
         STATE.update(keep)
-        return len([p for p, _o in sent[n0:] if p.endswith(".status.cmd")])
+        return len([p for p, _o in sent[n0:] if p.endswith(".status.verdict")])
 
     want(asks_for("w-server", role="server") == 0,
          "a SERVER end must never ask: it does not dial, and two ends both rotating would chase each "
@@ -173,9 +175,18 @@ def main():
          "a single edge and a single SNI must be asked like any other: the first rungs are free re-dials "
          "that move the tunnel nowhere and need no second endpoint. The core decides whether a burn is "
          "reachable at that pool size; the node does not get to size the pool for it")
-    want(asks_for("w-nopool", is_ws=False) == 0,
-         "a tunnel that is not an edge pool must never be judged on the EDGE axes -- it has none, and "
-         "the ip/sni keys would name nothing")
+    # The node no longer decides which axes a tunnel has: the AXES come from the core's own published
+    # pair, tagged with the kind it uses. A pool-less tunnel publishes an empty pair, so the ask names
+    # nothing -- and it is still sent, because the free rungs are the point.
+    n0 = len(sent)
+    STATE["ip"], STATE["sni"], STATE["hits"] = "", "", 0
+    for _ in range(2):
+        clock["t"] += 4.0
+        sweep("w-nopool")
+    named = [o for _p, o in sent[n0:]]
+    want(named and all(o.get("low") == "" and o.get("high") == "" for o in named),
+         f"a tunnel whose core publishes no pair must be asked naming NOTHING -- the node cannot invent "
+         f"axes the core did not tag, got {named}")
 
     os.path.exists = real_exists
     print()
