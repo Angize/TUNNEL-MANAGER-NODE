@@ -879,11 +879,15 @@ def _core_config(cfg):
             # over h2c and streams instead of buffering; needs ws_tls). Forwarded for both roles: the core
             # server auto-detects the client's style, but the client must be told.
 
-            # Carrier shape — the http-carrier CLIENT only. The server never POSTs and never opens the
-            # download streams, and the core REJECTS these on a server or in grpc mode, so emitting
-            # them there would refuse to build the tunnel rather than be ignored.
-            if cfg.get("role") == "client" and cdn == "http":
-                for _k in ("http_up_workers", "http_up_batch_kb", "http_up_rate", "http_down_workers"):
+            # Carrier shape — the CLIENT only, and the core REJECTS rather than ignores, so a key on the
+            # wrong end or the wrong carrier refuses to build the tunnel instead of being dropped. The
+            # POST ladder is the http carrier's alone; the stream count belongs to both (http stripes
+            # its download, grpc stripes both directions).
+            _shape = ("http_streams",)
+            if cdn == "http":
+                _shape = ("http_up_workers", "http_up_batch_kb", "http_up_rate", "http_streams")
+            if cfg.get("role") == "client" and cdn in ("http", "grpc"):
+                for _k in _shape:
                     try:
                         _v = int(cfg.get(_k) or 0)
                     except (TypeError, ValueError):
@@ -2744,8 +2748,8 @@ def op_tunnel(d):
                 # tunnel rebuilds on the default shape, which a WAF-protected CDN blocks. The ceilings are
                 # the CORE's own, because it REJECTS rather than clamps.
                 _up_max = {"http_up_workers": 16, "http_up_batch_kb": 512, "http_up_rate": 1000,
-                           "http_down_workers": 16}
-                for _k in ("http_up_workers", "http_up_batch_kb", "http_up_rate", "http_down_workers"):
+                           "http_streams": 16}
+                for _k in ("http_up_workers", "http_up_batch_kb", "http_up_rate", "http_streams"):
                     if _k in d:
                         try:
                             _v = int(d.get(_k) or 0)
