@@ -1913,13 +1913,7 @@ def pool_failover(name, alive, crossed, epoch, session_up):
         if _verdict.get(name, {}).get("bad", 0) < RED_SWEEPS:
             return
     if _is_ws_pool(name):
-        # The edge pool has no ladder: a fail burns an edge on the spot. So it keeps the stricter gate
-        # -- nothing is asked while the carrier reports no connection on this combination, because the
-        # silence a probe measures there belongs to the re-dial. What frees the DIRECT carriers is that
-        # their first rung is free and blames nobody; the edge pool has no such step, and its own
-        # bounded walk already covers a carrier that dies faster than the probe can judge it.
-        if session_up:
-            _ws_failover(name, epoch)
+        _ws_failover(name, epoch)
         return
     cur = _read_peer_pool(name, ".peerpool").get("active") or ""
     # NAME the endpoint the probe measured, exactly as the ok verdict does. That poll is a one-second
@@ -1936,11 +1930,12 @@ def pool_failover(name, alive, crossed, epoch, session_up):
 
 
 def _ws_failover(name, epoch):
-    """pool_failover's edge-pool half: ask the core to burn the edge/SNI when nothing crosses."""
+    """pool_failover's edge-pool half: report that nothing crossed this edge/SNI combination.
+
+    Naming the combination is not asking for a burn. The core's ladder decides what the report costs --
+    a free re-dial on a new source port first, a burn only once those are spent."""
     w = _read_ws_pool(name)
-    ips, snis, cur_ip, cur_sni = w["ips"], w["snis"], w["ip"], w["sni"]
-    if len(ips) < 2 and len(snis) < 2:
-        return                    # nothing to rotate to on either axis: a burn could only take it down
+    cur_ip, cur_sni = w["ip"], w["sni"]
     err = _atomic_write_json(_cfg_path(name, ".status.cmd"),
                              {"cmd": "fail", "ip": cur_ip, "sni": cur_sni, "epoch": epoch})
     logline(f"{name}: probe found nothing crossing — asked the core to fail edge "

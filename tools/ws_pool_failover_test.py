@@ -91,17 +91,30 @@ def main():
     want(sent[0][0].endswith(".status.cmd"),
          f"and it must go to the edge pool's own command file, got {sent[0][0]}")
 
-    # --- what swallows the sweeps right after a jump is the carrier's report, not a clock -----------
-    # The burn drops the connection, so the core publishes ready=false until it has re-dialled and
-    # re-upgraded on the combination it moved to. A probe in that window is measuring the TLS+upgrade,
-    # not the edge, and may not be charged to either axis.
+    # --- the carrier's session report gates the OK, never the FAIL --------------------------------
+    # A fail blames nobody: the core's first rung is a free re-dial on a new source port. Muting it
+    # while ready=false switched the judge off for the whole outage, because the re-dial IS what turns
+    # ready false, and on a blocked edge it never completes. What protects the edge is the rung itself,
+    # and it protects it wherever the carrier is -- a window with no session costs a free step, never a
+    # burn. Counting those steps is the core's job; the node only reports what it measured.
     PATH["ready"] = False
+    n0 = len(sent)
     for _ in range(2):
-        clock["t"] += 2.0
+        clock["t"] += 4.0
         sweep()
-    want(len(sent) == 1,
-         f"while the carrier reports no session on the combination, nothing may be asked -- the probe "
-         f"is measuring the re-dial. got {len(sent)}")
+    want(len(sent) == n0 + 2,
+         f"a fail must still be asked while the carrier reports no session: that report is exactly what "
+         f"the free rung produces. got {len(sent) - n0} of 2")
+
+    # ... and the OK still needs it: clearing a burn is the strong claim, and a silence the handshake
+    # explains must never be read as «this edge carries». On its own tunnel, so w1 keeps its red streak.
+    STATE["hits"] = m.PROBE_COUNT
+    n0 = len(sent)
+    clock["t"] += 4.0
+    sweep("w-okgate")
+    want(len(sent) == n0,
+         f"an ok must NOT be sent while the carrier reports no session on the path, got {sent[n0:]}")
+    STATE["hits"] = 0
     PATH["ready"] = True
 
     # --- the node never rations asks, and never hands the pool back itself -------------------------
@@ -156,9 +169,10 @@ def main():
     want(asks_for("w-server", role="server") == 0,
          "a SERVER end must never ask: it does not dial, and two ends both rotating would chase each "
          "other around the matrix")
-    want(asks_for("w-one", ips=["1.1.1.9"], snis=["only.example"], ip="1.1.1.9", sni="only.example") == 0,
-         "a single edge and a single SNI must never be burned -- there is nothing to move to on either "
-         "axis, so the ask would just take the tunnel down")
+    want(asks_for("w-one", ips=["1.1.1.9"], snis=["only.example"], ip="1.1.1.9", sni="only.example") == 1,
+         "a single edge and a single SNI must be asked like any other: the first rungs are free re-dials "
+         "that move the tunnel nowhere and need no second endpoint. The core decides whether a burn is "
+         "reachable at that pool size; the node does not get to size the pool for it")
     want(asks_for("w-nopool", is_ws=False) == 0,
          "a tunnel that is not an edge pool must never be judged on the EDGE axes -- it has none, and "
          "the ip/sni keys would name nothing")
