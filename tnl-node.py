@@ -783,13 +783,11 @@ def _core_config(cfg):
         sni = str(cfg.get("cover_sni") or "").strip()
         if sni:
             corecfg["cover_sni"] = sni
-    # Datagram (udp/raw/flux) and direct-stream (tcp, tcp+cover) transports have no ws edge pool, but they
-    # still write a self-heal event ring and startup configuration warnings to a status file we expose to
-    # the panel's log. This is `status_path`, NOT `ws_status_path`, so _is_ws_pool keeps telling a pool core
-    # apart from a plain one. BOTH ends get one: a server raises config warnings of its own, and only that
-    # end can see them. Liveness is not in here — the tun probe decides that.
-    if transport in ("udp", "tcp", "raw", "flux", "spoof", "dns"):
-        corecfg["status_path"] = _cfg_path(name, ".status")
+    # ONE status file per tunnel, whatever its transport and whichever pools it has: the live pair, both
+    # axes' health, the self-heal event ring and startup config warnings. BOTH ends get one — a server
+    # raises config warnings of its own and only that end can see them. Liveness is not in here; the tun
+    # probe decides that.
+    corecfg["status_path"] = _cfg_path(name, ".status")
     # peer_src_ips (raw/flux SERVER): the client's source pool. These carriers receive on a socket that
     # sees every host and pre-filter by the learned peer source, so a rotated client source is otherwise
     # dropped pre-crypto and never re-learned — the tunnel dies on a source rotation until a rebuild.
@@ -937,7 +935,6 @@ def _core_config(cfg):
                                          "path": str(s.get("path") or "").strip()} for s in snis]
                 _wrs = cfg.get("ws_rotate_secs")   # 0 = rotation OFF (failover-only); a truthiness `or 600` would wrongly force 600
                 corecfg["ws_rotate_secs"] = 600 if _wrs is None else max(0, min(28800, int(_wrs)))
-                corecfg["ws_status_path"] = _cfg_path(name, ".status")
     # FEC (forward error correction): reconstructs lost carrier datagrams from parity so a
     # throttled/high-loss link stays usable. Datagram carriers only (udp/raw/flux/spoof) — on
     # tcp/ws it's wasted (TCP is already reliable), so it's only forwarded for those.
@@ -984,7 +981,6 @@ def _core_config(cfg):
         if len(ordered) >= 2:
             corecfg["peer_ips"] = [f"{ip}:{port}" if transport in ("udp", "tcp") else ip for ip in ordered]
             corecfg["peer_rotate_secs"] = max(0, int(cfg.get("peer_rotate_secs") or 0))
-            corecfg["peer_status_path"] = _cfg_path(name, ".peerpool")
         # Source rotation pool (client): this node's OWN IPs to send FROM, cycled alongside peer_ips. local_ip
         # goes first so the pool's start matches the client's default source; bare IPv4 for every carrier. The
         # core gate is >=1, not >=2, and deliberately so: a LONE src_ip is a fixed source that supersedes
@@ -994,9 +990,6 @@ def _core_config(cfg):
         if _src_sel and sord:
             corecfg["src_ips"] = sord
             corecfg.setdefault("peer_rotate_secs", max(0, int(cfg.get("peer_rotate_secs") or 0)))
-            # The source pool writes its own live state / pin cmd file so the panel can show and pin both
-            # sides (destination = .peerpool, source = .srcpool).
-            corecfg["src_status_path"] = _cfg_path(name, ".srcpool")
     if cfg.get("role") == "server":
         # Bind to THIS node's physical IP for the tunnel, not 0.0.0.0. With several IPs on the host this is
         # required for the raw transport: a raw, portless socket bound to 0.0.0.0 replies from the primary IP,
@@ -1045,13 +1038,6 @@ def _core_config(cfg):
         lip = str(cfg.get("local_ip") or "").strip()
         if lip:
             corecfg["bind_ip"] = lip
-    # Single-edge ws/http (not a pool): the CLIENT core writes the same self-heal event ring the
-    # datagram carriers do — e.g. an in-band ECH self-heal — to a status file we expose to the panel.
-    # Use status_path (NOT ws_status_path) so _is_ws_pool keeps treating it as a non-pool core (a
-    # single-edge ws core installs no SIGHUP/SIGUSR handlers, so a pool-only signal would kill it).
-    if (transport == "ws" and str(cfg.get("role")) == "client"
-            and "ws_status_path" not in corecfg):
-        corecfg["status_path"] = _cfg_path(name, ".status")
     return corecfg
 
 
@@ -1138,7 +1124,7 @@ def _core_running(name):
 
 def _cfg_path(name, suffix=""):
     """Path of a core sidecar file for tunnel `name` in CONFIG_DIR (e.g. suffix=\".status\",
-    \".peerpool\", \".status.cmd\"). Centralizes the core-<name><suffix> naming used across the agent."""
+    \".verdict\", \".status.pin\"). Centralizes the core-<name><suffix> naming used across the agent."""
     return os.path.join(CONFIG_DIR, "core-" + name + suffix)
 
 
@@ -1161,20 +1147,12 @@ def _atomic_write_json(path, obj):
 
 
 def _core_status_paths(name):
-    """The core's live status files for tunnel `name`: the self-heal/ws-pool status and its select-edge
-    command sidecar, plus the direct-transport destination and source pool status files and their own pin
-    command sidecars. Callers only iterate to clean them up, so listing all of them here means a rebuild/
-    teardown never leaves stale pool state — or a leftover pin command — behind."""
+    """The core's live files for tunnel `name`: the one status file it publishes, and the three sidecars
+    written TO it — the tun probe's verdict, the operator's pin/retest, and the live-ECH push. Callers
+    only iterate to clean them up, so listing all of them here means a rebuild/teardown never leaves
+    stale state, or a leftover command nobody will consume, behind."""
     base = _cfg_path(name, ".status")
-    peer = _cfg_path(name, ".peerpool")
-    src = _cfg_path(name, ".srcpool")
-    # base + ".echcmd" is the live-ECH push sidecar (op ech-update writes it, the core polls it). It was
-    # missing here, so it alone survived rebuild/disable/delete — and a stale key file outliving the core
-    # that was meant to consume it is exactly the kind of leftover this list exists to prevent.
-    # base + ".verdict" is the tun probe's mailbox: it belongs to the TUNNEL, not to a pool, so a
-    # pool-less core has one too and it must be swept with the rest.
-    return (base, base + ".cmd", base + ".echcmd", base + ".verdict",
-            peer, peer + ".cmd", src, src + ".cmd")
+    return (base, base + ".verdict", base + ".pin", base + ".echcmd")
 
 
 def _read_core_cfg(name):
@@ -1190,28 +1168,24 @@ def _read_core_cfg(name):
 
 
 def _is_ws_pool(name):
-    """True if the running core for `name` is a ws edge-pool client — the ONLY core that installs
-    SIGHUP/SIGUSR handlers. Signaling any other core falls through to Go's default signal
-    disposition and TERMINATES the tunnel, so pool-only ops (probe-now / rotate) must guard on this."""
+    """True if the running core for `name` is a ws edge-pool client."""
     cc = _read_core_cfg(name)
-    return bool(cc.get("ws_status_path") or cc.get("ws_edge_ips"))
+    return bool(cc.get("ws_edge_ips"))
 
 
 def _is_ws_single(name):
     """True if the running core for `name` is a SINGLE ws/http edge client — one fixed ws_host, no edge
-    pool. Such a core reads a live ECH push into b.wsECH from its dialLoop (same <status>.echcmd sidecar
-    a pool uses), so it can accept ech-update too. Needs a wired status_path for the sidecar to be read."""
+    pool. Such a core reads a live ECH push into b.wsECH from its dialLoop (the same <status>.echcmd
+    sidecar a pool uses), so it can accept ech-update too."""
     cc = _read_core_cfg(name)
-    return bool(cc.get("ws_host") and cc.get("status_path")) and not (cc.get("ws_status_path") or cc.get("ws_edge_ips"))
+    return bool(cc.get("ws_host") and cc.get("status_path")) and not cc.get("ws_edge_ips")
 
 
 def _is_peer_pool(name):
     """True if the running core for `name` is a direct-transport pool client (a destination and/or
-    source rotation pool). Such a core installs a SIGHUP handler (probe-now) exactly like the ws pool,
-    so pool-only ops must guard on this — signaling a plain core would fall through to Go's default
-    disposition and TERMINATE the tunnel."""
+    source rotation pool)."""
     cc = _read_core_cfg(name)
-    return bool(cc.get("peer_status_path") or cc.get("src_status_path"))
+    return bool(cc.get("peer_ips") or cc.get("src_ips"))
 
 
 def build_core(cfg):
@@ -1786,45 +1760,15 @@ def _read_path_state(name):
     return epoch, bool(st.get("ready"))
 
 
-WS_ACTIVE_SEP = " · "   # what wsPool.writeStatus joins the active edge and SNI with
-
-
-def _read_ws_pool(name):
-    """Parse the ws edge pool's status file into {active_ip, active_sni, ips, snis, health}. The core
-    publishes one flat health list tagged by axis; split it here so a verdict can be sized and keyed on
-    the right one. Empty (well-formed) when the file is missing or the core has not written yet."""
-    empty = {"ip": "", "sni": "", "ips": [], "snis": [], "health": []}
-    try:
-        with open(_cfg_path(name, ".status")) as f:
-            st = json.load(f)
-    except (OSError, ValueError):
-        return empty
-    if not isinstance(st, dict):
-        return empty
-    health = [h for h in (st.get("health") or [])[:256] if isinstance(h, dict) and h.get("key")]
-    active = str(st.get("active") or "")
-    ip, _, sni = active.partition(WS_ACTIVE_SEP)
-    return {"ip": ip, "sni": sni,
-            "ips": [str(h["key"]) for h in health if str(h.get("kind")) != "sni"],
-            "snis": [str(h["key"]) for h in health if str(h.get("kind")) == "sni"],
-            "health": health}
-
-
-def _ws_condemned(pool, kind, key):
-    """True when `key` on axis `kind` carries a not-healthy record -- suspect or dead, either way sidelined."""
-    return bool(key) and any(str(h.get("key")) == key and str(h.get("state")) != "healthy"
-                             and (str(h.get("kind")) == "sni") == (kind == "sni")
-                             for h in (pool.get("health") or []))
-
-
-def _condemned(pool, addr):
-    """True when `addr` carries a not-healthy record in `pool` -- suspect or dead, either way sidelined."""
-    return bool(addr) and any(h.get("key") == addr and h.get("state") != "healthy"
-                              for h in (pool.get("health") or []))
+def _condemned(st, kind, key):
+    """True when `key` on axis `kind` carries a not-healthy record -- suspect or dead, either way
+    sidelined. A blank key names nothing and is never condemned."""
+    return bool(key) and any(h["key"] == key and h["kind"] == kind and h["state"] != "healthy"
+                             for h in st["health"])
 
 
 def _report_carrying(name, edge, epoch):
-    """Tell the core that traffic is CROSSING, naming the endpoints it crossed on.
+    """Tell the core that traffic is CROSSING, naming the pair it crossed on.
 
     The core has no way to learn this for itself. Everything it can observe -- a frame coming back, a
     dial that completed, a handshake that was answered -- is something a filtered IP passes while
@@ -1837,28 +1781,19 @@ def _report_carrying(name, edge, epoch):
     lapses, and by then the tunnel is already green -- no edge left to report on, and it stays condemned
     for good while visibly carrying traffic. A healthy tunnel on healthy endpoints still writes nothing.
 
-    Both keys are read from the pool files the core itself publishes, in ONE snapshot, so the endpoints
-    named are the ones the burned-check was made against."""
-    if _is_ws_pool(name):
-        w = _read_ws_pool(name)
-        ip, sni = w["ip"], w["sni"]
-        if not ip and not sni:
-            return
-        if not edge and not (_ws_condemned(w, "ip", ip) or _ws_condemned(w, "sni", sni)):
-            return
-        err = _atomic_write_json(_cfg_path(name, ".status.cmd"), {"cmd": "ok", "ip": ip, "sni": sni, "epoch": epoch})
-        logline(f"{name}: probe found traffic crossing — told the core {ip or '?'} / {sni or '?'} are carrying"
-                + (f" [{err}]" if err else ""))
-        return
-    dpool, spool = _read_peer_pool(name, ".peerpool"), _read_peer_pool(name, ".srcpool")
-    dst, src = dpool.get("active") or "", spool.get("active") or ""
+    The pair comes from ONE read of the file the core itself publishes, so what is named is what the
+    burned-check was made against."""
+    st = _read_status(name)
+    pair = st["pair"]
+    low, high = pair["low"], pair["high"]
     # Both empty on a pool-less tunnel, and it is still sent: `ok` also refills the ladder's free steps,
     # which every tunnel has whether or not it owns an endpoint to burn. Nothing to clear then, so the
     # recovery is the only occasion -- there is no condemned entry to keep announcing.
-    if not edge and not (_condemned(dpool, dst) or _condemned(spool, src)):
+    if not edge and not (_condemned(st, pair["low_kind"], low) or _condemned(st, pair["high_kind"], high)):
         return
-    err = _atomic_write_json(_cfg_path(name, ".status.verdict"), {"cmd": "ok", "key": dst, "src": src, "epoch": epoch})
-    carrying = f"{dst or '?'} / {src or '?'} are carrying" if dst or src else "the path is carrying"
+    err = _atomic_write_json(_cfg_path(name, ".status.verdict"),
+                             {"cmd": "ok", "low": low, "high": high, "epoch": epoch})
+    carrying = f"{low or '?'} / {high or '?'} are carrying" if low or high else "the path is carrying"
     logline(f"{name}: probe found traffic crossing — told the core {carrying}"
             + (f" [{err}]" if err else ""))
 
@@ -1916,34 +1851,22 @@ def pool_failover(name, alive, crossed, epoch, session_up):
         # same confirmation the colour gets, whatever the tunnel looked like before.
         if _verdict.get(name, {}).get("bad", 0) < RED_SWEEPS:
             return
-    if _is_ws_pool(name):
-        _ws_failover(name, epoch)
-        return
-    cur = _read_peer_pool(name, ".peerpool").get("active") or ""
-    # NAME the endpoint the probe measured, exactly as the ok verdict does. That poll is a one-second
-    # ticker and the probe before it takes most of a second, so every proactive rotate beat is a window
-    # where an unnamed verdict lands on whatever the core moved to -- condemning an endpoint nothing
-    # measured and putting the tunnel back on the one that was. Empty names no endpoint, which is the
-    # honest answer for a tunnel that has none: the core spends a free step and blames nobody.
-    # Atomic (tmp+replace): the core polls this file once a second and deletes it, so a half-written
-    # one would be read and dropped, and the failover silently lost.
-    err = _atomic_write_json(_cfg_path(name, ".status.verdict"), {"cmd": "fail", "key": cur, "epoch": epoch})
-    asked = f"fail destination {cur}" if cur else "spend a free step — this tunnel has no endpoint to burn"
+    st = _read_status(name)
+    pair = st["pair"]
+    low, high = pair["low"], pair["high"]
+    # NAME the pair the probe measured, exactly as the ok verdict does. That poll is a one-second ticker
+    # and the probe before it takes most of a second, so every proactive rotate beat is a window where an
+    # unnamed verdict lands on whatever the core moved to -- condemning an endpoint nothing measured and
+    # putting the tunnel back on the one that was. Empty names nothing, which is the honest answer for a
+    # tunnel with no pool: the core spends a free step and blames nobody.
+    # Atomic (tmp+replace): the core polls this file once a second and deletes it, so a half-written one
+    # would be read and dropped, and the failover silently lost.
+    err = _atomic_write_json(_cfg_path(name, ".status.verdict"),
+                             {"cmd": "fail", "low": low, "high": high, "epoch": epoch})
+    asked = (f"fail {low or '?'} / {high or '?'}" if low or high
+             else "spend a free step — this tunnel has no endpoint to burn")
     logline(f"{name}: probe found nothing crossing — asked the core to {asked}"
             + (f" [{err}]" if err else ""))
-
-
-def _ws_failover(name, epoch):
-    """pool_failover's edge-pool half: report that nothing crossed this edge/SNI combination.
-
-    Naming the combination is not asking for a burn. The core's ladder decides what the report costs --
-    a free re-dial on a new source port first, a burn only once those are spent."""
-    w = _read_ws_pool(name)
-    cur_ip, cur_sni = w["ip"], w["sni"]
-    err = _atomic_write_json(_cfg_path(name, ".status.cmd"),
-                             {"cmd": "fail", "ip": cur_ip, "sni": cur_sni, "epoch": epoch})
-    logline(f"{name}: probe found nothing crossing — asked the core to fail edge "
-            f"{cur_ip or '?'} / {cur_sni or '?'}" + (f" [{err}]" if err else ""))
 
 
 # --- directional liveness: bytes moving on the tunnel iface, counted per direction, whatever ICMP does ---
@@ -2594,8 +2517,9 @@ def op_list(d):
         nm = c.get("name") or ""
         if not nm:
             continue
-        dst = _read_peer_pool(nm, ".peerpool")["active"]
-        src = _read_peer_pool(nm, ".srcpool")["active"]
+        pair = _read_status(nm)["pair"]
+        dst = pair["low"] if pair["low_kind"] == "dst" else ""
+        src = pair["high"] if pair["high_kind"] == "src" else ""
         if dst or src:
             pools[nm] = {"dst": dst, "src": src}
     return {"configs": cfgs, "health": {c["name"]: hc.get(c["name"], {"up": None}) for c in cfgs}, "pools": pools}
@@ -3370,88 +3294,86 @@ def op_portcheck(d):
 
 
 def op_edge_status(d):
-    """READ_ONLY: return the ws edge pool's live status (active edge + the per-entry health FSM)
-    the core writes for tunnel {name}, so the panel can surface and drive the pool. Empty status
-    when the tunnel has no pool or the core hasn't written the file yet."""
-    name = _req_name(d)
-    path = _cfg_path(name, ".status")
-    try:
-        with open(path) as f:
-            st = json.load(f)
-    except (OSError, ValueError):
-        return {"ok": True, "active": "", "health": [], "ts": 0}
-    health = []
-    for h in (st.get("health") or [])[:256]:
-        if not isinstance(h, dict):
-            continue
-        health.append({
-            "key": str(h.get("key") or ""),
-            "kind": "sni" if str(h.get("kind")) == "sni" else "ip",
-            "state": str(h.get("state") or "healthy"),
-            "fails": int(h.get("fails") or 0),
-            "next_retest_unix": int(h.get("next_retest_unix") or 0),
-        })
-    events = []
-    for e in (st.get("events") or [])[:64]:
-        if not isinstance(e, dict):
-            continue
-        events.append({
-            "seq": int(e.get("seq") or 0),
-            "ts": int(e.get("ts") or 0),
-            "kind": str(e.get("kind") or ""),
-            "code": str(e.get("code") or ""),
-            "detail": str(e.get("detail") or ""),
-        })
+    """READ_ONLY: the ws edge pool's live state for tunnel {name} — the pair the carrier is on, the
+    per-entry health FSM on both axes, and the event ring — so the panel can surface and drive the pool.
+    Empty when the tunnel has no pool or the core has not written yet."""
+    st = _read_status(_req_name(d))
     return {"ok": True,
-            "active": str(st.get("active") or ""),
-            "health": health,
-            "events": events,
-            "ts": int(st.get("ts") or 0),
-            # The core stamps next_retest_unix on the NODE's clock, so return the node's "now"
-            # too — the panel counts down against this, not its own (possibly skewed) clock, and
-            # can flag a stale file (now - ts large) as offline.
+            "active": st["active"],
+            "pair": st["pair"],
+            "health": [h for h in st["health"] if h["kind"] in ("ip", "sni")],
+            "events": st["events"],
+            "ts": st["ts"],
+            # The core stamps next_retest_unix on the NODE's clock, so return the node's "now" too —
+            # the panel counts down against this, not its own (possibly skewed) clock, and can flag a
+            # stale file (now - ts large) as offline.
             "now": int(time.time())}
 
 
 _PEER_ADDR_RE = re.compile(r"^[0-9A-Fa-f:.]{1,64}$")  # a pool endpoint is only ever an IPv4/IPv6/ip:port
 
 
-def _read_peer_pool(name, suffix):
-    """Parse one direct-transport pool status file (suffix '.peerpool' = destination, '.srcpool' =
-    source) into the normalized shape the panel reads: active endpoint, the full list, the per-endpoint
-    health FSM (state / fails / retest countdown), and any operator pin. Empty
-    (but well-formed) when the file is missing — the pool doesn't exist or the core hasn't written yet."""
-    empty = {"active": "", "addrs": [], "health": [], "pin": "", "ts": 0}
+def _read_status(name):
+    """The one status file the core publishes for tunnel `name`, normalized.
+
+    `pair` is the machine-readable pair the carrier is on -- what a verdict must be keyed on. The
+    `active` string beside it is a display label and has always been parsed by eye; a verdict may not
+    rest on that. `health` carries every entry of every pool the tunnel has, tagged by axis kind
+    ("dst"/"src" on a direct pool, "ip"/"sni" on an edge pool). Empty (but well-formed) when the file is
+    missing or the core has not written yet."""
+    # ONE shape, always: a caller reaching for pair["low"] on a tunnel whose core has not written yet
+    # must get "", not a KeyError that kills the sweep for every tunnel behind it.
+    empty = {"active": "", "epoch": 0, "ready": False, "health": [], "events": [], "ts": 0,
+             "pair": {"low": "", "high": "", "low_kind": "", "high_kind": ""}}
     try:
-        with open(_cfg_path(name, suffix)) as f:
+        with open(_cfg_path(name, ".status")) as f:
             st = json.load(f)
     except (OSError, ValueError):
         return empty
-    # A pool endpoint is always a bare IP or ip:port; drop anything else so a malformed file can't feed
-    # a non-IP string to the panel's live view (defense-in-depth — the panel re-validates too).
-    ok = lambda s: bool(s) and bool(_PEER_ADDR_RE.match(s))
+    if not isinstance(st, dict):
+        return empty
     health = []
-    for h in (st.get("health") or [])[:64]:
-        if not isinstance(h, dict):
+    for h in (st.get("health") or [])[:256]:
+        if not isinstance(h, dict) or not h.get("key"):
             continue
-        key = str(h.get("key") or "")
-        if not ok(key):
+        health.append({"key": str(h.get("key")), "kind": str(h.get("kind") or ""),
+                       "state": str(h.get("state") or "healthy"),
+                       "fails": int(h.get("fails") or 0),
+                       "next_retest_unix": int(h.get("next_retest_unix") or 0),
+                       "pin": bool(h.get("pin"))})
+    events = []
+    for e in (st.get("events") or [])[:64]:
+        if not isinstance(e, dict):
             continue
-        health.append({
-            "key": key,
-            "state": str(h.get("state") or "healthy"),
-            "fails": int(h.get("fails") or 0),
-            "next_retest_unix": int(h.get("next_retest_unix") or 0),
-        })
-    active = str(st.get("active") or "")
-    pin = str(st.get("pin") or "")
-    return {
-        "active": active if ok(active) else "",
-        "addrs": [x for x in (str(v) for v in (st.get("addrs") or [])) if ok(x)][:64],
-        "health": health,
-        "pin": pin if ok(pin) else "",
-        "ts": int(st.get("updated_unix") or 0),
-    }
+        events.append({"seq": int(e.get("seq") or 0), "ts": int(e.get("ts") or 0),
+                       "kind": str(e.get("kind") or ""), "code": str(e.get("code") or ""),
+                       "detail": str(e.get("detail") or "")})
+    pair = st.get("pair") if isinstance(st.get("pair"), dict) else {}
+    return {"active": str(st.get("active") or ""), "epoch": int(st.get("epoch") or 0),
+            "ready": bool(st.get("ready")), "health": health, "events": events,
+            "ts": int(st.get("ts") or 0),
+            "pair": {"low": str(pair.get("low") or ""), "high": str(pair.get("high") or ""),
+                     "low_kind": str(pair.get("low_kind") or ""),
+                     "high_kind": str(pair.get("high_kind") or "")}}
+
+
+def _axis_rows(st, kind):
+    """One axis's rows out of the one health list, in the shape the panel's pool views read."""
+    ok = lambda v: bool(v) and bool(_PEER_ADDR_RE.match(v))
+    rows = [h for h in st["health"] if h["kind"] == kind]
+    if kind in ("dst", "src"):
+        rows = [h for h in rows if ok(h["key"])]
+    return rows
+
+
+def _axis_section(st, kind, active):
+    """The {active, addrs, health, pin} section the panel's direct-pool view expects, built from the one
+    file. `addrs` is not published separately any more: health lists EVERY entry, burned or not."""
+    rows = _axis_rows(st, kind)
+    pin = next((h["key"] for h in rows if h["pin"]), "")
+    return {"active": active, "addrs": [h["key"] for h in rows][:64],
+            "health": [{k: h[k] for k in ("key", "state", "fails", "next_retest_unix")} for h in rows],
+            "pin": pin, "ts": st["ts"]}
 
 
 def op_peer_status(d):
@@ -3461,83 +3383,67 @@ def op_peer_status(d):
     and any manual pin. Empty sections when the tunnel has no such pool or the core hasn't written yet.
     The core stamps next_retest_unix on the NODE's clock, so `now` is returned for the panel to count
     down against (and to flag a stale file as offline)."""
-    name = _req_name(d)
-    dst = _read_peer_pool(name, ".peerpool")
-    src = _read_peer_pool(name, ".srcpool")
-    return {"ok": True, "now": int(time.time()), "dst": dst, "src": src}
+    st = _read_status(_req_name(d))
+    pair = st["pair"]
+    return {"ok": True, "now": int(time.time()),
+            "dst": _axis_section(st, "dst", pair["low"] if pair["low_kind"] == "dst" else ""),
+            "src": _axis_section(st, "src", pair["high"] if pair["high_kind"] == "src" else "")}
+
+
+def _write_pin(name, kind, key, cmd=""):
+    """Drop a command in the operator's mailbox: pin one entry, or end one entry's wait. The core polls
+    it once a second and removes it. Separate from the tun probe's verdict mailbox on purpose -- one
+    file with two writers means os.replace drops whichever arrived first, silently."""
+    if not NAME_RE.match(name):
+        raise ValueError("bad name")
+    key = str(key or "").strip()
+    if not key or len(key) > 255:
+        raise ValueError("مقدارِ ورودی نامعتبر است")
+    body = {"kind": kind, "key": key}
+    if cmd:
+        body["cmd"] = cmd
+    err = _atomic_write_json(_cfg_path(name, ".status.pin"), body)
+    if err:
+        return {"ok": False, "error": err}
+    return {"ok": True}
 
 
 def op_peer_select(d):
-    """Live 'pin this IP' for a direct-transport pool: drop a JSON command file the running core polls
-    (<status>.cmd) so it jumps its rotation to THIS specific endpoint and re-points onto it — no rebuild,
-    TUN stays up. side 'src' pins the source pool (<name>.srcpool.cmd); anything else the destination
-    pool (<name>.peerpool.cmd). Backs the panel's per-IP pin button."""
+    """Live 'pin this IP' for a direct-transport pool: the core jumps its rotation to THIS endpoint and
+    re-points onto it — no rebuild, TUN stays up. side 'src' pins the source pool, anything else the
+    destination pool. Backs the panel's per-IP pin button."""
     _require(d, ["name", "key"])
     name = str(d["name"])
-    if not NAME_RE.match(name):
-        raise ValueError("bad name")
     if not _is_peer_pool(name):
         return {"ok": False, "error": "این تونل استخرِ آی‌پی ندارد"}
-    key = str(d.get("key") or "").strip()
-    if not key or len(key) > 64:
-        raise ValueError("مقدارِ آی‌پی نامعتبر است")
-    suffix = ".srcpool" if str(d.get("side")) == "src" else ".peerpool"
-    path = _cfg_path(name, suffix + ".cmd")
-    # Write atomically (tmp + replace): the core polls this file once per second and removes it, so a
-    # half-written file would be read+deleted and the pin SILENTLY LOST. os.replace is atomic.
-    err = _atomic_write_json(path, {"key": key})
-    if err:
-        return {"ok": False, "error": err}
-    return {"ok": True}
-
-
-def _pool_sighup(name, is_pool, no_pool_msg):
-    """SIGHUP the running core for `name` — the shared body of the two 'probe now' ops (retest every
-    suspect/dead pool entry at once). Guards that the core actually installs a SIGHUP handler first
-    (is_pool): signaling a plain core would fall through to Go's default disposition and kill the tunnel."""
-    if not is_pool(name):
-        return {"ok": False, "error": no_pool_msg}
-    rc, out, err = run(["systemctl", "kill", "-s", "SIGHUP", _core_unit(name)])
-    if rc != 0:
-        return {"ok": False, "error": (err or out or "").strip() or ("سیگنال به هسته نرسید (" + name + ")")}
-    return {"ok": True}
-
-
-def op_peer_probe_now(d):
-    """Live 'probe now' for a direct-transport pool: SIGHUP tells the running core to retest EVERY
-    suspect/dead endpoint immediately (re-admit it to the live rotation) instead of waiting out the
-    backoff, so a lifted block heals at once. No rebuild, TUN stays up."""
-    return _pool_sighup(_req_name(d), _is_peer_pool, "این تونل استخرِ آی‌پی ندارد")
+    return _write_pin(name, "src" if str(d.get("side")) == "src" else "dst", d.get("key"))
 
 
 def op_pool_select(d):
-    """Live 'pin this edge' for a ws edge pool: drop a JSON command file the running core polls
-    (<status>.cmd) so it jumps its rotation to THIS specific IP/SNI and re-dials onto it — no
-    rebuild, TUN stays up. Backs the panel's per-edge select button."""
+    """Live 'pin this edge' for a ws edge pool: the core jumps its rotation to THIS specific IP/SNI and
+    re-dials onto it — no rebuild, TUN stays up. Backs the panel's per-edge select button."""
     _require(d, ["name", "kind", "key"])
     name = str(d["name"])
-    if not NAME_RE.match(name):
-        raise ValueError("bad name")
     if not _is_ws_pool(name):
         return {"ok": False, "error": "این تونل استخرِ لبه ندارد"}
-    kind = "sni" if str(d.get("kind")) == "sni" else "ip"
-    key = str(d.get("key") or "").strip()
-    if not key or len(key) > 255:
-        raise ValueError("مقدارِ لبه نامعتبر است")
-    path = _cfg_path(name, ".status.cmd")
-    # Write atomically (tmp + replace): the core polls this file once per second and removes it,
-    # so a half-written file would be read+deleted and the pin SILENTLY LOST. os.replace is atomic.
-    err = _atomic_write_json(path, {"kind": kind, "key": key})
-    if err:
-        return {"ok": False, "error": err}
-    return {"ok": True}
+    return _write_pin(name, "sni" if str(d.get("kind")) == "sni" else "ip", d.get("key"))
 
 
-def op_pool_probe_now(d):
-    """Live 'probe now' for a ws edge pool: SIGHUP tells the running core to retest EVERY
-    suspect/dead edge immediately (cheap TLS-only probes) instead of waiting out the backoff,
-    so a lifted block heals at once. No rebuild, TUN stays up."""
-    return _pool_sighup(_req_name(d), _is_ws_pool, "این تونل استخرِ لبه ندارد")
+def op_retest_now(d):
+    """Live 'try this one again now' for ONE entry of either pool: end that entry's backoff so the next
+    rotation hands it live traffic and the tun probe can judge it. Nothing is dialled here -- there is no
+    prober behind either pool, and a control handshake could not tell a filtered endpoint from a live one
+    anyway. Per ENTRY, not per pool: one button that zeroed every wait made the others' backoff a lie."""
+    _require(d, ["name", "kind", "key"])
+    name = str(d["name"])
+    kind = str(d.get("kind") or "")
+    if kind not in ("dst", "src", "ip", "sni"):
+        raise ValueError("محورِ نامعتبر")
+    if kind in ("ip", "sni") and not _is_ws_pool(name):
+        return {"ok": False, "error": "این تونل استخرِ لبه ندارد"}
+    if kind in ("dst", "src") and not _is_peer_pool(name):
+        return {"ok": False, "error": "این تونل استخرِ آی‌پی ندارد"}
+    return _write_pin(name, kind, d.get("key"), cmd="retest")
 
 
 CORE_VER_RE = re.compile(r"^(?!.*\.\.)[A-Za-z0-9._-]{1,40}$")  # negative-lookahead rejects any '..' → no path traversal in the release URL
@@ -4138,8 +4044,7 @@ OPS = {"ping": op_ping, "list": op_list, "check": op_check, "tunnel": op_tunnel,
        "delete": op_delete, "apply": op_apply, "update": op_update, "wipe": op_wipe,
        "portcheck": op_portcheck, "edge-status": op_edge_status,
        "peer-status": op_peer_status,
-       "peer-select": op_peer_select, "peer-probe-now": op_peer_probe_now,
-       "pool-probe-now": op_pool_probe_now, "pool-select": op_pool_select,
+       "peer-select": op_peer_select, "pool-select": op_pool_select, "retest-now": op_retest_now,
        "ech-update": op_ech_update,
        "core-install": op_core_install, "spoof-probe": op_spoof_probe,
        "spoof-egress-listen": op_spoof_egress_listen, "spoof-egress-send": op_spoof_egress_send,
@@ -4161,7 +4066,7 @@ WIRE = {
     "pg": "ping", "ls": "list", "ck": "check", "mk": "tunnel", "dl": "delete", "ap": "apply",
     "up": "update", "wz": "wipe", "pf": "portfw", "pe": "portfw-edit", "pn": "portfw-next",
     "pc": "portcheck", "es": "edge-status", "ps": "peer-status", "pl": "peer-select",
-    "pp": "peer-probe-now", "qp": "pool-probe-now", "qs": "pool-select", "eu": "ech-update",
+    "qs": "pool-select", "rt": "retest-now", "eu": "ech-update",
     "ci": "core-install", "sp": "spoof-probe", "sl": "spoof-egress-listen", "ss": "spoof-egress-send",
     "sr": "spoof-egress-result", "sk": "set-update-key", "kt": "kernel-tune", "le": "link-enable",
     "cr": "core-restart",
