@@ -3176,13 +3176,20 @@ def op_wipe(d):
 
 
 def op_check(d):
-    """On-demand health probe for ONE config. Deliberately the SAME measurement the sweep runs: a
-    button that samples differently would disagree with the card it sits on."""
+    """READ_ONLY, as this op has always been declared: the sweep's latest measurement for ONE config.
+
+    It does not probe. health_of judges -- it advances settle()'s counter and writes the verdict file --
+    so only the sweep, which spaces its samples, may call it. The snapshot is refreshed every 1-3 s,
+    which is already fresher than the poll hops this button exists to skip."""
     _require(d, ["name"])
     cfg = read_config(d["name"])
     if not cfg:
         raise ValueError("not found")
-    return {"ok": True, "health": health_of(cfg)}
+    with _health_lock:
+        # Copy under the lock: the health thread rebinds the entry rather than mutating it today, and
+        # this way the caller does not depend on that staying true.
+        health = dict(_health_cache.get(cfg["name"]) or {"up": None})
+    return {"ok": True, "health": health}
 
 
 def _ss_proc(line):
