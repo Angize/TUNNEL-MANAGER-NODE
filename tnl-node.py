@@ -22,6 +22,7 @@ import errno
 import hashlib
 import hmac
 import ipaddress
+import itertools
 import json
 import os
 import select
@@ -1128,11 +1129,19 @@ def _cfg_path(name, suffix=""):
     return os.path.join(CONFIG_DIR, "core-" + name + suffix)
 
 
+_tmp_seq = itertools.count(1)
+
+
 def _atomic_write_json(path, obj):
     """Write obj as JSON to path atomically (tmp + os.replace). The core polls these command files
     once per second and deletes them, so a half-written file would be read+deleted and the command
-    SILENTLY LOST. Returns None on success, or the OSError string on failure."""
-    tmp = path + ".tmp"
+    SILENTLY LOST. Returns None on success, or the OSError string on failure.
+
+    The scratch name is per-call. One fixed «path».tmp meant two writers of the same file opened the
+    SAME scratch with O_TRUNC, interleaved their JSON into it, and both renamed: whichever rename ran
+    second failed with ENOENT, and the file that did land could be a mix of the two."""
+    d, base = os.path.split(path)
+    tmp = os.path.join(d, ".%s.%d.tmp" % (base, next(_tmp_seq)))
     try:
         with open(tmp, "w") as f:
             json.dump(obj, f)
@@ -1150,9 +1159,13 @@ def _core_status_paths(name):
     """The core's live files for tunnel `name`: the one status file it publishes, and the three sidecars
     written TO it — the tun probe's verdict, the operator's pin/retest, and the live-ECH push. Callers
     only iterate to clean them up, so listing all of them here means a rebuild/teardown never leaves
-    stale state, or a leftover command nobody will consume, behind."""
+    stale state, or a leftover command nobody will consume, behind.
+
+    The two «.taken» names are the core's: it claims a mailbox by renaming it, so one is left behind
+    only if the core dies between the rename and the read."""
     base = _cfg_path(name, ".status")
-    return (base, base + ".verdict", base + ".pin", base + ".echcmd")
+    return (base, base + ".verdict", base + ".verdict.taken",
+            base + ".pin", base + ".pin.taken", base + ".echcmd")
 
 
 def _read_core_cfg(name):
@@ -1628,7 +1641,7 @@ def tun_probe(iface, tunnel_ip, ttype, count=PROBE_COUNT):
     SYN was lost, and its "latency" is the kernel's own 1 s timer wearing the path's clothes.
 
     Returns (hits, sent, rtt_ms). rtt_ms is the FASTEST reply and is always a real round trip.
-    sent counts the SYNs that actually went out; it is 0 only when no socket could be set up at all."""
+    sent counts the SYNs that actually went out, and is 0 when the set was too small to judge on."""
     self_ip = tunnel_ip.split("/")[0]
     peer = peer_of(tunnel_ip, ttype)
     fam = socket.AF_INET6 if ttype == "sit" else socket.AF_INET
@@ -1667,6 +1680,15 @@ def tun_probe(iface, tunnel_ip, ttype, count=PROBE_COUNT):
             waiting[s] = t0
         else:
             s.close()          # the SYN never left; it is not a sample and must not count as loss
+
+    # A short set is not a cheaper measurement, it is a different one. Both breaks above stop the loop
+    # where it stands, so an fd ceiling on a busy node could hand the caller a set of one -- and there
+    # a single lost SYN reads as 100 % loss and condemns a healthy path. Under half of what was asked
+    # for, say we could not measure: sent == 0 is what the caller already treats that way.
+    if sent * 2 < max(1, count):
+        for s in waiting:
+            s.close()
+        return 0, 0, None
 
     deadline = time.monotonic() + PROBE_WAIT
     while waiting:
@@ -2783,7 +2805,11 @@ def op_tunnel(d):
                     obj["raw_port"] = rport
                 if _as_bool(d.get("raw_sport_random")):   # ...and whether the SOURCE port rolls
                     obj["raw_sport_random"] = True
-            wk = int(d.get("workers") or 0)   # extra TUN queues; 0/1 is the core's single-queue default
+        if transport in QUEUEING_TRANSPORTS:
+            # Extra TUN queues. _core_config emits this for every transport in QUEUEING_TRANSPORTS, so
+            # keeping it only while building a raw tunnel meant a udp tunnel's knob was accepted by the
+            # panel, dropped here, and never reached the core.
+            wk = int(d.get("workers") or 0)   # 0/1 is the core's single-queue default
             if wk and not (1 <= wk <= MAX_WORKERS):
                 raise ValueError("bad workers")
             if wk > 1:
@@ -3397,10 +3423,17 @@ def op_peer_status(d):
             "src": _axis_section(st, "src", pair["high"] if pair["high_kind"] == "src" else "")}
 
 
+PINBOX_MAX = 64 * 1024   # ~600 commands: a core that never comes back must not grow this without end
+
+
 def _write_pin(name, kind, key, cmd=""):
-    """Drop a command in the operator's mailbox: pin one entry, or end one entry's wait. The core polls
-    it once a second and removes it. Separate from the tun probe's verdict mailbox on purpose -- one
-    file with two writers means os.replace drops whichever arrived first, silently."""
+    """Append a command to the operator's mailbox: pin one entry, or end one entry's wait. The core
+    claims the whole file once a second and applies every line in order.
+
+    An APPEND, not a write. As one slot it held one command, so two clicks inside the core's one-second
+    tick meant the second erased the first and the panel reported both as done -- and a pin and a
+    retest are orders on different entries, so neither supersedes the other. Separate from the tun
+    probe's verdict mailbox, which IS a slot: only the newest sweep matters there."""
     if not NAME_RE.match(name):
         raise ValueError("bad name")
     key = str(key or "").strip()
@@ -3409,9 +3442,17 @@ def _write_pin(name, kind, key, cmd=""):
     body = {"kind": kind, "key": key}
     if cmd:
         body["cmd"] = cmd
-    err = _atomic_write_json(_cfg_path(name, ".status.pin"), body)
-    if err:
-        return {"ok": False, "error": err}
+    path = _cfg_path(name, ".status.pin")
+    try:
+        if os.path.getsize(path) > PINBOX_MAX:
+            return {"ok": False, "error": "صفِ فرمان پر است — هستهٔ این تونل فرمان‌ها را برنمی‌دارد"}
+    except OSError:
+        pass
+    try:
+        with open(path, "a") as f:
+            f.write(json.dumps(body) + "\n")
+    except OSError as e:
+        return {"ok": False, "error": str(e)}
     return {"ok": True}
 
 
