@@ -9,7 +9,7 @@ They must not. The panel still sends the sha256 and its RSA signature OVER that 
 checks both before anything is written. So the trust chain is identical in both modes: whoever serves
 the URL cannot install code the panel did not authorize; the worst they can do is fail the checksum.
 
-Every test drives the REAL op_update / op_core_install with only the network boundary stubbed.
+Every test drives the REAL op_update / op_core_put with only the network boundary stubbed.
 
 Run with no arguments. Exit 0 = a fetched update is as safe as a pushed one.
 """
@@ -82,12 +82,13 @@ def drive(mod, tmp, op, payload, served=None, serve_err=None):
         return served
 
     saved = {k: getattr(mod, k) for k in ("_fetch_url", "CONFIG_DIR", "NODE_CONF", "INSTALLED",
-                                          "CORE_BIN", "build_core", "svc")}
+                                          "CORE_BIN", "CORE_STAGED", "build_core", "svc")}
     mod._fetch_url = fake_fetch
     mod.CONFIG_DIR = tmp
     mod.NODE_CONF = os.path.join(tmp, "node.conf")
     mod.INSTALLED = os.path.join(tmp, "tnl-node.py")
     mod.CORE_BIN = os.path.join(tmp, "tnl-core")
+    mod.CORE_STAGED = mod.CORE_BIN + ".new"
     mod.build_core = lambda c: None     # relaunching real tunnels is build_core's subject, not this one
     mod.svc = lambda *a, **k: None
     try:
@@ -156,41 +157,51 @@ def main():
             ok("op_update surfaces a failed download")
 
         # --- the core half ---------------------------------------------------------------------------
-        r, calls = drive(mod, tmp, mod.op_core_install,
+        # op_core_put STAGES: it verifies everything and installs nothing, so what is checked here is
+        # that a bad artifact never reaches the disk the swap reads from.
+        r, calls = drive(mod, tmp, mod.op_core_put,
                          {"url": "https://example/tnl-core", "sha256": csha,
                           "sig": sign(priv, csha.encode()), "version": "v2.68.0"},
                          served=CORE_BYTES)
         if not r.get("ok"):
-            fail("a correctly signed URL core install was refused: %s" % r.get("msg"))
+            fail("a correctly signed URL core stage was refused: %s" % r.get("code"))
         elif not calls:
-            fail("op_core_install reported ok without downloading anything")
+            fail("op_core_put reported ok without downloading anything")
+        elif r.get("code") != "staged":
+            fail("op_core_put fetched a core but did not say it staged it: %r" % r)
         else:
-            ok("a signed URL core install works, and the node really fetched it")
+            ok("a signed URL core stage works, and the node really fetched it")
 
         for name, payload, served, want in [
             ("the sha does not match what was served",
              {"url": "https://example/c", "sha256": csha, "sig": sign(priv, csha.encode())},
-             CORE_BYTES + b"tamper", "checksum"),
-            ("no signature", {"url": "https://example/c", "sha256": csha}, CORE_BYTES, "signature"),
+             CORE_BYTES + b"tamper", "sha_mismatch"),
+            ("no signature", {"url": "https://example/c", "sha256": csha}, CORE_BYTES, "bad_signature"),
         ]:
-            r, _ = drive(mod, tmp, mod.op_core_install, payload, served=served)
+            r, _ = drive(mod, tmp, mod.op_core_put, payload, served=served)
             if r.get("ok"):
-                fail("op_core_install ACCEPTED a core with %s — that binary runs as root" % name)
-            elif want not in str(r.get("msg", "")).lower():
-                fail("op_core_install refused %s but said %r" % (name, r.get("msg")))
+                fail("op_core_put ACCEPTED a core with %s — that binary runs as root" % name)
+            elif r.get("code") != want:
+                fail("op_core_put refused %s but said %r" % (name, r.get("code")))
             else:
-                ok("op_core_install refuses: %s" % name)
+                ok("op_core_put refuses: %s" % name)
 
         # a tiny download is still refused by the size floor, exactly as a tiny push is
         small = b"nope"
-        r, _ = drive(mod, tmp, mod.op_core_install,
+        r, _ = drive(mod, tmp, mod.op_core_put,
                      {"url": "https://example/c", "sha256": hashlib.sha256(small).hexdigest(),
                       "sig": sign(priv, hashlib.sha256(small).hexdigest().encode())},
                      served=small)
         if r.get("ok"):
-            fail("op_core_install installed a 4-byte 'core'")
+            fail("op_core_put staged a 4-byte 'core'")
         else:
-            ok("op_core_install still refuses a too-small binary in URL mode")
+            ok("op_core_put still refuses a too-small binary in URL mode")
+
+        # nothing that was refused may be left behind for the install step to pick up
+        if os.path.exists(mod.CORE_STAGED):
+            fail("a refused core was left staged — the next apply would install it")
+        else:
+            ok("a refused core leaves nothing staged")
 
         # --- the REAL _fetch_url, with only urlopen stubbed ------------------------------------------
         opened = []

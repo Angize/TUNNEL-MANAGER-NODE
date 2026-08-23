@@ -50,7 +50,7 @@ SELF_PATH = os.path.realpath(__file__)
 INSTALLED = os.path.join(CONFIG_DIR, "tnl-node.py")  # stable path the systemd unit points at
 
 # The custom Go data-plane core (packet/core): a static binary the PANEL delivers by pushing verified
-# bytes to the node (op core-install). The node never downloads it itself — nodes may have no internet
+# bytes to the node (op core-put). The node never downloads it itself — nodes may have no internet
 # (e.g. an Iran node), so the panel is the single source and stages/relays the binary. The node only
 # verifies the pushed sha256 and supervises the binary via systemd-run.
 CORE_BIN = os.path.join(CONFIG_DIR, "tnl-core")
@@ -630,7 +630,7 @@ def _installed_core_sha():
 
 
 def _ensure_core():
-    """The core binary is delivered ONLY by the panel, which pushes verified bytes via the core-install
+    """The core binary is delivered ONLY by the panel, which pushes verified bytes via the core-put
     op. The node NEVER downloads it itself (nodes may have no internet — e.g. an Iran node). If the
     binary is missing, raise a clear, panel-detectable error so the panel's tunnel-build path relays the
     staged binary and retries; if the panel has nothing staged, the operator sees "core not installed"."""
@@ -3689,66 +3689,97 @@ def op_set_update_key(d):
     return {"ok": True, "already": bool(cur)}
 
 
-def op_core_install(d):
-    """Install a raw core binary pushed from the panel (base64), not a published release. Verify its
-    sha256, swap it in atomically, pin the node to a custom label, then rebuild the core tunnels so they
-    relaunch on it. NEVER install a binary whose checksum does not verify (it runs as root)."""
-    _require(d, ["sha256"])
+CORE_STAGED = CORE_BIN + ".new"
+
+
+def _core_bytes(d):
+    """The core binary the panel wants installed, or a (code, message) the caller returns as-is. Bytes
+    arrive inline or, in "node" delivery, are fetched here; either way the sha the panel signed is what
+    decides, so a hostile mirror gets no further than the checksum."""
     want = str(d.get("sha256") or "").strip().lower()
     if not CORE_SHA_RE.match(want):
         raise ValueError("bad sha256")
     if d.get("data") is None and d.get("url"):
-        # Delivery mode "node": fetch the release asset ourselves. `want` and the signature over it still
-        # decide what may be installed, so a hostile mirror gets no further than a checksum mismatch.
         try:
             raw = _fetch_url(d["url"], FETCH_MAX_CORE)
         except Exception as e:
-            return {"ok": False, "msg": "download failed: " + str(e)[:140]}
+            return None, want, {"ok": False, "code": "download_failed", "msg": str(e)[:140]}
     else:
         _require(d, ["data"])
         try:
             raw = base64.b64decode(d["data"], validate=True)
         except Exception:
             raise ValueError("bad base64 payload")
-    if len(raw) < 100000:                         # an core binary is ~3 MB; anything tiny is a mistake, never install it
-        return {"ok": False, "msg": "binary too small"}
-    got = hashlib.sha256(raw).hexdigest()
-    if got != want:
-        return {"ok": False, "msg": "checksum mismatch"}   # transport truncation guard — never install unverified bytes
-    if not _verify_update_sig(want.encode(), d.get("sig")):   # authenticity: only the panel's key may authorize a root binary
-        return {"ok": False, "msg": "signature verification failed (panel key)"}
+    if len(raw) < 100000:                      # a core binary is ~3 MB; anything tiny is a mistake
+        return None, want, {"ok": False, "code": "too_small"}
+    if hashlib.sha256(raw).hexdigest() != want:
+        return None, want, {"ok": False, "code": "sha_mismatch"}
+    if not _verify_update_sig(want.encode(), d.get("sig")):
+        return None, want, {"ok": False, "code": "bad_signature"}
+    return raw, want, None
+
+
+def _core_label(d):
     label = str(d.get("version") or "custom").strip() or "custom"
-    if not CORE_VER_RE.match(label):
-        label = "custom"
-    # Already the exact binary? Then this is a no-op: do NOT swap and do NOT restart the
-    # running core tunnels (a re-push of the same version must not blip live tunnels).
-    if os.path.isfile(CORE_BIN) and _installed_core_sha() == got:
+    return label if CORE_VER_RE.match(label) else "custom"
+
+
+def op_core_put(d):
+    """Stage a core binary beside the running one. Verifies everything and installs nothing: no swap, no
+    tunnel touched, so a cancel here leaves the node exactly as it was."""
+    raw, want, bad = _core_bytes(d)
+    if bad:
+        return bad
+    if os.path.isfile(CORE_BIN) and _installed_core_sha() == want:
         conf = load_conf()
+        label = _core_label(d)
         if conf.get("core_version") != label:
             conf["core_version"] = label
             save_conf(conf)
-        return {"ok": True, "unchanged": True, "version": label, "core_sha": got[:12], "restarted": 0}
+        return {"ok": True, "code": "same", "core_sha": want[:12]}
     with _core_lock:
-        tmp = CORE_BIN + ".new"
+        tmp = CORE_STAGED + ".tmp"
         with open(tmp, "wb") as f:
             f.write(raw)
         os.chmod(tmp, 0o755)
-        os.replace(tmp, CORE_BIN)               # atomic swap on the same fs — no half-written window
+        os.replace(tmp, CORE_STAGED)
+    return {"ok": True, "code": "staged", "core_sha": want[:12]}
+
+
+def op_core_apply(d):
+    """Swap in the staged binary and relaunch every enabled core tunnel on it. The staged file is checked
+    against the sha the panel signed a second time: it has been on disk since the put, and this is the
+    step that makes it the binary every tunnel runs as root."""
+    want = str(d.get("sha256") or "").strip().lower()
+    if not CORE_SHA_RE.match(want):
+        raise ValueError("bad sha256")
+    with _core_lock:
+        if not os.path.isfile(CORE_STAGED):
+            if os.path.isfile(CORE_BIN) and _installed_core_sha() == want:
+                return {"ok": True, "code": "same", "core_sha": want[:12], "restarted": 0}
+            return {"ok": False, "code": "nothing_staged"}
+        with open(CORE_STAGED, "rb") as f:
+            got = hashlib.sha256(f.read()).hexdigest()
+        if got != want:
+            os.remove(CORE_STAGED)
+            return {"ok": False, "code": "sha_mismatch"}
+        os.replace(CORE_STAGED, CORE_BIN)
+    label = _core_label(d)
     conf = load_conf()
     conf["core_version"] = label
     save_conf(conf)
-    restarted, errs = 0, []
-    for c in raw_configs():                        # relaunch every core tunnel on the freshly-installed binary
-        if c.get("type") == "core":
-            if not c.get("enabled", True):
-                continue                           # a tunnel the operator turned OFF stays down — an install must not silently re-enable it
-            try:
-                build_core(c)
-                restarted += 1
-            except Exception as e:
-                errs.append(f"{c.get('name')}: {e}")
-    logline(f"core installed from upload ({label}, sha {got[:12]}); rebuilt {restarted} core tunnel(s)")
-    return {"ok": True, "version": label, "core_sha": got[:12], "restarted": restarted, "errors": errs}
+    restarted, failed = 0, []
+    for c in raw_configs():
+        if c.get("type") != "core" or not c.get("enabled", True):
+            continue                           # one the operator switched OFF stays down
+        try:
+            build_core(c)
+            restarted += 1
+        except Exception as e:
+            failed.append({"name": c.get("name"), "msg": str(e)[:120]})
+    logline("core %s applied (sha %s); relaunched %d tunnel(s)" % (label, want[:12], restarted))
+    return {"ok": True, "code": "applied", "version": label, "core_sha": want[:12],
+            "restarted": restarted, "failed": failed}
 
 
 def op_apply(d):
@@ -4094,7 +4125,8 @@ OPS = {"ping": op_ping, "list": op_list, "check": op_check, "tunnel": op_tunnel,
        "peer-status": op_peer_status,
        "peer-select": op_peer_select, "pool-select": op_pool_select, "retest-now": op_retest_now,
        "ech-update": op_ech_update,
-       "core-install": op_core_install, "spoof-probe": op_spoof_probe,
+       "core-put": op_core_put, "core-apply": op_core_apply,
+       "spoof-probe": op_spoof_probe,
        "spoof-egress-listen": op_spoof_egress_listen, "spoof-egress-send": op_spoof_egress_send,
        "spoof-egress-result": op_spoof_egress_result,
        "set-update-key": op_set_update_key,
@@ -4115,7 +4147,7 @@ WIRE = {
     "up": "update", "wz": "wipe", "pf": "portfw", "pe": "portfw-edit", "pn": "portfw-next",
     "pc": "portcheck", "es": "edge-status", "ps": "peer-status", "pl": "peer-select",
     "qs": "pool-select", "rt": "retest-now", "eu": "ech-update",
-    "ci": "core-install", "sp": "spoof-probe", "sl": "spoof-egress-listen", "ss": "spoof-egress-send",
+    "cp": "core-put", "ca": "core-apply", "sp": "spoof-probe", "sl": "spoof-egress-listen", "ss": "spoof-egress-send",
     "sr": "spoof-egress-result", "sk": "set-update-key", "kt": "kernel-tune", "le": "link-enable",
     "cr": "core-restart",
 }
@@ -4247,9 +4279,9 @@ class Handler(BaseHTTPRequestHandler):
         if cmd not in READ_ONLY and method != "POST":
             self._send(405, {"error": "use POST"})
             return
-        # core-install carries a base64-encoded core binary (~3MB raw → ~4MB base64); a 1MB cap
-        # would truncate it and fail the JSON parse, so raise the cap for that op only.
-        cap = 20971520 if cmd == "core-install" else 1048576
+        # core-put carries a whole base64-encoded core binary; the ordinary cap would truncate it and
+        # fail the JSON parse, so raise it for that op only.
+        cap = 33554432 if cmd == "core-put" else 1048576
         d = self._body(cap) if method == "POST" else {}
         if how == "sig" and not self._body_matches_sig():
             # The signature covers X-Body, so this is what binds the bytes that arrived to the ones the
