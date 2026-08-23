@@ -22,6 +22,7 @@ import errno
 import hashlib
 import hmac
 import ipaddress
+import itertools
 import json
 import os
 import select
@@ -49,7 +50,7 @@ SELF_PATH = os.path.realpath(__file__)
 INSTALLED = os.path.join(CONFIG_DIR, "tnl-node.py")  # stable path the systemd unit points at
 
 # The custom Go data-plane core (packet/core): a static binary the PANEL delivers by pushing verified
-# bytes to the node (op core-install). The node never downloads it itself — nodes may have no internet
+# bytes to the node (op core-put). The node never downloads it itself — nodes may have no internet
 # (e.g. an Iran node), so the panel is the single source and stages/relays the binary. The node only
 # verifies the pushed sha256 and supervises the binary via systemd-run.
 CORE_BIN = os.path.join(CONFIG_DIR, "tnl-core")
@@ -629,7 +630,7 @@ def _installed_core_sha():
 
 
 def _ensure_core():
-    """The core binary is delivered ONLY by the panel, which pushes verified bytes via the core-install
+    """The core binary is delivered ONLY by the panel, which pushes verified bytes via the core-put
     op. The node NEVER downloads it itself (nodes may have no internet — e.g. an Iran node). If the
     binary is missing, raise a clear, panel-detectable error so the panel's tunnel-build path relays the
     staged binary and retries; if the panel has nothing staged, the operator sees "core not installed"."""
@@ -1128,11 +1129,19 @@ def _cfg_path(name, suffix=""):
     return os.path.join(CONFIG_DIR, "core-" + name + suffix)
 
 
+_tmp_seq = itertools.count(1)
+
+
 def _atomic_write_json(path, obj):
     """Write obj as JSON to path atomically (tmp + os.replace). The core polls these command files
     once per second and deletes them, so a half-written file would be read+deleted and the command
-    SILENTLY LOST. Returns None on success, or the OSError string on failure."""
-    tmp = path + ".tmp"
+    SILENTLY LOST. Returns None on success, or the OSError string on failure.
+
+    The scratch name is per-call. One fixed «path».tmp meant two writers of the same file opened the
+    SAME scratch with O_TRUNC, interleaved their JSON into it, and both renamed: whichever rename ran
+    second failed with ENOENT, and the file that did land could be a mix of the two."""
+    d, base = os.path.split(path)
+    tmp = os.path.join(d, ".%s.%d.tmp" % (base, next(_tmp_seq)))
     try:
         with open(tmp, "w") as f:
             json.dump(obj, f)
@@ -1628,7 +1637,7 @@ def tun_probe(iface, tunnel_ip, ttype, count=PROBE_COUNT):
     SYN was lost, and its "latency" is the kernel's own 1 s timer wearing the path's clothes.
 
     Returns (hits, sent, rtt_ms). rtt_ms is the FASTEST reply and is always a real round trip.
-    sent counts the SYNs that actually went out; it is 0 only when no socket could be set up at all."""
+    sent counts the SYNs that actually went out, and is 0 when the set was too small to judge on."""
     self_ip = tunnel_ip.split("/")[0]
     peer = peer_of(tunnel_ip, ttype)
     fam = socket.AF_INET6 if ttype == "sit" else socket.AF_INET
@@ -1667,6 +1676,15 @@ def tun_probe(iface, tunnel_ip, ttype, count=PROBE_COUNT):
             waiting[s] = t0
         else:
             s.close()          # the SYN never left; it is not a sample and must not count as loss
+
+    # A short set is not a cheaper measurement, it is a different one. Both breaks above stop the loop
+    # where it stands, so an fd ceiling on a busy node could hand the caller a set of one -- and there
+    # a single lost SYN reads as 100 % loss and condemns a healthy path. Under half of what was asked
+    # for, say we could not measure: sent == 0 is what the caller already treats that way.
+    if sent * 2 < max(1, count):
+        for s in waiting:
+            s.close()
+        return 0, 0, None
 
     deadline = time.monotonic() + PROBE_WAIT
     while waiting:
@@ -2783,7 +2801,11 @@ def op_tunnel(d):
                     obj["raw_port"] = rport
                 if _as_bool(d.get("raw_sport_random")):   # ...and whether the SOURCE port rolls
                     obj["raw_sport_random"] = True
-            wk = int(d.get("workers") or 0)   # extra TUN queues; 0/1 is the core's single-queue default
+        if transport in QUEUEING_TRANSPORTS:
+            # Extra TUN queues. _core_config emits this for every transport in QUEUEING_TRANSPORTS, so
+            # keeping it only while building a raw tunnel meant a udp tunnel's knob was accepted by the
+            # panel, dropped here, and never reached the core.
+            wk = int(d.get("workers") or 0)   # 0/1 is the core's single-queue default
             if wk and not (1 <= wk <= MAX_WORKERS):
                 raise ValueError("bad workers")
             if wk > 1:
@@ -3397,10 +3419,17 @@ def op_peer_status(d):
             "src": _axis_section(st, "src", pair["high"] if pair["high_kind"] == "src" else "")}
 
 
+PINBOX_MAX = 64 * 1024   # ~600 commands: a core that never comes back must not grow this without end
+
+
 def _write_pin(name, kind, key, cmd=""):
-    """Drop a command in the operator's mailbox: pin one entry, or end one entry's wait. The core polls
-    it once a second and removes it. Separate from the tun probe's verdict mailbox on purpose -- one
-    file with two writers means os.replace drops whichever arrived first, silently."""
+    """Append a command to the operator's mailbox: pin one entry, or end one entry's wait. The core
+    claims the whole file once a second and applies every line in order.
+
+    An APPEND, not a write. As one slot it held one command, so two clicks inside the core's one-second
+    tick meant the second erased the first and the panel reported both as done -- and a pin and a
+    retest are orders on different entries, so neither supersedes the other. Separate from the tun
+    probe's verdict mailbox, which IS a slot: only the newest sweep matters there."""
     if not NAME_RE.match(name):
         raise ValueError("bad name")
     key = str(key or "").strip()
@@ -3409,9 +3438,17 @@ def _write_pin(name, kind, key, cmd=""):
     body = {"kind": kind, "key": key}
     if cmd:
         body["cmd"] = cmd
-    err = _atomic_write_json(_cfg_path(name, ".status.pin"), body)
-    if err:
-        return {"ok": False, "error": err}
+    path = _cfg_path(name, ".status.pin")
+    try:
+        if os.path.getsize(path) > PINBOX_MAX:
+            return {"ok": False, "error": "صفِ فرمان پر است — هستهٔ این تونل فرمان‌ها را برنمی‌دارد"}
+    except OSError:
+        pass
+    try:
+        with open(path, "a") as f:
+            f.write(json.dumps(body) + "\n")
+    except OSError as e:
+        return {"ok": False, "error": str(e)}
     return {"ok": True}
 
 
@@ -3739,68 +3776,6 @@ def op_core_apply(d):
     logline("core %s applied (sha %s); relaunched %d tunnel(s)" % (label, want[:12], restarted))
     return {"ok": True, "code": "applied", "version": label, "core_sha": want[:12],
             "restarted": restarted, "failed": failed}
-
-
-def op_core_install(d):
-    """Install a raw core binary pushed from the panel (base64), not a published release. Verify its
-    sha256, swap it in atomically, pin the node to a custom label, then rebuild the core tunnels so they
-    relaunch on it. NEVER install a binary whose checksum does not verify (it runs as root)."""
-    _require(d, ["sha256"])
-    want = str(d.get("sha256") or "").strip().lower()
-    if not CORE_SHA_RE.match(want):
-        raise ValueError("bad sha256")
-    if d.get("data") is None and d.get("url"):
-        # Delivery mode "node": fetch the release asset ourselves. `want` and the signature over it still
-        # decide what may be installed, so a hostile mirror gets no further than a checksum mismatch.
-        try:
-            raw = _fetch_url(d["url"], FETCH_MAX_CORE)
-        except Exception as e:
-            return {"ok": False, "msg": "download failed: " + str(e)[:140]}
-    else:
-        _require(d, ["data"])
-        try:
-            raw = base64.b64decode(d["data"], validate=True)
-        except Exception:
-            raise ValueError("bad base64 payload")
-    if len(raw) < 100000:                         # an core binary is ~3 MB; anything tiny is a mistake, never install it
-        return {"ok": False, "msg": "binary too small"}
-    got = hashlib.sha256(raw).hexdigest()
-    if got != want:
-        return {"ok": False, "msg": "checksum mismatch"}   # transport truncation guard — never install unverified bytes
-    if not _verify_update_sig(want.encode(), d.get("sig")):   # authenticity: only the panel's key may authorize a root binary
-        return {"ok": False, "msg": "signature verification failed (panel key)"}
-    label = str(d.get("version") or "custom").strip() or "custom"
-    if not CORE_VER_RE.match(label):
-        label = "custom"
-    # Already the exact binary? Then this is a no-op: do NOT swap and do NOT restart the
-    # running core tunnels (a re-push of the same version must not blip live tunnels).
-    if os.path.isfile(CORE_BIN) and _installed_core_sha() == got:
-        conf = load_conf()
-        if conf.get("core_version") != label:
-            conf["core_version"] = label
-            save_conf(conf)
-        return {"ok": True, "unchanged": True, "version": label, "core_sha": got[:12], "restarted": 0}
-    with _core_lock:
-        tmp = CORE_BIN + ".new"
-        with open(tmp, "wb") as f:
-            f.write(raw)
-        os.chmod(tmp, 0o755)
-        os.replace(tmp, CORE_BIN)               # atomic swap on the same fs — no half-written window
-    conf = load_conf()
-    conf["core_version"] = label
-    save_conf(conf)
-    restarted, errs = 0, []
-    for c in raw_configs():                        # relaunch every core tunnel on the freshly-installed binary
-        if c.get("type") == "core":
-            if not c.get("enabled", True):
-                continue                           # a tunnel the operator turned OFF stays down — an install must not silently re-enable it
-            try:
-                build_core(c)
-                restarted += 1
-            except Exception as e:
-                errs.append(f"{c.get('name')}: {e}")
-    logline(f"core installed from upload ({label}, sha {got[:12]}); rebuilt {restarted} core tunnel(s)")
-    return {"ok": True, "version": label, "core_sha": got[:12], "restarted": restarted, "errors": errs}
 
 
 def op_apply(d):
@@ -4146,7 +4121,7 @@ OPS = {"ping": op_ping, "list": op_list, "check": op_check, "tunnel": op_tunnel,
        "peer-status": op_peer_status,
        "peer-select": op_peer_select, "pool-select": op_pool_select, "retest-now": op_retest_now,
        "ech-update": op_ech_update,
-       "core-install": op_core_install, "core-put": op_core_put, "core-apply": op_core_apply,
+       "core-put": op_core_put, "core-apply": op_core_apply,
        "spoof-probe": op_spoof_probe,
        "spoof-egress-listen": op_spoof_egress_listen, "spoof-egress-send": op_spoof_egress_send,
        "spoof-egress-result": op_spoof_egress_result,
@@ -4168,7 +4143,7 @@ WIRE = {
     "up": "update", "wz": "wipe", "pf": "portfw", "pe": "portfw-edit", "pn": "portfw-next",
     "pc": "portcheck", "es": "edge-status", "ps": "peer-status", "pl": "peer-select",
     "qs": "pool-select", "rt": "retest-now", "eu": "ech-update",
-    "ci": "core-install", "cp": "core-put", "ca": "core-apply", "sp": "spoof-probe", "sl": "spoof-egress-listen", "ss": "spoof-egress-send",
+    "cp": "core-put", "ca": "core-apply", "sp": "spoof-probe", "sl": "spoof-egress-listen", "ss": "spoof-egress-send",
     "sr": "spoof-egress-result", "sk": "set-update-key", "kt": "kernel-tune", "le": "link-enable",
     "cr": "core-restart",
 }
@@ -4300,9 +4275,9 @@ class Handler(BaseHTTPRequestHandler):
         if cmd not in READ_ONLY and method != "POST":
             self._send(405, {"error": "use POST"})
             return
-        # core-install carries a base64-encoded core binary (~3MB raw → ~4MB base64); a 1MB cap
-        # would truncate it and fail the JSON parse, so raise the cap for that op only.
-        cap = 20971520 if cmd == "core-install" else 1048576
+        # core-put carries a whole base64-encoded core binary; the ordinary cap would truncate it and
+        # fail the JSON parse, so raise it for that op only.
+        cap = 33554432 if cmd == "core-put" else 1048576
         d = self._body(cap) if method == "POST" else {}
         if how == "sig" and not self._body_matches_sig():
             # The signature covers X-Body, so this is what binds the bytes that arrived to the ones the
