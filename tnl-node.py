@@ -815,10 +815,18 @@ def _core_config(cfg):
             _rport = 0
         if raw_profile in ("udp", "tcp") and 1 <= _rport <= 65535:
             corecfg["raw_port"] = _rport
-        # udp/tcp only: roll the CLIENT's forged SOURCE port for the life of the tunnel instead of the
-        # one constant, so a stateful box cannot burn a single 4-tuple and take the carrier with it.
+        # udp/tcp only: the CLIENT's forged SOURCE port -- rolled for the life of the tunnel, so a
+        # stateful box cannot burn a single 4-tuple and take the carrier with it, or pinned to the
+        # operator's number so the client looks like a peer of some known protocol. Never both: the
+        # core refuses the pair, and the rolled mode is the one that wins here.
+        try:
+            _rsport = int(cfg.get("raw_sport") or 0)
+        except (TypeError, ValueError):
+            _rsport = 0
         if raw_profile in ("udp", "tcp") and _as_bool(cfg.get("raw_sport_random")):
             corecfg["raw_sport_random"] = True
+        elif raw_profile in ("udp", "tcp") and 1 <= _rsport <= 65535:
+            corecfg["raw_sport"] = _rsport
     if transport in QUEUEING_TRANSPORTS:
         # Extra TUN queues, so a tunnel's packets are read and written by several goroutines instead of
         # queueing behind one file's lock. NOT with FEC: its decoder rebuilds a block out of consecutive
@@ -2535,16 +2543,23 @@ def op_list(d):
     # time — without a separate per-tunnel status call. Only pooled tunnels have these files; the rest are
     # absent (empty), so this is a cheap best-effort read of a couple of small files per config.
     pools = {}
+    # The live SOURCE port out of the same file, for the same reason: a rolled or forged client port
+    # exists nowhere else, and the panel would otherwise print the mode with no number beside it.
+    sports = {}
     for c in cfgs:
         nm = c.get("name") or ""
         if not nm:
             continue
-        pair = _read_status(nm)["pair"]
+        st = _read_status(nm)
+        pair = st["pair"]
         dst = pair["low"] if pair["low_kind"] == "dst" else ""
         src = pair["high"] if pair["high_kind"] == "src" else ""
         if dst or src:
             pools[nm] = {"dst": dst, "src": src}
-    return {"configs": cfgs, "health": {c["name"]: hc.get(c["name"], {"up": None}) for c in cfgs}, "pools": pools}
+        if st["path"]["sport"]:
+            sports[nm] = st["path"]["sport"]
+    return {"configs": cfgs, "health": {c["name"]: hc.get(c["name"], {"up": None}) for c in cfgs},
+            "pools": pools, "sports": sports}
 
 
 def op_tunnel(d):
@@ -2803,8 +2818,18 @@ def op_tunnel(d):
                     raise ValueError("bad raw_port")
                 if rport:
                     obj["raw_port"] = rport
+                # The CLIENT source port in the same forged header: a number, or rolled. The core
+                # refuses both at once, so refuse it here too rather than storing a pair whose
+                # rebuild then dies on the far side with nothing on screen to explain it.
+                rsport = int(d.get("raw_sport") or 0)
+                if rsport and not (1 <= rsport <= 65535):
+                    raise ValueError("bad raw_sport")
+                if rsport and _as_bool(d.get("raw_sport_random")):
+                    raise ValueError("raw_sport and raw_sport_random are exclusive")
                 if _as_bool(d.get("raw_sport_random")):   # ...and whether the SOURCE port rolls
                     obj["raw_sport_random"] = True
+                elif rsport:
+                    obj["raw_sport"] = rsport
         if transport in QUEUEING_TRANSPORTS:
             # Extra TUN queues. _core_config emits this for every transport in QUEUEING_TRANSPORTS, so
             # keeping it only while building a raw tunnel meant a udp tunnel's knob was accepted by the
@@ -3346,6 +3371,16 @@ def op_edge_status(d):
 _PEER_ADDR_RE = re.compile(r"^[0-9A-Fa-f:.]{1,64}$")  # a pool endpoint is only ever an IPv4/IPv6/ip:port
 
 
+def _port_or_zero(v):
+    """A port out of a file the core wrote: in range, or 0. A malformed one must not kill the sweep
+    for every tunnel behind it."""
+    try:
+        n = int(v or 0)
+    except (TypeError, ValueError):
+        return 0
+    return n if 1 <= n <= 65535 else 0
+
+
 def _read_status(name):
     """The one status file the core publishes for tunnel `name`, normalized.
 
@@ -3357,7 +3392,8 @@ def _read_status(name):
     # ONE shape, always: a caller reaching for pair["low"] on a tunnel whose core has not written yet
     # must get "", not a KeyError that kills the sweep for every tunnel behind it.
     empty = {"active": "", "epoch": 0, "ready": False, "health": [], "events": [], "ts": 0,
-             "pair": {"low": "", "high": "", "low_kind": "", "high_kind": ""}}
+             "pair": {"low": "", "high": "", "low_kind": "", "high_kind": ""},
+             "path": {"src": "", "sport": 0, "dst": "", "dport": 0}}
     try:
         with open(_cfg_path(name, ".status")) as f:
             st = json.load(f)
@@ -3382,12 +3418,17 @@ def _read_status(name):
                        "kind": str(e.get("kind") or ""), "code": str(e.get("code") or ""),
                        "detail": str(e.get("detail") or "")})
     pair = st.get("pair") if isinstance(st.get("pair"), dict) else {}
+    # `path` is the 4-tuple the carrier is on RIGHT NOW. Only the end that dials publishes one, and
+    # its source port is the only place the rolled or forged client port is observable at all.
+    pk = st.get("path") if isinstance(st.get("path"), dict) else {}
     return {"active": str(st.get("active") or ""), "epoch": int(st.get("epoch") or 0),
             "ready": bool(st.get("ready")), "health": health, "events": events,
             "ts": int(st.get("ts") or 0),
             "pair": {"low": str(pair.get("low") or ""), "high": str(pair.get("high") or ""),
                      "low_kind": str(pair.get("low_kind") or ""),
-                     "high_kind": str(pair.get("high_kind") or "")}}
+                     "high_kind": str(pair.get("high_kind") or "")},
+            "path": {"src": str(pk.get("src") or ""), "sport": _port_or_zero(pk.get("sport")),
+                     "dst": str(pk.get("dst") or ""), "dport": _port_or_zero(pk.get("dport"))}}
 
 
 def _axis_rows(st, kind):
