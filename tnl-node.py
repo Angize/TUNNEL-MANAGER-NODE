@@ -655,8 +655,7 @@ QUEUEING_TRANSPORTS = ("raw", "udp")
 _TUNING_INT_KEYS = ("dead_retest_secs",
                     # flux_rotate_default_secs intentionally omitted: every flux tunnel carries an explicit
                     # flux_rotate_secs, so the core's tuned default is unreachable; the panel offers no knob either.
-                    "min_liveness_secs",
-                    "port_tries")
+                    "min_liveness_secs")
 
 
 def _core_tuning(tn):
@@ -828,6 +827,12 @@ def _core_config(cfg):
             corecfg["raw_sport_random"] = True
         elif raw_profile in ("udp", "tcp") and 1 <= _rsport <= 65535:
             corecfg["raw_sport"] = _rsport
+    try:
+        _ptries = int(cfg.get("port_tries") or 0)
+    except (TypeError, ValueError):
+        _ptries = 0
+    if 1 <= _ptries <= 50:
+        corecfg["port_tries"] = _ptries
     if transport in QUEUEING_TRANSPORTS:
         # Extra TUN queues, so a tunnel's packets are read and written by several goroutines instead of
         # queueing behind one file's lock. NOT with FEC: its decoder rebuilds a block out of consecutive
@@ -2831,6 +2836,14 @@ def op_tunnel(d):
                     obj["raw_sport_random"] = True
                 elif rsport:
                     obj["raw_sport"] = rsport
+        # How many source ports this tunnel's ladder may draw. Per tunnel, so it is stored on the
+        # record and emitted below -- a value accepted here and not emitted is one the operator sets
+        # and the core never sees.
+        ptries = int(d.get("port_tries") or 0)
+        if ptries and not (1 <= ptries <= 50):
+            raise ValueError("bad port_tries")
+        if ptries:
+            obj["port_tries"] = ptries
         if transport in QUEUEING_TRANSPORTS:
             # Extra TUN queues. _core_config emits this for every transport in QUEUEING_TRANSPORTS, so
             # keeping it only while building a raw tunnel meant a udp tunnel's knob was accepted by the
