@@ -655,7 +655,8 @@ QUEUEING_TRANSPORTS = ("raw", "udp")
 _TUNING_INT_KEYS = ("dead_retest_secs",
                     # flux_rotate_default_secs intentionally omitted: every flux tunnel carries an explicit
                     # flux_rotate_secs, so the core's tuned default is unreachable; the panel offers no knob either.
-                    "min_liveness_secs")
+                    "min_liveness_secs",
+                    "port_tries")
 
 
 def _core_tuning(tn):
