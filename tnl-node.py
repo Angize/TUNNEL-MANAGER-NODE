@@ -657,10 +657,15 @@ _TUNING_INT_KEYS = ("dead_retest_secs",
                     # flux_rotate_secs, so the core's tuned default is unreachable; the panel offers no knob either.
                     "min_liveness_secs")
 
+# The knobs whose value is a LIST of seconds rather than one number. Guarded against the core's own
+# roster by tools/tuning_consistency.py -- a list knob missing here is passed through as nothing, and
+# the core silently keeps its compiled-in default while the panel shows the operator's number.
+_TUNING_LIST_KEYS = ("suspect_backoff", "ladder_revive")
+
 
 def _core_tuning(tn):
     """Sanitize the panel's operational-timing overrides into a type-clean JSON object for the core:
-    positive ints for the scalar knobs, a list of positive ints for suspect_backoff. Drop anything
+    positive ints for the scalar knobs, a list of positive ints for each list knob. Drop anything
     malformed or non-positive (the core treats absent/zero as "keep default"). Returns {} when there
     is nothing to pass, so the core config omits `tuning` entirely and every timing stays at default."""
     if not isinstance(tn, dict):
@@ -673,10 +678,12 @@ def _core_tuning(tn):
             continue
         if v > 0:
             out[k] = v
-    sb = tn.get("suspect_backoff")
-    if isinstance(sb, (list, tuple)):
+    for k in _TUNING_LIST_KEYS:
+        raw = tn.get(k)
+        if not isinstance(raw, (list, tuple)):
+            continue
         steps = []
-        for x in sb:
+        for x in raw:
             try:
                 iv = int(x)
             except (TypeError, ValueError):
@@ -684,7 +691,7 @@ def _core_tuning(tn):
             if iv > 0:
                 steps.append(iv)
         if steps:
-            out["suspect_backoff"] = steps
+            out[k] = steps
     return out
 
 
