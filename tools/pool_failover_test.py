@@ -152,6 +152,11 @@ def main():
     n_again = len(sent)
     clock["t"] += 4.0
     sweep()
+    want(len(sent) == n_again,
+         f"the straddled sweeps are not evidence, so the first trustworthy one only starts the count, "
+         f"got {len(sent) - n_again} asks")
+    clock["t"] += 4.0
+    sweep()
     want(len(sent) == n_again + 1,
          f"past the straddled window the next endpoint may be failed too, got {len(sent) - n_again}")
 

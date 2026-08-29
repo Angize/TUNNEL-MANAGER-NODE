@@ -1346,8 +1346,6 @@ def settle(name, ok):
         return st["pub"]
 
 
-
-
 def _read_path_state(name):
     try:
         with open(_cfg_path(name, ".status")) as f:
@@ -1384,21 +1382,26 @@ def _report_carrying(name, edge, epoch):
 def pool_failover(name, alive, crossed, epoch, session_up, stable):
     if str(_read_core_cfg(name).get("role") or "") != "client":
         return
-    pair = _read_status(name)["pair"]
-    low, high = pair["low"], pair["high"]
+    counted = stable and not crossed
+    low, high = "", ""
+    if counted:
+        pair = _read_status(name)["pair"]
+        low, high = pair["low"], pair["high"]
     with _verdict_lock:
         st = _verdict.setdefault(name, {"pub": None, "bad": 0})
         was_red, st["red"] = st.get("red", False), alive is False
-        if crossed or st.get("on") != (low, high):
-            st["on"], st["onbad"] = (low, high), 0
-        if not crossed:
-            st["onbad"] = st.get("onbad", 0) + 1
-        onbad = st["onbad"]
+        if crossed:
+            st["on"], st["onbad"] = None, 0
+        elif counted:
+            if st.get("on") != (low, high):
+                st["on"], st["onbad"] = (low, high), 0
+            st["onbad"] += 1
+        onbad = st.get("onbad", 0)
     if alive is not False:
         if crossed and session_up:
             _report_carrying(name, was_red and alive is True, epoch)
         return
-    if not stable or onbad < RED_SWEEPS:
+    if not counted or onbad < RED_SWEEPS:
         return
     err = _atomic_write_json(_cfg_path(name, ".status.verdict"),
                              {"cmd": "fail", "low": low, "high": high, "epoch": epoch})
@@ -1426,7 +1429,6 @@ def _prune_iface_state(names):
     with _verdict_lock:
         for nm in [n for n in _verdict if n not in names]:
             _verdict.pop(nm, None)
-
 
 
 def _flow_sample(name):
@@ -1721,7 +1723,6 @@ _req_ctr_lock = threading.Lock()
 _req_ctr = 0
 _req_seen = 0
 _req_ctr_hwm = 0
-
 
 
 def _seed_req_ctr():
@@ -2999,7 +3000,6 @@ def op_spoof_probe(d):
         return {"ok": False, "reason": "unreadable probe output"}
     p.setdefault("ok", False)
     return p
-
 
 
 _EGRESS = {}

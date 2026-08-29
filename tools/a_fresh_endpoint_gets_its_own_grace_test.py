@@ -43,12 +43,17 @@ def carrier_on(low, high="cdn.spacefly.ir"):
               io.open(os.path.join(D, "core-%s.status" % NAME), "w"))
 
 
-def sweep(crossed):
+READS = []
+_real_read_status = N._read_status
+N._read_status = lambda n: (READS.append(n), _real_read_status(n))[1]
+
+
+def sweep(crossed, stable=True):
     """One probe, exactly as health_of runs it. Returns the endpoint the node asked to burn, or None."""
     if os.path.exists(VERDICT):
         os.remove(VERDICT)
     alive = N.settle(NAME, crossed)
-    N.pool_failover(NAME, alive, crossed, EPOCH, True, True)
+    N.pool_failover(NAME, alive, crossed, EPOCH, True, stable)
     if not os.path.exists(VERDICT):
         return None
     v = json.load(io.open(VERDICT))
@@ -100,6 +105,30 @@ for _ in range(4):
 check(N._verdict[NAME]["bad"] >= 4,
       "the per-tunnel counter still counts every bad sweep for the colour (%d)" % N._verdict[NAME]["bad"])
 check(N._verdict[NAME]["pub"] is False, "and the tunnel is published red")
+
+print()
+print("== a sweep the epoch guard distrusts is not evidence against any endpoint ==")
+carrier_on(DEAD)
+sweep(True)
+for _ in range(6):
+    sweep(False, stable=False)
+check(N._verdict[NAME].get("onbad", 0) == 0,
+      "six sweeps that straddled a path move left the per-endpoint tally at 0 (%d) -- the probe cannot "
+      "say which path it measured, so it may not condemn one"
+      % N._verdict[NAME].get("onbad", 0))
+check(sweep(False) is None and sweep(False) == DEAD,
+      "and a trustworthy pair of sweeps still condemns the dead endpoint right after")
+
+print()
+print("== the status file is read only when the sweep can judge ==")
+carrier_on(DEAD)
+sweep(True)
+READS.clear()
+sweep(True)
+check(len(READS) <= 1, "a crossing sweep reads it at most once, got %d" % len(READS))
+READS.clear()
+sweep(False, stable=False)
+check(not READS, "a sweep the epoch guard drops does not read it at all, got %d" % len(READS))
 
 shutil.rmtree(D, ignore_errors=True)
 print()
