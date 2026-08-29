@@ -1381,7 +1381,7 @@ def _report_carrying(name, edge, epoch):
             + (f" [{err}]" if err else ""))
 
 
-def pool_failover(name, alive, crossed, epoch, session_up):
+def pool_failover(name, alive, crossed, epoch, session_up, stable):
     if str(_read_core_cfg(name).get("role") or "") != "client":
         return
     with _verdict_lock:
@@ -1390,6 +1390,8 @@ def pool_failover(name, alive, crossed, epoch, session_up):
     if alive is not False:
         if crossed and session_up:
             _report_carrying(name, was_red and alive is True, epoch)
+        return
+    if not stable:
         return
     with _verdict_lock:
         if _verdict.get(name, {}).get("bad", 0) < RED_SWEEPS:
@@ -1490,8 +1492,8 @@ def health_of(cfg):
             crossed = carrying(hits, sent, probe_min_pct(cfg))
             alive = settle(name, crossed)
             epoch, ready = _read_path_state(name)
-            if epoch == epoch_before:
-                pool_failover(name, alive, crossed, epoch, ready_before and ready)
+            pool_failover(name, alive, crossed, epoch_before, ready_before and ready,
+                          epoch == epoch_before)
     return {"up": up, "alive": alive, "dead": alive is False, "rtt_ms": rtt, "loss_pct": loss,
             "crossed": crossed, "rx_still": rx_still, "tx_still": tx_still, "live_win": int(LIVE_WINDOW)}
 

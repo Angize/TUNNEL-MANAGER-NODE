@@ -58,3 +58,5 @@ jobs:
         run: python tools/pooled_raw_binds_wildcard_test.py
       - name: a signed request cannot be replayed or forged
         run: python tools/signed_request_test.py
+      - name: a moved epoch swallows the fail, not the recovery
+        run: python tools/a_moved_epoch_swallows_only_the_fail_test.py
