@@ -233,6 +233,9 @@ def main():
         n = len(sent)
         clock["t"] += 4.0
         sweep("t-key")
+        want(not sent[n:], f"the first sweep on {want_key} must ask for nothing, got {sent[n:]}")
+        clock["t"] += 4.0
+        sweep("t-key")
         got = [o for _, o in sent[n:]]
         want(len(got) == 1 and got[0].get("low") == want_key,
              f"an ask measured on {want_key} must name {want_key}, got {got}")

@@ -117,6 +117,8 @@ def main():
     with P._verdict_lock:
         P._verdict["t1"] = {"pub": True, "bad": 1}      # one more bad sweep tips it
     P.health_of(dict(cfg))
+    check(not wrote, "the first bad sweep on an endpoint asks for nothing, got %s" % (wrote,))
+    P.health_of(dict(cfg))
     P.os.path.exists = real_exists
     check(any(str(p).endswith(".status.verdict") for p, _ in wrote),
           "health_of still writes the verdict — what was removed is the BUTTON's call to it, not the "
