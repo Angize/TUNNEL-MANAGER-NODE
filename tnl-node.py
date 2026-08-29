@@ -1384,21 +1384,22 @@ def _report_carrying(name, edge, epoch):
 def pool_failover(name, alive, crossed, epoch, session_up, stable):
     if str(_read_core_cfg(name).get("role") or "") != "client":
         return
+    pair = _read_status(name)["pair"]
+    low, high = pair["low"], pair["high"]
     with _verdict_lock:
         st = _verdict.setdefault(name, {"pub": None, "bad": 0})
         was_red, st["red"] = st.get("red", False), alive is False
+        if crossed or st.get("on") != (low, high):
+            st["on"], st["onbad"] = (low, high), 0
+        if not crossed:
+            st["onbad"] = st.get("onbad", 0) + 1
+        onbad = st["onbad"]
     if alive is not False:
         if crossed and session_up:
             _report_carrying(name, was_red and alive is True, epoch)
         return
-    if not stable:
+    if not stable or onbad < RED_SWEEPS:
         return
-    with _verdict_lock:
-        if _verdict.get(name, {}).get("bad", 0) < RED_SWEEPS:
-            return
-    st = _read_status(name)
-    pair = st["pair"]
-    low, high = pair["low"], pair["high"]
     err = _atomic_write_json(_cfg_path(name, ".status.verdict"),
                              {"cmd": "fail", "low": low, "high": high, "epoch": epoch})
     asked = (f"fail {low or '?'} / {high or '?'}" if low or high
