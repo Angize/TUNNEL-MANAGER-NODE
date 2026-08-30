@@ -2841,10 +2841,37 @@ def op_set_update_key(d):
 CORE_STAGED = CORE_BIN + ".new"
 
 
-def _core_bytes(d):
+def _release_checksum(url):
+    txt = _fetch_url(str(url) + ".sha256", 4096, timeout=20).decode("utf-8", "replace")
+    sha = (txt.split() or [""])[0].strip().lower()
+    if not CORE_SHA_RE.match(sha):
+        raise ValueError("the release published no usable checksum")
+    return sha
+
+
+def _granted_sha(d):
     want = str(d.get("sha256") or "").strip().lower()
-    if not CORE_SHA_RE.match(want):
+    if want:
+        if not CORE_SHA_RE.match(want):
+            raise ValueError("bad sha256")
+        if not _verify_update_sig(want.encode(), d.get("sig")):
+            return "", {"ok": False, "code": "bad_signature"}
+        return want, None
+    url = str(d.get("url") or "").strip()
+    if not url:
         raise ValueError("bad sha256")
+    if not _verify_update_sig(url.encode(), d.get("sig")):
+        return "", {"ok": False, "code": "bad_signature"}
+    try:
+        return _release_checksum(url), None
+    except Exception as e:
+        return "", {"ok": False, "code": "checksum_unavailable", "msg": str(e)[:140]}
+
+
+def _core_bytes(d):
+    want, bad = _granted_sha(d)
+    if bad:
+        return None, want, bad
     if d.get("data") is None and d.get("url"):
         try:
             raw = _fetch_url(d["url"], FETCH_MAX_CORE)
@@ -2860,8 +2887,6 @@ def _core_bytes(d):
         return None, want, {"ok": False, "code": "too_small"}
     if hashlib.sha256(raw).hexdigest() != want:
         return None, want, {"ok": False, "code": "sha_mismatch"}
-    if not _verify_update_sig(want.encode(), d.get("sig")):
-        return None, want, {"ok": False, "code": "bad_signature"}
     return raw, want, None
 
 
@@ -2891,9 +2916,9 @@ def op_core_put(d):
 
 
 def op_core_apply(d):
-    want = str(d.get("sha256") or "").strip().lower()
-    if not CORE_SHA_RE.match(want):
-        raise ValueError("bad sha256")
+    want, bad = _granted_sha(d)
+    if bad:
+        return bad
     with _core_lock:
         if not os.path.isfile(CORE_STAGED):
             if os.path.isfile(CORE_BIN) and _installed_core_sha() == want:
