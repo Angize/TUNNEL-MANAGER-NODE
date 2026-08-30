@@ -115,8 +115,8 @@ def main():
     P._read_path_state = lambda n: (7, True)
     P.probe_min_pct = lambda c: 15
     with P._verdict_lock:
-        P._verdict["t1"] = {"pub": True, "bad": 1}      # one more bad sweep tips it
-    P.health_of(dict(cfg))
+        P._verdict["t1"] = {"pub": True, "bad": 1}      # one more bad sweep tips the COLOUR
+    P.health_of(dict(cfg))                              # the burn needs its own two: this is the first
     check(not wrote, "the first bad sweep on an endpoint asks for nothing, got %s" % (wrote,))
     P.health_of(dict(cfg))
     P.os.path.exists = real_exists
