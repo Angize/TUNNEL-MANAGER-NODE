@@ -3343,7 +3343,8 @@ class Handler(BaseHTTPRequestHandler):
                 return
         cp = self.headers.get("X-Central-Port")
         if cp:
-            note_central(self.client_address[0], cp,
+            ch = str(self.headers.get("X-Central-Host", "")).strip()
+            note_central(ch if is_ipv4(ch) else self.client_address[0], cp,
                          str(self.headers.get("X-Central-TLS", "")).strip() not in ("", "0"))
         if cmd not in OPS:
             self._send(404, {"error": "unknown endpoint"})

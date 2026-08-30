@@ -60,3 +60,5 @@ jobs:
         run: python tools/signed_request_test.py
       - name: a moved epoch swallows the fail, not the recovery
         run: python tools/a_moved_epoch_swallows_only_the_fail_test.py
+      - name: the node believes the panel about where the panel is
+        run: python tools/the_panel_says_where_it_is_test.py
