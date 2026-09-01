@@ -708,17 +708,21 @@ def _core_config(cfg):
         if cdn in ("http", "grpc"):
             corecfg["cdn_carrier"] = cdn
 
-            _shape = ("http_streams",)
-            if cdn == "http":
-                _shape = ("http_up_workers", "http_up_batch_kb", "http_up_rate", "http_streams")
-            if cfg.get("role") == "client" and cdn in ("http", "grpc"):
-                for _k in _shape:
-                    try:
-                        _v = int(cfg.get(_k) or 0)
-                    except (TypeError, ValueError):
-                        _v = 0
-                    if _v > 0:
-                        corecfg[_k] = _v
+            if cfg.get("role") == "client":
+                _shape = ("http_streams",)
+                if cdn == "http":
+                    _shape = ("http_up_workers", "http_up_batch_kb", "http_up_rate", "http_streams")
+            elif cdn == "http":
+                _shape = ("http_up_workers", "http_up_batch_kb")
+            else:
+                _shape = ()
+            for _k in _shape:
+                try:
+                    _v = int(cfg.get(_k) or 0)
+                except (TypeError, ValueError):
+                    _v = 0
+                if _v > 0:
+                    corecfg[_k] = _v
         if bool(cfg.get("ws_tls")) and cfg.get("role") == "client":
             corecfg["ws_tls"] = True
             if bool(cfg.get("sni_split")):
