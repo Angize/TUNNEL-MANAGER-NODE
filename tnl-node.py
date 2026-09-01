@@ -601,7 +601,7 @@ def _core_config(cfg):
     elif transport == "spoof":
         outer = 20
     elif transport == "flux":
-        outer = 20 + (8 + 20 + 4 + 3 if flux_carrier == "stun" else 8)
+        outer = 20 + (8 + 20 + 12 + 4 + 3 if flux_carrier == "stun" else 8)
     elif transport == "ws":
         outer = 40 + 14
     else:
