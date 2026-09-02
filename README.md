@@ -59,7 +59,7 @@ sudo python3 tnl-node.py --show      # host / port / token → در تبِ «ن�
 
 | نوع | جزئیات |
 |---|---|
-| `core` | تونلِ رمزنگاری‌شدهٔ هسته (`udp`/`tcp`/`raw`/`flux`/`ws`/`dns`) — با پنل کانفیگ می‌شود، هسته را زیرِ یونیتِ transientِ systemd اجرا می‌کند |
+| `core` | تونلِ رمزنگاری‌شدهٔ هسته (`udp`/`tcp`/`raw`/`ws`/`dns`) — با پنل کانفیگ می‌شود، هسته را زیرِ یونیتِ transientِ systemd اجرا می‌کند |
 | kernel | VXLAN · GRE · SIT · IPIP · L2TPv3 · FOU · IPsec (ESPِ کلیدِ ثابت، بدونِ IKE) |
 | forward | پورت‌فورواردِ TCP+UDP با چرخشِ چند مقصد + شمارشِ ماندگارِ ترافیک |
 

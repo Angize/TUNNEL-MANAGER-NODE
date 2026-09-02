@@ -595,13 +595,10 @@ def _core_config(cfg):
     transport = str(cfg.get("transport") or "udp").lower()
     raw_profile = str(cfg.get("raw_profile") or "bare").lower()
     obfs = bool(cfg.get("obfs")) and crypto_on
-    flux_carrier = str(cfg.get("flux_carrier") or "udp").lower()
     if transport == "raw":
         outer = 20 + RAW_HEADER_LEN.get(raw_profile, 0)
     elif transport == "spoof":
         outer = 20
-    elif transport == "flux":
-        outer = 20 + (8 + 20 + 12 + 4 + 3 if flux_carrier == "stun" else 8)
     elif transport == "ws":
         outer = 40 + 14
     else:
@@ -614,7 +611,7 @@ def _core_config(cfg):
     overhead = outer + framing
     if crypto_on:
         overhead += (40 if cipher == "xchacha20-poly1305" else 28) + 12
-    if transport in ("udp", "raw", "flux", "spoof") and bool(cfg.get("fec")):
+    if transport in ("udp", "raw", "spoof") and bool(cfg.get("fec")):
         overhead += 13
     mtu = max(576, base_mtu(cfg.get("iface")) - overhead)
     if transport == "dns":
@@ -642,7 +639,7 @@ def _core_config(cfg):
         if sni:
             corecfg["cover_sni"] = sni
     corecfg["status_path"] = _cfg_path(name, ".status")
-    if transport in ("raw", "flux") and str(cfg.get("role")) == "server":
+    if transport == "raw" and str(cfg.get("role")) == "server":
         _psrc = [str(x).strip() for x in (cfg.get("peer_src_ips") or []) if is_ipv4(str(x).strip())]
         if _psrc:
             corecfg["peer_src_ips"] = _psrc
@@ -698,13 +695,6 @@ def _core_config(cfg):
         corecfg["dns_zone"] = str(cfg.get("dns_zone") or "").strip().lower()
         if cfg.get("role") == "client":
             corecfg["dns_resolvers"] = [str(x).strip() for x in (cfg.get("dns_resolvers") or []) if str(x).strip()]
-    if transport == "flux":
-        corecfg["flux_carrier"] = flux_carrier
-        corecfg["flux_rotate_secs"] = max(10, min(86400, int(cfg.get("flux_rotate_secs") or 600)))
-        corecfg["flux_shape"] = str(cfg.get("flux_shape") or "random").lower()
-        off = int(cfg.get("flux_epoch_offset") or 0)
-        if off:
-            corecfg["flux_epoch_offset"] = off
     if transport == "ws":
         if cfg.get("ws_host"):
             corecfg["ws_host"] = str(cfg["ws_host"])
@@ -754,7 +744,7 @@ def _core_config(cfg):
                                          "path": str(s.get("path") or "").strip()} for s in snis]
                 _wrs = cfg.get("ws_rotate_secs")
                 corecfg["ws_rotate_secs"] = 600 if _wrs is None else max(0, min(28800, int(_wrs)))
-    if transport in ("udp", "raw", "flux", "spoof") and bool(cfg.get("fec")):
+    if transport in ("udp", "raw", "spoof") and bool(cfg.get("fec")):
         corecfg["fec"] = True
         corecfg["fec_data"] = int(cfg.get("fec_data") or 10)
         corecfg["fec_parity"] = int(cfg.get("fec_parity") or 3)
@@ -772,13 +762,13 @@ def _core_config(cfg):
             if spoof_dst:
                 corecfg["spoof_dst_ip"] = spoof_dst
             corecfg["real_peer_ip"] = cfg["remote_ip"]
-    if transport in ("raw", "flux", "spoof", "tcp", "ws") and cfg.get("role") == "client" and bool(cfg.get("fake_desync")):
+    if transport in ("raw", "spoof", "tcp", "ws") and cfg.get("role") == "client" and bool(cfg.get("fake_desync")):
         corecfg["fake_desync"] = True
         corecfg["fake_ttl"] = max(1, min(255, int(cfg.get("fake_ttl") or 4)))
         corecfg["fake_count"] = max(1, min(64, int(cfg.get("fake_count") or 2)))
         mode = str(cfg.get("fake_mode") or "ttl").strip().lower()
         corecfg["fake_mode"] = mode if mode in ("ttl", "badsum", "both") else "ttl"
-    if transport in ("udp", "tcp", "raw", "flux") and str(cfg.get("role")) == "client":
+    if transport in ("udp", "tcp", "raw") and str(cfg.get("role")) == "client":
         ordered = _ordered_pool(str(cfg.get("remote_ip") or ""), cfg.get("peer_ips"))
         if len(ordered) >= 2:
             corecfg["peer_ips"] = [f"{ip}:{port}" if transport in ("udp", "tcp") else ip for ip in ordered]
@@ -1998,7 +1988,7 @@ def op_tunnel(d):
             raise ValueError("bad core cipher")
         obj["cipher"] = cipher
         transport = str(d.get("transport") or "udp").strip().lower()
-        if transport not in ("udp", "tcp", "raw", "flux", "spoof", "ws", "dns"):
+        if transport not in ("udp", "tcp", "raw", "spoof", "ws", "dns"):
             raise ValueError("bad core transport")
         obj["transport"] = transport
 
@@ -2180,21 +2170,7 @@ def op_tunnel(d):
                 raise ValueError("bad raw_proto")
             if rproto:
                 obj["raw_proto"] = rproto
-        if transport == "flux":
-            carrier = str(d.get("flux_carrier") or "udp").strip().lower()
-            if carrier not in ("udp", "stun"):
-                raise ValueError("bad flux_carrier")
-            obj["flux_carrier"] = carrier
-            rot = int(d.get("flux_rotate_secs") or 600)
-            if rot < 10 or rot > 86400:
-                raise ValueError("flux_rotate_secs out of range (10..86400)")
-            obj["flux_rotate_secs"] = rot
-            shape = str(d.get("flux_shape") or "random").strip().lower()
-            if shape not in ("random", "quic", "video", "webrtc"):
-                raise ValueError("bad flux_shape")
-            obj["flux_shape"] = shape
-            obj["flux_epoch_offset"] = int(d.get("flux_epoch_offset") or 0)
-        if transport in ("udp", "raw", "flux", "spoof") and _as_bool(d.get("fec")):
+        if transport in ("udp", "raw", "spoof") and _as_bool(d.get("fec")):
             if obj.get("raw_sport_rotate"):
                 raise ValueError("raw_sport_rotate and fec are exclusive (the FEC send path snapshots the source port)")
             obj["fec"] = True
@@ -2204,7 +2180,7 @@ def op_tunnel(d):
                 raise ValueError("fec_data/fec_parity out of range (>=1, sum<=255)")
             obj["fec_data"] = fd
             obj["fec_parity"] = fp
-        if transport in ("udp", "tcp", "raw", "flux") and role == "client":
+        if transport in ("udp", "tcp", "raw") and role == "client":
             pips = _clean_pool("peer_ips")
             sips = _clean_pool("src_ips")
             if pips or sips:
@@ -2220,7 +2196,7 @@ def op_tunnel(d):
                 lips = _clean_pool("listen_ips")
                 if lips:
                     obj["listen_ips"] = lips
-        if transport in ("raw", "flux") and role == "server":
+        if transport == "raw" and role == "server":
             psrc = _clean_pool("peer_src_ips")
             if psrc:
                 obj["peer_src_ips"] = psrc
@@ -2233,8 +2209,6 @@ def op_tunnel(d):
         if obfs and (not psk or cipher == "none"):
             raise ValueError("obfs requires a psk and encryption")
         obj["obfs"] = obfs
-        if transport == "flux" and (not psk or cipher == "none"):
-            raise ValueError("flux requires a psk and encryption")
         if transport == "raw" and (not psk or cipher == "none"):
             raise ValueError("ترنسپورت raw به رمزنگاری (psk) نیاز دارد — هر فریم با AEAD رمز و احراز می‌شود")
         if transport == "spoof" and (not psk or cipher == "none"):
@@ -2250,8 +2224,8 @@ def op_tunnel(d):
         if _as_bool(d.get("gso")):
             obj["gso"] = True
         if _as_bool(d.get("fake_desync")):
-            if transport not in ("raw", "flux", "spoof", "tcp", "ws"):
-                raise ValueError("fake_desync is supported on the raw, flux, spoof, tcp and ws carriers (not udp)")
+            if transport not in ("raw", "spoof", "tcp", "ws"):
+                raise ValueError("fake_desync is supported on the raw, spoof, tcp and ws carriers (not udp)")
             obj["fake_desync"] = True
             ttl = int(d.get("fake_ttl") or 4)
             if ttl < 1 or ttl > 255:
