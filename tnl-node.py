@@ -2190,6 +2190,8 @@ def op_tunnel(d):
             obj["flux_shape"] = shape
             obj["flux_epoch_offset"] = int(d.get("flux_epoch_offset") or 0)
         if transport in ("udp", "raw", "flux", "spoof") and _as_bool(d.get("fec")):
+            if obj.get("raw_sport_rotate"):
+                raise ValueError("raw_sport_rotate and fec are exclusive (the FEC send path snapshots the source port)")
             obj["fec"] = True
             fd = int(d.get("fec_data") or 10)
             fp = int(d.get("fec_parity") or 3)
