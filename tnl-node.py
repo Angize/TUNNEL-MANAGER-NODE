@@ -668,6 +668,12 @@ def _core_config(cfg):
             corecfg["raw_sport_random"] = True
         elif raw_profile in ("udp", "tcp") and 1 <= _rsport <= 65535:
             corecfg["raw_sport"] = _rsport
+        try:
+            _rrot = int(cfg.get("raw_sport_rotate") or 0)
+        except (TypeError, ValueError):
+            _rrot = 0
+        if raw_profile == "udp" and 1 <= _rrot <= 64:
+            corecfg["raw_sport_rotate"] = _rrot
     try:
         _ptries = int(cfg.get("port_tries") or 0)
     except (TypeError, ValueError):
@@ -2143,6 +2149,15 @@ def op_tunnel(d):
                     obj["raw_sport_random"] = True
                 elif rsport:
                     obj["raw_sport"] = rsport
+                rrot = int(d.get("raw_sport_rotate") or 0)
+                if rrot and profile != "udp":
+                    raise ValueError("raw_sport_rotate is the udp profile only")
+                if rrot and not (1 <= rrot <= 64):
+                    raise ValueError("bad raw_sport_rotate")
+                if rrot and (rsport or _as_bool(d.get("raw_sport_random"))):
+                    raise ValueError("raw_sport_rotate excludes raw_sport and raw_sport_random")
+                if rrot:
+                    obj["raw_sport_rotate"] = rrot
         ptries = int(d.get("port_tries") or 0)
         if ptries and not (1 <= ptries <= 50):
             raise ValueError("bad port_tries")
