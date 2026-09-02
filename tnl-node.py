@@ -1914,6 +1914,7 @@ def op_list(d):
         hc = dict(_health_cache)
     pools = {}
     sports = {}
+    rots = {}
     for c in cfgs:
         nm = c.get("name") or ""
         if not nm:
@@ -1926,8 +1927,12 @@ def op_list(d):
             pools[nm] = {"dst": dst, "src": src}
         if st["path"]["sport"]:
             sports[nm] = st["path"]["sport"]
+        elif st["rot"]["sport"]:
+            sports[nm] = st["rot"]["sport"]
+        if st["rot"]["every"]:
+            rots[nm] = st["rot"]
     return {"configs": cfgs, "health": {c["name"]: hc.get(c["name"], {"up": None}) for c in cfgs},
-            "pools": pools, "sports": sports}
+            "pools": pools, "sports": sports, "rots": rots}
 
 
 def op_tunnel(d):
@@ -2617,6 +2622,7 @@ def _port_or_zero(v):
 def _read_status(name):
     empty = {"active": "", "epoch": 0, "ready": False, "health": [], "events": [], "ts": 0,
              "pair": {"low": "", "high": "", "low_kind": "", "high_kind": ""},
+             "rot": {"sport": 0, "every": 0, "lo": 0, "hi": 0, "drawn": 0},
              "path": {"src": "", "sport": 0, "dst": "", "dport": 0}}
     try:
         with open(_cfg_path(name, ".status")) as f:
@@ -2643,12 +2649,17 @@ def _read_status(name):
                        "detail": str(e.get("detail") or "")})
     pair = st.get("pair") if isinstance(st.get("pair"), dict) else {}
     pk = st.get("path") if isinstance(st.get("path"), dict) else {}
+    rt = st.get("rot") if isinstance(st.get("rot"), dict) else {}
     return {"active": str(st.get("active") or ""), "epoch": int(st.get("epoch") or 0),
             "ready": bool(st.get("ready")), "health": health, "events": events,
             "ts": int(st.get("ts") or 0),
             "pair": {"low": str(pair.get("low") or ""), "high": str(pair.get("high") or ""),
                      "low_kind": str(pair.get("low_kind") or ""),
                      "high_kind": str(pair.get("high_kind") or "")},
+            "rot": {"sport": _port_or_zero(rt.get("sport")),
+                    "every": max(0, min(64, int(rt.get("every") or 0))),
+                    "lo": _port_or_zero(rt.get("lo")), "hi": _port_or_zero(rt.get("hi")),
+                    "drawn": max(0, int(rt.get("drawn") or 0))},
             "path": {"src": str(pk.get("src") or ""), "sport": _port_or_zero(pk.get("sport")),
                      "dst": str(pk.get("dst") or ""), "dport": _port_or_zero(pk.get("dport"))}}
 
