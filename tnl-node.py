@@ -1051,6 +1051,12 @@ def _ipt_add_missing(table, chain, rule):
         run(["iptables", "-t", table, "-A", chain] + rule)
 
 
+def _ipt_ins_missing(table, chain, rule):
+    rc, _, _ = run(["iptables", "-t", table, "-C", chain] + rule)
+    if rc != 0:
+        run(["iptables", "-t", table, "-I", chain, "1"] + rule)
+
+
 def _ipt_del_all(table, chain, rule, tries=64):
     for _ in range(tries):
         rc, _, _ = run(["iptables", "-t", table, "-C", chain] + rule)
@@ -2568,6 +2574,157 @@ def _port_busy(port, proto, ip=None):
     return _port_busy_proc(port, proto, tip), ""
 
 
+SPEED_CHUNK = 1 << 16
+SPEED_MAX_SECS = 30
+SPEED_MAX_STREAMS = 8
+SPEED_ZERO = bytes(SPEED_CHUNK)
+
+
+def _tun_ip4(name):
+    rc, out, _ = run(["ip", "-o", "-4", "addr", "show", name])
+    m = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", out) if rc == 0 else None
+    if not m:
+        raise ValueError("interface %s has no IPv4 address" % name)
+    return m.group(1)
+
+
+def _speed_rule(name, ip, port):
+    return ["-i", name, "-p", "tcp", "-d", ip, "--dport", str(port),
+            "-m", "comment", "--comment", RULE_OWNER_PREFIX + name, "-j", "ACCEPT"]
+
+
+def _speed_conn(c, secs):
+    try:
+        c.settimeout(secs + 15)
+        mode = c.recv(1)
+        if mode == b"U":
+            got = 0
+            while True:
+                b = c.recv(SPEED_CHUNK)
+                if not b:
+                    break
+                got += len(b)
+            c.sendall(struct.pack(">Q", got))
+        elif mode == b"D":
+            end = time.time() + secs
+            while time.time() < end:
+                c.sendall(SPEED_ZERO)
+    except (OSError, struct.error):
+        pass
+    finally:
+        try:
+            c.close()
+        except OSError:
+            pass
+
+
+def _speed_serve(s, rule, secs):
+    end = time.time() + secs * 2 + 30
+    s.settimeout(2.0)
+    try:
+        while time.time() < end:
+            try:
+                c, _ = s.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            threading.Thread(target=_speed_conn, args=(c, secs), daemon=True).start()
+    finally:
+        try:
+            s.close()
+        except OSError:
+            pass
+        _ipt_del_all("filter", "INPUT", rule)
+
+
+def _speed_dir(mode, ip, port, src, secs, streams):
+    got = [0] * streams
+    span = [None] * streams
+
+    def one(i):
+        try:
+            c = socket.create_connection((ip, port), timeout=10, source_address=(src, 0))
+        except OSError:
+            return
+        try:
+            c.settimeout(secs + 15)
+            c.sendall(mode)
+            t0 = time.time()
+            end = t0 + secs
+            if mode == b"U":
+                while time.time() < end:
+                    c.sendall(SPEED_ZERO)
+                span[i] = (t0, time.time())
+                c.shutdown(socket.SHUT_WR)
+                head = b""
+                while len(head) < 8:
+                    b = c.recv(8 - len(head))
+                    if not b:
+                        return
+                    head += b
+                got[i] = struct.unpack(">Q", head)[0]
+            else:
+                while time.time() < end:
+                    b = c.recv(SPEED_CHUNK)
+                    if not b:
+                        break
+                    got[i] += len(b)
+                span[i] = (t0, time.time())
+        except (OSError, struct.error):
+            pass
+        finally:
+            try:
+                c.close()
+            except OSError:
+                pass
+
+    th = [threading.Thread(target=one, args=(i,)) for i in range(streams)]
+    for x in th:
+        x.start()
+    for x in th:
+        x.join(secs + 30)
+    live = [s for s in span if s]
+    if not live:
+        return 0.0, 0
+    el = max(0.001, max(b for _, b in live) - min(a for a, _ in live))
+    return round(sum(got) * 8 / 1e6 / el, 1), len(live)
+
+
+def op_speedtest(d):
+    name = str(d.get("name") or "")
+    if not NAME_RE.match(name):
+        raise ValueError("bad name")
+    secs = min(SPEED_MAX_SECS, max(3, int(d.get("secs") or 8)))
+    mode = str(d.get("mode") or "")
+    if mode == "serve":
+        ip = _tun_ip4(name)
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind((ip, 0))
+        s.listen(SPEED_MAX_STREAMS * 2)
+        port = s.getsockname()[1]
+        rule = _speed_rule(name, ip, port)
+        _ipt_ins_missing("filter", "INPUT", rule)
+        threading.Thread(target=_speed_serve, args=(s, rule, secs), daemon=True).start()
+        return {"ok": True, "ip": ip, "port": port, "secs": secs}
+    if mode == "run":
+        ip = str(d.get("peer_ip") or "")
+        port = int(d.get("port") or 0)
+        if not is_ipv4(ip) or not 1 <= port <= 65535:
+            raise ValueError("bad peer")
+        streams = min(SPEED_MAX_STREAMS, max(1, int(d.get("streams") or 4)))
+        src = _tun_ip4(name)
+        up, nup = _speed_dir(b"U", ip, port, src, secs, streams)
+        down, ndown = _speed_dir(b"D", ip, port, src, secs, streams)
+        if not nup and not ndown:
+            raise ValueError("nothing reached %s:%d over %s -- the far end is not listening or the "
+                             "tunnel is not carrying" % (ip, port, name))
+        return {"ok": True, "secs": secs, "streams": streams, "up_mbit": up, "down_mbit": down,
+                "up_streams": nup, "down_streams": ndown}
+    raise ValueError("bad mode")
+
+
 def op_portcheck(d):
     _require(d, ["port"])
     try:
@@ -3267,7 +3424,7 @@ def op_kernel_tune(d):
 OPS = {"ping": op_ping, "list": op_list, "check": op_check, "tunnel": op_tunnel,
        "portfw": op_portfw, "portfw-edit": op_portfw_edit, "portfw-next": op_portfw_next,
        "delete": op_delete, "apply": op_apply, "update": op_update, "wipe": op_wipe,
-       "portcheck": op_portcheck, "edge-status": op_edge_status,
+       "portcheck": op_portcheck, "speedtest": op_speedtest, "edge-status": op_edge_status,
        "peer-status": op_peer_status,
        "peer-select": op_peer_select, "pool-select": op_pool_select, "retest-now": op_retest_now,
        "ech-update": op_ech_update,
@@ -3283,7 +3440,7 @@ READ_ONLY = {"ping", "list", "check", "portcheck", "spoof-probe", "edge-status",
 WIRE = {
     "pg": "ping", "ls": "list", "ck": "check", "mk": "tunnel", "dl": "delete", "ap": "apply",
     "up": "update", "wz": "wipe", "pf": "portfw", "pe": "portfw-edit", "pn": "portfw-next",
-    "pc": "portcheck", "es": "edge-status", "ps": "peer-status", "pl": "peer-select",
+    "pc": "portcheck", "sd": "speedtest", "es": "edge-status", "ps": "peer-status", "pl": "peer-select",
     "qs": "pool-select", "rt": "retest-now", "eu": "ech-update",
     "cp": "core-put", "ca": "core-apply", "sp": "spoof-probe", "sl": "spoof-egress-listen", "ss": "spoof-egress-send",
     "sr": "spoof-egress-result", "sk": "set-update-key", "kt": "kernel-tune", "le": "link-enable",
