@@ -671,6 +671,12 @@ def _core_config(cfg):
             _rrot = 0
         if raw_profile == "udp" and 1 <= _rrot <= 64:
             corecfg["raw_sport_rotate"] = _rrot
+            try:
+                _rdp = int(cfg.get("raw_dports") or 0)
+            except (TypeError, ValueError):
+                _rdp = 0
+            if 1 <= _rdp <= 8:
+                corecfg["raw_dports"] = _rdp
     try:
         _ptries = int(cfg.get("port_tries") or 0)
     except (TypeError, ValueError):
@@ -2153,6 +2159,13 @@ def op_tunnel(d):
                     raise ValueError("raw_sport_rotate excludes raw_sport and raw_sport_random")
                 if rrot:
                     obj["raw_sport_rotate"] = rrot
+                rdp = int(d.get("raw_dports") or 0)
+                if rdp and not rrot:
+                    raise ValueError("raw_dports needs raw_sport_rotate")
+                if rdp and not (1 <= rdp <= 8):
+                    raise ValueError("bad raw_dports")
+                if rdp:
+                    obj["raw_dports"] = rdp
         ptries = int(d.get("port_tries") or 0)
         if ptries and not (1 <= ptries <= 50):
             raise ValueError("bad port_tries")
@@ -2596,7 +2609,7 @@ def _port_or_zero(v):
 def _read_status(name):
     empty = {"active": "", "epoch": 0, "ready": False, "health": [], "events": [], "ts": 0,
              "pair": {"low": "", "high": "", "low_kind": "", "high_kind": ""},
-             "rot": {"sport": 0, "every": 0, "lo": 0, "hi": 0, "drawn": 0},
+             "rot": {"sport": 0, "dport": 0, "dports": 0, "every": 0, "lo": 0, "hi": 0, "drawn": 0},
              "path": {"src": "", "sport": 0, "dst": "", "dport": 0}}
     try:
         with open(_cfg_path(name, ".status")) as f:
@@ -2631,6 +2644,8 @@ def _read_status(name):
                      "low_kind": str(pair.get("low_kind") or ""),
                      "high_kind": str(pair.get("high_kind") or "")},
             "rot": {"sport": _port_or_zero(rt.get("sport")),
+                    "dport": _port_or_zero(rt.get("dport")),
+                    "dports": max(0, min(8, int(rt.get("dports") or 0))),
                     "every": max(0, min(64, int(rt.get("every") or 0))),
                     "lo": _port_or_zero(rt.get("lo")), "hi": _port_or_zero(rt.get("hi")),
                     "drawn": max(0, int(rt.get("drawn") or 0))},
