@@ -540,7 +540,7 @@ def _core_port(cfg):
 
 RAW_HEADER_LEN = {"bare": 0, "ipip": 0, "etherip": 2, "ipcomp": 4, "gre": 4, "icmp": 8, "udp": 8,
                   "esp": 8, "l2tpv3": 8, "tcp": 32, "ah": 24}
-MAX_WORKERS = 4
+MAX_WORKERS = 8
 QUEUEING_TRANSPORTS = ("raw", "udp")
 
 _TUNING_INT_KEYS = ("dead_retest_secs",
