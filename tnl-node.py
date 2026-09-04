@@ -542,6 +542,7 @@ RAW_HEADER_LEN = {"bare": 0, "ipip": 0, "etherip": 2, "ipcomp": 4, "gre": 4, "ic
                   "esp": 8, "l2tpv3": 8, "tcp": 32, "ah": 24}
 MAX_WORKERS = 8
 MAX_SPROT_EVERY = 60
+MAX_PORT_TRIES = 60
 QUEUEING_TRANSPORTS = ("raw", "udp")
 
 _TUNING_INT_KEYS = ("dead_retest_secs",
@@ -680,7 +681,7 @@ def _core_config(cfg):
         _ptries = int(cfg.get("port_tries") or 0)
     except (TypeError, ValueError):
         _ptries = 0
-    if 1 <= _ptries <= 50:
+    if 1 <= _ptries <= MAX_PORT_TRIES:
         corecfg["port_tries"] = _ptries
     if transport in QUEUEING_TRANSPORTS:
         try:
@@ -2153,7 +2154,7 @@ def op_tunnel(d):
                 if rdp:
                     obj["raw_dports"] = rdp
         ptries = int(d.get("port_tries") or 0)
-        if ptries and not (1 <= ptries <= 50):
+        if ptries and not (1 <= ptries <= MAX_PORT_TRIES):
             raise ValueError("bad port_tries")
         if ptries:
             obj["port_tries"] = ptries
