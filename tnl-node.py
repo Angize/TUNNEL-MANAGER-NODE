@@ -541,6 +541,7 @@ def _core_port(cfg):
 RAW_HEADER_LEN = {"bare": 0, "ipip": 0, "etherip": 2, "ipcomp": 4, "gre": 4, "icmp": 8, "udp": 8,
                   "esp": 8, "l2tpv3": 8, "tcp": 32, "ah": 24}
 MAX_WORKERS = 8
+MAX_SPROT_EVERY = 60
 QUEUEING_TRANSPORTS = ("raw", "udp")
 
 _TUNING_INT_KEYS = ("dead_retest_secs",
@@ -2159,7 +2160,7 @@ def op_tunnel(d):
                 rrot = int(d.get("raw_sport_rotate") or 0)
                 if rrot and profile != "udp":
                     raise ValueError("raw_sport_rotate is the udp profile only")
-                if rrot and not (1 <= rrot <= 64):
+                if rrot and not (1 <= rrot <= MAX_SPROT_EVERY):
                     raise ValueError("bad raw_sport_rotate")
                 if rrot and (rsport or _as_bool(d.get("raw_sport_random"))):
                     raise ValueError("raw_sport_rotate excludes raw_sport and raw_sport_random")
