@@ -598,8 +598,6 @@ def _core_config(cfg):
     obfs = bool(cfg.get("obfs")) and crypto_on
     if transport == "raw":
         outer = 20 + RAW_HEADER_LEN.get(raw_profile, 0)
-    elif transport == "spoof":
-        outer = 20
     elif transport == "ws":
         outer = 40 + 14
     else:
@@ -612,7 +610,7 @@ def _core_config(cfg):
     overhead = outer + framing
     if crypto_on:
         overhead += (40 if cipher == "xchacha20-poly1305" else 28) + 12
-    if transport in ("udp", "raw", "spoof") and bool(cfg.get("fec")):
+    if transport in ("udp", "raw") and bool(cfg.get("fec")):
         overhead += 13
     mtu = max(576, base_mtu(cfg.get("iface")) - overhead)
     if transport == "dns":
@@ -691,13 +689,6 @@ def _core_config(cfg):
             _wk = 0
         if 2 <= _wk <= MAX_WORKERS and not bool(cfg.get("fec")):
             corecfg["workers"] = _wk
-    if transport == "spoof":
-        try:
-            _rp = int(cfg.get("raw_proto") or 0)
-        except (TypeError, ValueError):
-            _rp = 0
-        if 1 <= _rp <= 255:
-            corecfg["raw_proto"] = _rp
     if transport == "dns":
         corecfg["dns_zone"] = str(cfg.get("dns_zone") or "").strip().lower()
         if cfg.get("role") == "client":
@@ -751,25 +742,13 @@ def _core_config(cfg):
                                          "path": str(s.get("path") or "").strip()} for s in snis]
                 _wrs = cfg.get("ws_rotate_secs")
                 corecfg["ws_rotate_secs"] = 600 if _wrs is None else max(0, min(28800, int(_wrs)))
-    if transport in ("udp", "raw", "spoof") and bool(cfg.get("fec")):
+    if transport in ("udp", "raw") and bool(cfg.get("fec")):
         corecfg["fec"] = True
         corecfg["fec_data"] = int(cfg.get("fec_data") or 10)
         corecfg["fec_parity"] = int(cfg.get("fec_parity") or 3)
     if bool(cfg.get("gso")):
         corecfg["gso"] = True
-    if transport == "spoof" and crypto_on:
-        spoof_src = str(cfg.get("spoof_src") or "").strip()
-        spoof_dst = str(cfg.get("spoof_dst") or "").strip()
-        if cfg.get("role") == "client":
-            if spoof_src:
-                corecfg["spoof_src_ip"] = spoof_src
-            if spoof_dst:
-                corecfg["spoof_dst_ip"] = spoof_dst
-        else:
-            if spoof_dst:
-                corecfg["spoof_dst_ip"] = spoof_dst
-            corecfg["real_peer_ip"] = cfg["remote_ip"]
-    if transport in ("raw", "spoof", "tcp", "ws") and cfg.get("role") == "client" and bool(cfg.get("fake_desync")):
+    if transport in ("raw", "tcp", "ws") and cfg.get("role") == "client" and bool(cfg.get("fake_desync")):
         corecfg["fake_desync"] = True
         corecfg["fake_ttl"] = max(1, min(255, int(cfg.get("fake_ttl") or 4)))
         corecfg["fake_count"] = max(1, min(64, int(cfg.get("fake_count") or 2)))
@@ -2001,7 +1980,7 @@ def op_tunnel(d):
             raise ValueError("bad core cipher")
         obj["cipher"] = cipher
         transport = str(d.get("transport") or "udp").strip().lower()
-        if transport not in ("udp", "tcp", "raw", "spoof", "ws", "dns"):
+        if transport not in ("udp", "tcp", "raw", "ws", "dns"):
             raise ValueError("bad core transport")
         obj["transport"] = transport
 
@@ -2184,13 +2163,7 @@ def op_tunnel(d):
                 raise ValueError("bad workers")
             if wk > 1:
                 obj["workers"] = wk
-        if transport == "spoof":
-            rproto = int(d.get("raw_proto") or 0)
-            if rproto and not (1 <= rproto <= 255):
-                raise ValueError("bad raw_proto")
-            if rproto:
-                obj["raw_proto"] = rproto
-        if transport in ("udp", "raw", "spoof") and _as_bool(d.get("fec")):
+        if transport in ("udp", "raw") and _as_bool(d.get("fec")):
             if obj.get("raw_sport_rotate"):
                 raise ValueError("raw_sport_rotate and fec are exclusive (the FEC send path snapshots the source port)")
             obj["fec"] = True
@@ -2231,8 +2204,6 @@ def op_tunnel(d):
         obj["obfs"] = obfs
         if transport == "raw" and (not psk or cipher == "none"):
             raise ValueError("ترنسپورت raw به رمزنگاری (psk) نیاز دارد — هر فریم با AEAD رمز و احراز می‌شود")
-        if transport == "spoof" and (not psk or cipher == "none"):
-            raise ValueError("ترنسپورت spoof به رمزنگاری (psk) نیاز دارد — هر فریمِ هدرجعلی با AEAD احراز می‌شود")
         if _as_bool(d.get("cover")) and transport == "tcp":
             obj["cover"] = True
             sni = str(d.get("cover_sni") or "").strip()
@@ -2244,8 +2215,8 @@ def op_tunnel(d):
         if _as_bool(d.get("gso")):
             obj["gso"] = True
         if _as_bool(d.get("fake_desync")):
-            if transport not in ("raw", "spoof", "tcp", "ws"):
-                raise ValueError("fake_desync is supported on the raw, spoof, tcp and ws carriers (not udp)")
+            if transport not in ("raw", "tcp", "ws"):
+                raise ValueError("fake_desync is supported on the raw, tcp and ws carriers (not udp)")
             obj["fake_desync"] = True
             ttl = int(d.get("fake_ttl") or 4)
             if ttl < 1 or ttl > 255:
@@ -2259,19 +2230,6 @@ def op_tunnel(d):
             if mode not in ("ttl", "badsum", "both"):
                 raise ValueError("bad fake_mode")
             obj["fake_mode"] = mode
-        if transport == "spoof":
-            ss = str(d.get("spoof_src") or "").strip()
-            sd = str(d.get("spoof_dst") or "").strip()
-            if ss:
-                if not is_ipv4(ss):
-                    raise ValueError("bad spoof_src")
-                obj["spoof_src"] = ss
-            if sd:
-                if not is_ipv4(sd):
-                    raise ValueError("bad spoof_dst")
-                obj["spoof_dst"] = sd
-            if not ss and not sd:
-                raise ValueError("ترنسپورت spoof حداقل به یکی از spoof_src / spoof_dst نیاز دارد")
     if old and old.get("type") != "portfw":
         teardown_config(old)
     write_config(name, obj)
@@ -3190,198 +3148,6 @@ def op_update(d):
     return {"ok": True, "version": int(m.group(1)) if m else None, "sha256": h, "restarting": True}
 
 
-def op_spoof_probe(d):
-    try:
-        _ensure_core()
-    except Exception as e:
-        return {"ok": False, "reason": "core binary unavailable on this node: %s" % e}
-    rc, out, err = run([CORE_BIN, "--probe-spoof"], timeout=15)
-    if rc != 0:
-        return {"ok": False, "reason": (err or out or "probe failed").strip()}
-    try:
-        p = json.loads(out.strip())
-    except Exception:
-        return {"ok": False, "reason": "unreadable probe output"}
-    p.setdefault("ok", False)
-    return p
-
-
-_EGRESS = {}
-_EGRESS_LOCK = threading.Lock()
-_EGRESS_MAX = 32
-_PROBE_TAGS = (b"BAS", b"SRC", b"DST")
-
-
-def _egress_checksum(b):
-    if len(b) % 2:
-        b += b"\x00"
-    s = 0
-    for i in range(0, len(b), 2):
-        s += (b[i] << 8) | b[i + 1]
-    while s >> 16:
-        s = (s & 0xffff) + (s >> 16)
-    return (~s) & 0xffff
-
-
-def _egress_build_ip4(src, dst, proto, payload, ttl=64):
-    total = 20 + len(payload)
-    h = bytearray(total)
-    h[0] = 0x45
-    struct.pack_into("!H", h, 2, total)
-    h[8] = ttl
-    h[9] = proto
-    h[12:16] = socket.inet_aton(src)
-    h[16:20] = socket.inet_aton(dst)
-    struct.pack_into("!H", h, 10, _egress_checksum(bytes(h[:20])))
-    h[20:] = payload
-    return bytes(h)
-
-
-def _egress_payload(tag, nonce):
-    return tag + nonce.encode("ascii", "ignore")[:32]
-
-
-def _egress_route_local(peer):
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            s.connect((peer, 9))
-            ip = s.getsockname()[0]
-        finally:
-            s.close()
-        return ip if is_ipv4(ip) else None
-    except OSError:
-        return None
-
-
-def op_spoof_egress_listen(d):
-    nonce = str(d.get("nonce") or "").strip()
-    if not re.match(r"^[0-9a-f]{8,32}$", nonce):
-        raise ValueError("bad nonce")
-    proto = int(d.get("proto") or 253)
-    if not 1 <= proto <= 255:
-        raise ValueError("bad proto")
-    decoy = str(d.get("decoy") or "").strip()
-    if decoy and not is_ipv4(decoy):
-        raise ValueError("bad decoy")
-    window = min(20, max(2, int(d.get("window") or 8)))
-    token = secrets.token_hex(8)
-
-    def capture():
-        saw = {"baseline": False, "src": False, "dst": False}
-        observed = {}
-        fd = None
-        try:
-            fd = socket.socket(socket.AF_PACKET, socket.SOCK_DGRAM, socket.htons(0x0800))
-            fd.settimeout(1.0)
-            end = time.time() + window
-            nb = nonce.encode("ascii")
-            while time.time() < end:
-                try:
-                    pkt, addr = fd.recvfrom(2048)
-                except socket.timeout:
-                    continue
-                except OSError:
-                    break
-                if len(addr) >= 3 and addr[2] == 4:
-                    continue
-                if len(pkt) < 20 or (pkt[0] >> 4) != 4 or pkt[9] != proto:
-                    continue
-                ihl = (pkt[0] & 0x0f) * 4
-                body = pkt[ihl:ihl + 3 + len(nb)]
-                if len(body) < 3 + len(nb) or body[3:3 + len(nb)] != nb:
-                    continue
-                tag = body[:3]
-                src = socket.inet_ntoa(pkt[12:16])
-                dst = socket.inet_ntoa(pkt[16:20])
-                if tag == b"BAS":
-                    saw["baseline"] = True
-                elif tag == b"SRC":
-                    saw["src"] = True
-                    observed["src_seen_from"] = src
-                elif tag == b"DST" and (not decoy or dst == decoy):
-                    saw["dst"] = True
-                    observed["dst_seen"] = dst
-                if saw["baseline"] and saw["src"] and (saw["dst"] or not decoy):
-                    break
-        except OSError as e:
-            observed["error"] = str(e)
-        finally:
-            if fd is not None:
-                fd.close()
-            with _EGRESS_LOCK:
-                _EGRESS[token] = {"done": True, "saw": saw, "observed": observed}
-
-    with _EGRESS_LOCK:
-        if len(_EGRESS) >= _EGRESS_MAX:
-            for k in [k for k, v in list(_EGRESS.items()) if v.get("done")][: _EGRESS_MAX // 2]:
-                _EGRESS.pop(k, None)
-        _EGRESS[token] = {"done": False}
-    threading.Thread(target=capture, daemon=True).start()
-    return {"ok": True, "token": token, "window": window}
-
-
-def op_spoof_egress_send(d):
-    nonce = str(d.get("nonce") or "").strip()
-    if not re.match(r"^[0-9a-f]{8,32}$", nonce):
-        raise ValueError("bad nonce")
-    proto = int(d.get("proto") or 253)
-    if not 1 <= proto <= 255:
-        raise ValueError("bad proto")
-    peer = str(d.get("peer") or "").strip()
-    if not is_ipv4(peer):
-        raise ValueError("bad peer")
-    real_src = str(d.get("real_src") or "").strip()
-    if not real_src:
-        real_src = _egress_route_local(peer) or ""
-    if not real_src or real_src not in local_ips_flat():
-        raise ValueError("real_src must be one of this node's own IPs (route-local lookup failed)")
-    forged_src = str(d.get("forged_src") or "").strip()
-    if forged_src and not is_ipv4(forged_src):
-        raise ValueError("bad forged_src")
-    decoy_dst = str(d.get("decoy_dst") or "").strip()
-    if decoy_dst and not is_ipv4(decoy_dst):
-        raise ValueError("bad decoy_dst")
-
-    plan = [("BAS", real_src, peer)]
-    if forged_src:
-        plan.append(("SRC", forged_src, peer))
-    if decoy_dst:
-        plan.append(("DST", real_src, decoy_dst))
-
-    fd = None
-    sent = []
-    try:
-        fd = socket.socket(socket.AF_INET, socket.SOCK_RAW, proto)
-        fd.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
-        fd.settimeout(2.0)
-        sa = (peer, 0)
-        for tag, s, dstip in plan:
-            pkt = _egress_build_ip4(s, dstip, proto, _egress_payload(tag.encode(), nonce))
-            for _ in range(3):
-                try:
-                    fd.sendto(pkt, sa)
-                except OSError as e:
-                    return {"ok": False, "error": "send failed (%s): %s" % (tag, e)}
-                time.sleep(0.05)
-            sent.append(tag.lower())
-    except OSError as e:
-        return {"ok": False, "error": "raw socket: %s (needs root / CAP_NET_RAW)" % e}
-    finally:
-        if fd is not None:
-            fd.close()
-    return {"ok": True, "sent": sent}
-
-
-def op_spoof_egress_result(d):
-    token = str(d.get("token") or "").strip()
-    with _EGRESS_LOCK:
-        r = _EGRESS.get(token)
-    if r is None:
-        return {"ok": False, "error": "unknown or expired token"}
-    return {"ok": True, **r}
-
-
 def op_ech_update(d):
     _require(d, ["name", "snis"])
     name = str(d["name"])
@@ -3430,21 +3196,17 @@ OPS = {"ping": op_ping, "list": op_list, "check": op_check, "tunnel": op_tunnel,
        "peer-select": op_peer_select, "pool-select": op_pool_select, "retest-now": op_retest_now,
        "ech-update": op_ech_update,
        "core-put": op_core_put, "core-apply": op_core_apply,
-       "spoof-probe": op_spoof_probe,
-       "spoof-egress-listen": op_spoof_egress_listen, "spoof-egress-send": op_spoof_egress_send,
-       "spoof-egress-result": op_spoof_egress_result,
        "set-update-key": op_set_update_key,
        "kernel-tune": op_kernel_tune,
        "link-enable": op_link_enable, "core-restart": op_core_restart}
-READ_ONLY = {"ping", "list", "check", "portcheck", "spoof-probe", "edge-status", "peer-status"}
+READ_ONLY = {"ping", "list", "check", "portcheck", "edge-status", "peer-status"}
 
 WIRE = {
     "pg": "ping", "ls": "list", "ck": "check", "mk": "tunnel", "dl": "delete", "ap": "apply",
     "up": "update", "wz": "wipe", "pf": "portfw", "pe": "portfw-edit", "pn": "portfw-next",
     "pc": "portcheck", "sd": "speedtest", "es": "edge-status", "ps": "peer-status", "pl": "peer-select",
     "qs": "pool-select", "rt": "retest-now", "eu": "ech-update",
-    "cp": "core-put", "ca": "core-apply", "sp": "spoof-probe", "sl": "spoof-egress-listen", "ss": "spoof-egress-send",
-    "sr": "spoof-egress-result", "sk": "set-update-key", "kt": "kernel-tune", "le": "link-enable",
+    "cp": "core-put", "ca": "core-apply", "sk": "set-update-key", "kt": "kernel-tune", "le": "link-enable",
     "cr": "core-restart",
 }
 
