@@ -548,7 +548,14 @@ QUEUEING_TRANSPORTS = ("raw", "udp")
 _TUNING_INT_KEYS = ("dead_retest_secs",
                     "min_liveness_secs")
 
+REVIVE_STEP_MIN = 10
+REVIVE_STEP_MAX = 3600
+BACKOFF_STEP_MIN = 1
+BACKOFF_STEP_MAX = 86400
+
 _TUNING_LIST_KEYS = ("suspect_backoff", "ladder_revive")
+_TUNING_LIST_RANGES = {"suspect_backoff": (BACKOFF_STEP_MIN, BACKOFF_STEP_MAX),
+                       "ladder_revive": (REVIVE_STEP_MIN, REVIVE_STEP_MAX)}
 
 
 def _core_tuning(tn):
@@ -562,7 +569,7 @@ def _core_tuning(tn):
             continue
         if v > 0:
             out[k] = v
-    for k in _TUNING_LIST_KEYS:
+    for k, (lo, hi) in _TUNING_LIST_RANGES.items():
         raw = tn.get(k)
         if not isinstance(raw, (list, tuple)):
             continue
@@ -572,7 +579,7 @@ def _core_tuning(tn):
                 iv = int(x)
             except (TypeError, ValueError):
                 continue
-            if iv > 0:
+            if lo <= iv <= hi:
                 steps.append(iv)
         if steps:
             out[k] = steps
