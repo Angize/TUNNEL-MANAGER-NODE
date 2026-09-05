@@ -874,7 +874,7 @@ def _atomic_write_json(path, obj):
 def _core_status_paths(name):
     base = _cfg_path(name, ".status")
     return (base, base + ".verdict", base + ".verdict.taken",
-            base + ".pin", base + ".pin.taken", base + ".echcmd")
+            base + ".select", base + ".select.taken", base + ".echcmd")
 
 
 def _read_core_cfg(name):
@@ -2749,8 +2749,7 @@ def _read_status(name):
         health.append({"key": str(h.get("key")), "kind": str(h.get("kind") or ""),
                        "state": str(h.get("state") or "healthy"),
                        "fails": int(h.get("fails") or 0),
-                       "next_retest_unix": int(h.get("next_retest_unix") or 0),
-                       "pin": bool(h.get("pin"))})
+                       "next_retest_unix": int(h.get("next_retest_unix") or 0)})
     events = []
     for e in (st.get("events") or [])[:64]:
         if not isinstance(e, dict):
@@ -2787,10 +2786,9 @@ def _axis_rows(st, kind):
 
 def _axis_section(st, kind, active):
     rows = _axis_rows(st, kind)
-    pin = next((h["key"] for h in rows if h["pin"]), "")
     return {"active": active, "addrs": [h["key"] for h in rows][:64],
             "health": [{k: h[k] for k in ("key", "state", "fails", "next_retest_unix")} for h in rows],
-            "pin": pin, "ts": st["ts"]}
+            "ts": st["ts"]}
 
 
 def op_peer_status(d):
@@ -2801,10 +2799,10 @@ def op_peer_status(d):
             "src": _axis_section(st, "src", pair["high"] if pair["high_kind"] == "src" else "")}
 
 
-PINBOX_MAX = 64 * 1024
+CMDBOX_MAX = 64 * 1024
 
 
-def _write_pin(name, kind, key, cmd=""):
+def _write_cmd(name, kind, key, cmd=""):
     if not NAME_RE.match(name):
         raise ValueError("bad name")
     key = str(key or "").strip()
@@ -2813,9 +2811,9 @@ def _write_pin(name, kind, key, cmd=""):
     body = {"kind": kind, "key": key}
     if cmd:
         body["cmd"] = cmd
-    path = _cfg_path(name, ".status.pin")
+    path = _cfg_path(name, ".status.select")
     try:
-        if os.path.getsize(path) > PINBOX_MAX:
+        if os.path.getsize(path) > CMDBOX_MAX:
             return {"ok": False, "error": "صفِ فرمان پر است — هستهٔ این تونل فرمان‌ها را برنمی‌دارد"}
     except OSError:
         pass
@@ -2832,7 +2830,7 @@ def op_peer_select(d):
     name = str(d["name"])
     if not _is_peer_pool(name):
         return {"ok": False, "error": "این تونل استخرِ آی‌پی ندارد"}
-    return _write_pin(name, "src" if str(d.get("side")) == "src" else "dst", d.get("key"))
+    return _write_cmd(name, "src" if str(d.get("side")) == "src" else "dst", d.get("key"))
 
 
 def op_pool_select(d):
@@ -2840,7 +2838,7 @@ def op_pool_select(d):
     name = str(d["name"])
     if not _is_ws_pool(name):
         return {"ok": False, "error": "این تونل استخرِ لبه ندارد"}
-    return _write_pin(name, "sni" if str(d.get("kind")) == "sni" else "ip", d.get("key"))
+    return _write_cmd(name, "sni" if str(d.get("kind")) == "sni" else "ip", d.get("key"))
 
 
 def op_retest_now(d):
@@ -2853,7 +2851,7 @@ def op_retest_now(d):
         return {"ok": False, "error": "این تونل استخرِ لبه ندارد"}
     if kind in ("dst", "src") and not _is_peer_pool(name):
         return {"ok": False, "error": "این تونل استخرِ آی‌پی ندارد"}
-    return _write_pin(name, kind, d.get("key"), cmd="retest")
+    return _write_cmd(name, kind, d.get("key"), cmd="retest")
 
 
 CORE_VER_RE = re.compile(r"^(?!.*\.\.)[A-Za-z0-9._-]{1,40}$")

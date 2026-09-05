@@ -36,7 +36,7 @@ def mailbox_keeps_every_command():
     m.CONFIG_DIR = tempfile.mkdtemp()
     m._is_ws_pool = lambda name: True
     m._is_peer_pool = lambda name: True
-    box = m._cfg_path("t1", ".status.pin")
+    box = m._cfg_path("t1", ".status.select")
 
     said = [m.op_pool_select({"name": "t1", "kind": "ip", "key": "1.1.1.1"}),
             m.op_retest_now({"name": "t1", "kind": "ip", "key": "2.2.2.2"}),
@@ -56,9 +56,9 @@ def mailbox_keeps_every_command():
 def mailbox_refuses_when_it_cannot_drain():
     m.CONFIG_DIR = tempfile.mkdtemp()
     m._is_ws_pool = lambda name: True
-    box = m._cfg_path("t2", ".status.pin")
+    box = m._cfg_path("t2", ".status.select")
     with open(box, "w") as f:
-        f.write("x" * (m.PINBOX_MAX + 1))
+        f.write("x" * (m.CMDBOX_MAX + 1))
     r = m.op_pool_select({"name": "t2", "kind": "ip", "key": "1.1.1.1"})
     check("a core that never drains its mailbox is reported, not fed for ever",
           r.get("ok") is False, repr(r))
