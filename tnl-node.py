@@ -1917,9 +1917,7 @@ def op_list(d):
             pools[nm] = {"dst": dst, "src": src}
         if st["path"]["sport"]:
             sports[nm] = st["path"]["sport"]
-        elif st["rot"]["sport"]:
-            sports[nm] = st["rot"]["sport"]
-        if st["rot"]["every"]:
+        if st["rot"]["sport"]:
             rots[nm] = st["rot"]
     return {"configs": cfgs, "health": {c["name"]: hc.get(c["name"], {"up": None}) for c in cfgs},
             "pools": pools, "sports": sports, "rots": rots}
