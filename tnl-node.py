@@ -676,7 +676,7 @@ def _core_config(cfg):
             _rrot = int(cfg.get("raw_sport_rotate") or 0)
         except (TypeError, ValueError):
             _rrot = 0
-        if raw_profile == "udp" and 1 <= _rrot <= 64:
+        if raw_profile in ("udp", "tcp") and 1 <= _rrot <= 64:
             corecfg["raw_sport_rotate"] = _rrot
             try:
                 _rdp = int(cfg.get("raw_dports") or 0)
@@ -2142,22 +2142,23 @@ def op_tunnel(d):
                     obj["raw_sport_random"] = True
                 elif rsport:
                     obj["raw_sport"] = rsport
-                rrot = int(d.get("raw_sport_rotate") or 0)
-                if rrot and profile != "udp":
-                    raise ValueError("raw_sport_rotate is the udp profile only")
-                if rrot and not (1 <= rrot <= MAX_SPROT_EVERY):
-                    raise ValueError("bad raw_sport_rotate")
-                if rrot and (rsport or _as_bool(d.get("raw_sport_random"))):
-                    raise ValueError("raw_sport_rotate excludes raw_sport and raw_sport_random")
-                if rrot:
-                    obj["raw_sport_rotate"] = rrot
-                rdp = int(d.get("raw_dports") or 0)
-                if rdp and not rrot:
-                    raise ValueError("raw_dports needs raw_sport_rotate")
-                if rdp and not (1 <= rdp <= 8):
-                    raise ValueError("bad raw_dports")
-                if rdp:
-                    obj["raw_dports"] = rdp
+            rrot = int(d.get("raw_sport_rotate") or 0)
+            if rrot and profile not in ("udp", "tcp"):
+                raise ValueError("raw_sport_rotate cycles a forged source port, so it needs a profile "
+                                 "that builds one (udp or tcp)")
+            if rrot and not (1 <= rrot <= MAX_SPROT_EVERY):
+                raise ValueError("bad raw_sport_rotate")
+            if rrot and (int(d.get("raw_sport") or 0) or _as_bool(d.get("raw_sport_random"))):
+                raise ValueError("raw_sport_rotate excludes raw_sport and raw_sport_random")
+            if rrot:
+                obj["raw_sport_rotate"] = rrot
+            rdp = int(d.get("raw_dports") or 0)
+            if rdp and not rrot:
+                raise ValueError("raw_dports needs raw_sport_rotate")
+            if rdp and not (1 <= rdp <= 8):
+                raise ValueError("bad raw_dports")
+            if rdp:
+                obj["raw_dports"] = rdp
         ptries = int(d.get("port_tries") or 0)
         if ptries and not (1 <= ptries <= MAX_PORT_TRIES):
             raise ValueError("bad port_tries")
