@@ -131,13 +131,15 @@ def main():
             return 1
         print("SKIP cross-repo check: no core checkout at %s" % CORE)
         rules = {"lo": 1, "hi": mod.MAX_SPROT_EVERY, "needs_ports": True, "excludes_sport": True,
-                 "excludes_random": True, "excludes_fec": True}
+                 "excludes_random": True, "excludes_fec": False}
     else:
         named = [k for k in ("needs_ports", "excludes_sport", "excludes_random", "excludes_fec") if rules[k]]
         print("core rejects: %s; range %d..%d" % (", ".join(named), rules["lo"], rules["hi"]))
-    if not rules["excludes_fec"]:
-        fail("the core no longer rejects fec + raw_sport_rotate — this guard is now watching a rule "
-             "that moved, so either the core learned to rotate under FEC or the check needs updating")
+    if rules["excludes_fec"]:
+        fail("the core refuses fec + raw_sport_rotate again. That pair was measured to WORK: the FEC "
+             "emit path goes through wire(), so the ports cycle, and at 20% loss the combination "
+             "carried 254 Mbit against 132 without FEC. If it is being refused again, say why in the "
+             "core and update this guard, but do not put back the old reason -- it was false.")
 
     with tempfile.TemporaryDirectory() as tmp:
         obj, err = drive(mod, base_req(), tmp)
@@ -169,7 +171,6 @@ def main():
 
         # Every combination the core refuses must be refused here, before a config is written.
         cases = [
-            ("fec", rules["excludes_fec"], base_req(raw_sport_rotate=5, fec=True)),
             ("raw_sport", rules["excludes_sport"], base_req(raw_sport_rotate=5, raw_sport=4500)),
             ("raw_sport_random", rules["excludes_random"], base_req(raw_sport_rotate=5, raw_sport_random=True)),
             ("a profile that forges no ports", rules["needs_ports"],

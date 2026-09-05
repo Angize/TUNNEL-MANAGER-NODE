@@ -2232,8 +2232,6 @@ def op_tunnel(d):
             if wk > 1:
                 obj["workers"] = wk
         if transport in ("udp", "raw") and _as_bool(d.get("fec")):
-            if obj.get("raw_sport_rotate"):
-                raise ValueError("raw_sport_rotate and fec are exclusive (the FEC send path snapshots the source port)")
             obj["fec"] = True
             fd = int(d.get("fec_data") or 10)
             fp = int(d.get("fec_parity") or 3)
