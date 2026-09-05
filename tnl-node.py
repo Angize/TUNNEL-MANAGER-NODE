@@ -752,8 +752,8 @@ def _core_config(cfg):
                 corecfg["ws_rotate_secs"] = 600 if _wrs is None else max(0, min(28800, int(_wrs)))
     if transport in ("udp", "raw") and bool(cfg.get("fec")):
         corecfg["fec"] = True
-        corecfg["fec_data"] = int(cfg.get("fec_data") or 10)
-        corecfg["fec_parity"] = int(cfg.get("fec_parity") or 3)
+        corecfg["fec_data"] = int(cfg.get("fec_data") or 16)
+        corecfg["fec_parity"] = int(cfg.get("fec_parity") or 4)
     if bool(cfg.get("gso")):
         corecfg["gso"] = True
     if transport in ("raw", "tcp", "ws") and cfg.get("role") == "client" and bool(cfg.get("fake_desync")):
@@ -2235,8 +2235,8 @@ def op_tunnel(d):
             if obj.get("raw_sport_rotate"):
                 raise ValueError("raw_sport_rotate and fec are exclusive (the FEC send path snapshots the source port)")
             obj["fec"] = True
-            fd = int(d.get("fec_data") or 10)
-            fp = int(d.get("fec_parity") or 3)
+            fd = int(d.get("fec_data") or 16)
+            fp = int(d.get("fec_parity") or 4)
             if fd < 1 or fp < 1 or fd + fp > 255:
                 raise ValueError("fec_data/fec_parity out of range (>=1, sum<=255)")
             obj["fec_data"] = fd
