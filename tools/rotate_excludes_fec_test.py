@@ -43,6 +43,18 @@ def load_node():
     return mod
 
 
+def go_bound(src, block, op):
+    """A bound in the core's validate(): a literal, or the name of a Go const to resolve."""
+    m = re.search(r"c\.RawSportRotate\s*" + op + r"\s*([A-Za-z_]\w*|\d+)", block)
+    if not m:
+        return None
+    tok = m.group(1)
+    if tok.isdigit():
+        return int(tok)
+    c = re.search(r"\b" + re.escape(tok) + r"\s*=\s*(\d+)\b", src)
+    return int(c.group(1)) if c else None
+
+
 def core_rules():
     """Which conflicts the core's validate() names for raw_sport_rotate, and its range."""
     path = os.path.join(CORE, "config.go")
@@ -55,10 +67,14 @@ def core_rules():
         fail("could not find the RawSportRotate block in the core's config.go")
         return None
     block = src[i:i + 2200]
-    rng = re.search(r"c\.RawSportRotate\s*<\s*(\d+)\s*\|\|\s*c\.RawSportRotate\s*>\s*(\d+)", block)
+    lo, hi = go_bound(src, block, "<"), go_bound(src, block, ">")
+    if lo is None or hi is None:
+        fail("CANNOT READ the raw_sport_rotate range out of the core's config.go (lo=%r hi=%r) -- "
+             "THIS SCRIPT is out of date" % (lo, hi))
+        return None
     return {
-        "lo": int(rng.group(1)) if rng else 1,
-        "hi": int(rng.group(2)) if rng else 64,
+        "lo": lo,
+        "hi": hi,
         "udp_only": 'c.RawProfile != "udp"' in block,
         "excludes_sport": "c.RawSport != 0" in block,
         "excludes_random": "c.RawSportRandom" in block,
@@ -111,8 +127,10 @@ def main():
     mod.base_mtu = lambda iface: 1500
     rules = core_rules()
     if rules is None:
+        if os.path.exists(os.path.join(CORE, "config.go")):
+            return 1
         print("SKIP cross-repo check: no core checkout at %s" % CORE)
-        rules = {"lo": 1, "hi": 64, "udp_only": True, "excludes_sport": True,
+        rules = {"lo": 1, "hi": mod.MAX_SPROT_EVERY, "udp_only": True, "excludes_sport": True,
                  "excludes_random": True, "excludes_fec": True}
     else:
         named = [k for k in ("udp_only", "excludes_sport", "excludes_random", "excludes_fec") if rules[k]]
