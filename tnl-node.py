@@ -912,6 +912,8 @@ def build_core(cfg):
     os.chmod(tmp, 0o600)
     os.replace(tmp, path)
     _core_relaunch(name)
+    if _as_bool(cfg.get("conntrack_bypass")):
+        _ct_bypass_build(cfg)
 
 
 def _core_relaunch(name):
@@ -1031,6 +1033,60 @@ def _pf_acct_rules(cfg):
         out.append(scope + ct + ["--ctdir", ctdir, "-m", "comment", "--comment",
                                  f"pfacct:{nm}:{dirn}", "-j", "RETURN"])
     return out
+
+
+CT_BYPASS_PROFILES = ("udp", "tcp")
+
+
+def _ct_pressure():
+    try:
+        with open("/proc/sys/net/netfilter/nf_conntrack_count") as f:
+            c = int(f.read().strip())
+        with open("/proc/sys/net/netfilter/nf_conntrack_max") as f:
+            m = int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+    if m <= 0:
+        return None
+    return {"count": c, "max": m}
+
+
+def _ct_bypass_peers(cfg):
+    out = []
+    for v in [cfg.get("remote_ip")] + list(cfg.get("peer_ips") or []):
+        ip = str(v or "").split(":")[0].strip()
+        if is_ipv4(ip) and ip not in out:
+            out.append(ip)
+    return out
+
+
+def _ct_bypass_rules(cfg):
+    name = cfg.get("name", "")
+    if not NAME_RE.match(name or ""):
+        return []
+    if cfg.get("type") != "core" or str(cfg.get("transport") or "").lower() != "raw":
+        return []
+    prof = str(cfg.get("raw_profile") or "bare").lower()
+    if prof not in CT_BYPASS_PROFILES:
+        return []
+    tag = ["-m", "comment", "--comment", RULE_OWNER_PREFIX + name]
+    out = []
+    for ip in _ct_bypass_peers(cfg):
+        out.append(("filter", "INPUT", ["-s", ip, "-p", prof] + tag + ["-j", "ACCEPT"]))
+        out.append(("raw", "OUTPUT", ["-d", ip, "-p", prof] + tag + ["-j", "NOTRACK"]))
+        out.append(("raw", "PREROUTING", ["-s", ip, "-p", prof] + tag + ["-j", "NOTRACK"]))
+    return out
+
+
+def _ct_bypass_build(cfg):
+    rules = _ct_bypass_rules(cfg)
+    for table, chain, rule in rules:
+        _ipt_ins_missing(table, chain, rule)
+    if rules:
+        logline("%s: conntrack bypass installed for %s (%d rule(s), owner %s%s)"
+                % (cfg.get("name"), ", ".join(_ct_bypass_peers(cfg)), len(rules),
+                   RULE_OWNER_PREFIX, cfg.get("name")))
+    return len(rules)
 
 
 def _ipt_add_missing(table, chain, rule):
@@ -1920,7 +1976,7 @@ def op_list(d):
         if st["rot"]["sport"]:
             rots[nm] = st["rot"]
     return {"configs": cfgs, "health": {c["name"]: hc.get(c["name"], {"up": None}) for c in cfgs},
-            "pools": pools, "sports": sports, "rots": rots}
+            "pools": pools, "sports": sports, "rots": rots, "ct": _ct_pressure()}
 
 
 def op_tunnel(d):
@@ -2152,6 +2208,11 @@ def op_tunnel(d):
                 raise ValueError("raw_sport_rotate excludes raw_sport and raw_sport_random")
             if rrot:
                 obj["raw_sport_rotate"] = rrot
+            if _as_bool(d.get("conntrack_bypass")):
+                if profile not in CT_BYPASS_PROFILES:
+                    raise ValueError("conntrack bypass only means something for a profile that forges "
+                                     "ports (udp or tcp); others mint one flow, not one per packet")
+                obj["conntrack_bypass"] = True
             rdp = int(d.get("raw_dports") or 0)
             if rdp and not rrot:
                 raise ValueError("raw_dports needs raw_sport_rotate")
