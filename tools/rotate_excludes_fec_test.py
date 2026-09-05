@@ -75,7 +75,7 @@ def core_rules():
     return {
         "lo": lo,
         "hi": hi,
-        "udp_only": 'c.RawProfile != "udp"' in block,
+        "needs_ports": "RawProfileHasPorts(c.RawProfile)" in block,
         "excludes_sport": "c.RawSport != 0" in block,
         "excludes_random": "c.RawSportRandom" in block,
         "excludes_fec": "c.Fec" in block,
@@ -130,10 +130,10 @@ def main():
         if os.path.exists(os.path.join(CORE, "config.go")):
             return 1
         print("SKIP cross-repo check: no core checkout at %s" % CORE)
-        rules = {"lo": 1, "hi": mod.MAX_SPROT_EVERY, "udp_only": True, "excludes_sport": True,
+        rules = {"lo": 1, "hi": mod.MAX_SPROT_EVERY, "needs_ports": True, "excludes_sport": True,
                  "excludes_random": True, "excludes_fec": True}
     else:
-        named = [k for k in ("udp_only", "excludes_sport", "excludes_random", "excludes_fec") if rules[k]]
+        named = [k for k in ("needs_ports", "excludes_sport", "excludes_random", "excludes_fec") if rules[k]]
         print("core rejects: %s; range %d..%d" % (", ".join(named), rules["lo"], rules["hi"]))
     if not rules["excludes_fec"]:
         fail("the core no longer rejects fec + raw_sport_rotate — this guard is now watching a rule "
@@ -172,7 +172,8 @@ def main():
             ("fec", rules["excludes_fec"], base_req(raw_sport_rotate=5, fec=True)),
             ("raw_sport", rules["excludes_sport"], base_req(raw_sport_rotate=5, raw_sport=4500)),
             ("raw_sport_random", rules["excludes_random"], base_req(raw_sport_rotate=5, raw_sport_random=True)),
-            ("a non-udp profile", rules["udp_only"], base_req(raw_sport_rotate=5, raw_profile="tcp")),
+            ("a profile that forges no ports", rules["needs_ports"],
+             base_req(raw_sport_rotate=5, raw_profile="esp")),
             ("above the range", True, base_req(raw_sport_rotate=rules["hi"] + 1)),
             ("below the range", True, base_req(raw_sport_rotate=-1)),
         ]
