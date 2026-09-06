@@ -543,8 +543,15 @@ RAW_HEADER_LEN = {"bare": 0, "ipip": 0, "etherip": 2, "ipcomp": 4, "gre": 4, "ic
 MAX_WORKERS = 8
 MAX_SPROT_EVERY = 60
 MAX_DPORTS = 16
+MIN_BAND_LO = 1024
+MIN_BAND_SPAN = 100
 MAX_PORT_TRIES = 60
 QUEUEING_TRANSPORTS = ("raw", "udp")
+
+
+def band_ok(lo, hi):
+    return MIN_BAND_LO <= lo <= hi <= 65535 and hi - lo + 1 >= MIN_BAND_SPAN
+
 
 _TUNING_INT_KEYS = ("dead_retest_secs",
                     "min_liveness_secs")
@@ -685,6 +692,14 @@ def _core_config(cfg):
                 _rdp = 0
             if 1 <= _rdp <= MAX_DPORTS:
                 corecfg["raw_dports"] = _rdp
+        if raw_profile in ("udp", "tcp") and (_rrot or _as_bool(cfg.get("raw_sport_random"))):
+            try:
+                _blo = int(cfg.get("raw_sport_lo") or 0)
+                _bhi = int(cfg.get("raw_sport_hi") or 0)
+            except (TypeError, ValueError):
+                _blo = _bhi = 0
+            if band_ok(_blo, _bhi):
+                corecfg["raw_sport_lo"], corecfg["raw_sport_hi"] = _blo, _bhi
     try:
         _ptries = int(cfg.get("port_tries") or 0)
     except (TypeError, ValueError):
@@ -2214,6 +2229,16 @@ def op_tunnel(d):
                     raise ValueError("conntrack bypass only means something for a profile that forges "
                                      "ports (udp or tcp); others mint one flow, not one per packet")
                 obj["conntrack_bypass"] = True
+            blo = int(d.get("raw_sport_lo") or 0)
+            bhi = int(d.get("raw_sport_hi") or 0)
+            if (blo or bhi) and not (rrot or _as_bool(d.get("raw_sport_random"))):
+                raise ValueError("raw_sport_lo/raw_sport_hi bound a band that only exists while "
+                                 "raw_sport_rotate or raw_sport_random moves the source port")
+            if blo or bhi:
+                if not band_ok(blo, bhi):
+                    raise ValueError("raw_sport band must be %d..65535, lo <= hi, at least %d ports wide"
+                                     % (MIN_BAND_LO, MIN_BAND_SPAN))
+                obj["raw_sport_lo"], obj["raw_sport_hi"] = blo, bhi
             rdp = int(d.get("raw_dports") or 0)
             if rdp and not rrot:
                 raise ValueError("raw_dports needs raw_sport_rotate")
