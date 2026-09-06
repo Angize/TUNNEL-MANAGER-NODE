@@ -542,6 +542,7 @@ RAW_HEADER_LEN = {"bare": 0, "ipip": 0, "etherip": 2, "ipcomp": 4, "gre": 4, "ic
                   "esp": 8, "l2tpv3": 8, "tcp": 32, "ah": 24}
 MAX_WORKERS = 8
 MAX_SPROT_EVERY = 60
+MAX_DPORTS = 16
 MAX_PORT_TRIES = 60
 QUEUEING_TRANSPORTS = ("raw", "udp")
 
@@ -676,13 +677,13 @@ def _core_config(cfg):
             _rrot = int(cfg.get("raw_sport_rotate") or 0)
         except (TypeError, ValueError):
             _rrot = 0
-        if raw_profile in ("udp", "tcp") and 1 <= _rrot <= 64:
+        if raw_profile in ("udp", "tcp") and 1 <= _rrot <= MAX_SPROT_EVERY:
             corecfg["raw_sport_rotate"] = _rrot
             try:
                 _rdp = int(cfg.get("raw_dports") or 0)
             except (TypeError, ValueError):
                 _rdp = 0
-            if 1 <= _rdp <= 8:
+            if 1 <= _rdp <= MAX_DPORTS:
                 corecfg["raw_dports"] = _rdp
     try:
         _ptries = int(cfg.get("port_tries") or 0)
@@ -2216,7 +2217,7 @@ def op_tunnel(d):
             rdp = int(d.get("raw_dports") or 0)
             if rdp and not rrot:
                 raise ValueError("raw_dports needs raw_sport_rotate")
-            if rdp and not (1 <= rdp <= 8):
+            if rdp and not (1 <= rdp <= MAX_DPORTS):
                 raise ValueError("bad raw_dports")
             if rdp:
                 obj["raw_dports"] = rdp

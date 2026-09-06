@@ -64,3 +64,7 @@ jobs:
         run: python tools/the_panel_says_where_it_is_test.py
       - name: a signed url is checked against the release itself
         run: python tools/a_url_grant_is_checked_against_the_release_test.py
+      - name: the destination-port ceiling is the core's, and it reaches the wire
+        env:
+          CORE_RAWPROFILE: core-checkout/internal/packet/rawprofile.go
+        run: python tools/the_dport_ceiling_is_the_core_s_test.py
