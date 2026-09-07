@@ -1843,6 +1843,10 @@ def _sig_msg(method, path, ctr, body_sha):
     return "%s\n%s\n%s\n%s" % (method, path, ctr, body_sha)
 
 
+def _resp_sig_msg(ctr, status, body_sha):
+    return "resp\n%s\n%s\n%s" % (ctr, status, body_sha)
+
+
 def _sig_ok(secret, method, path, ctr, body_sha, sig_b64):
     try:
         want = hmac.new(secret.encode("utf-8"),
@@ -3301,16 +3305,67 @@ WIRE = {
 }
 
 
+class HeaderDeadline:
+    def __init__(self, raw, sock, idle):
+        self.raw, self.sock, self.idle, self.until = raw, sock, idle, None
+
+    def arm(self, budget):
+        self.until = time.monotonic() + budget
+
+    def disarm(self):
+        self.until = None
+        try:
+            self.sock.settimeout(self.idle)
+        except OSError:
+            pass
+
+    def _tick(self):
+        if self.until is None:
+            return
+        left = self.until - time.monotonic()
+        if left <= 0:
+            raise TimeoutError("header deadline")
+        try:
+            self.sock.settimeout(left)
+        except OSError:
+            pass
+
+    def readline(self, *a):
+        self._tick()
+        return self.raw.readline(*a)
+
+    def read(self, *a):
+        self._tick()
+        return self.raw.read(*a)
+
+    def __getattr__(self, name):
+        return getattr(self.raw, name)
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "tnl-node"
     timeout = 30
+    header_budget = 15
 
     def log_message(self, *a):
         pass
 
     def setup(self):
         BaseHTTPRequestHandler.setup(self)
+        self.rfile = HeaderDeadline(self.rfile, self.connection, self.timeout)
         self._sem_held = _conn_sem.acquire(blocking=False)
+
+    def handle_one_request(self):
+        self.rfile.arm(self.header_budget)
+        try:
+            BaseHTTPRequestHandler.handle_one_request(self)
+        finally:
+            self.rfile.disarm()
+
+    def parse_request(self):
+        got = BaseHTTPRequestHandler.parse_request(self)
+        self.rfile.disarm()
+        return got
 
     def finish(self):
         try:
@@ -3330,6 +3385,13 @@ class Handler(BaseHTTPRequestHandler):
                                  b"Connection: close\r\n\r\n" + body)
             except Exception:
                 pass
+            try:
+                self.connection.setblocking(False)
+                for _ in range(4):
+                    if not self.connection.recv(65536):
+                        break
+            except OSError:
+                pass
             return
         BaseHTTPRequestHandler.handle(self)
 
@@ -3343,12 +3405,23 @@ class Handler(BaseHTTPRequestHandler):
         return "sig" if _sig_ok(want, method, self.path, self.headers.get("X-Ctr", ""),
                                 self.headers.get("X-Body", ""), sig) else ""
 
+    def _resp_sig(self, code, data):
+        tok = self.server.conf.get("token", "")
+        if not tok:
+            return ""
+        msg = _resp_sig_msg(self.headers.get("X-Ctr", ""), code, hashlib.sha256(data).hexdigest())
+        return base64.b64encode(hmac.new(tok.encode("utf-8"), msg.encode("utf-8"),
+                                         hashlib.sha256).digest()).decode()
+
     def _send(self, code, body):
         data = json.dumps(body).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
         self.send_header("X-Content-Type-Options", "nosniff")
+        sig = self._resp_sig(code, data)
+        if sig:
+            self.send_header("X-Resp-Sig", sig)
         self.end_headers()
         self.wfile.write(data)
 
