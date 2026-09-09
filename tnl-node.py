@@ -629,8 +629,6 @@ def _core_config(cfg):
     if transport in ("udp", "raw") and bool(cfg.get("fec")):
         overhead += 13
     mtu = max(576, base_mtu(cfg.get("iface")) - overhead)
-    if transport == "dns":
-        mtu = 1280
     corecfg = {
         "role": cfg.get("role"),
         "mode": "packet",
@@ -713,10 +711,6 @@ def _core_config(cfg):
             _wk = 0
         if 2 <= _wk <= MAX_WORKERS and not bool(cfg.get("fec")):
             corecfg["workers"] = _wk
-    if transport == "dns":
-        corecfg["dns_zone"] = str(cfg.get("dns_zone") or "").strip().lower()
-        if cfg.get("role") == "client":
-            corecfg["dns_resolvers"] = [str(x).strip() for x in (cfg.get("dns_resolvers") or []) if str(x).strip()]
     if transport == "ws":
         if cfg.get("ws_host"):
             corecfg["ws_host"] = str(cfg["ws_host"])
@@ -792,17 +786,13 @@ def _core_config(cfg):
         lip = cfg.get("local_ip") or "0.0.0.0"
         pool_ips = [str(x).strip() for x in (cfg.get("listen_ips") or []) if str(x).strip()]
         pooled = bool(cfg.get("pool_listen"))
-        if transport == "dns":
-            corecfg["listen"] = f"{lip}:53"
-        elif pooled and transport in ("udp", "tcp") and pool_ips:
+        if pooled and transport in ("udp", "tcp") and pool_ips:
             corecfg["listen"] = f"{pool_ips[0]}:{port}"
             corecfg["listen_ips"] = [f"{ip}:{port}" for ip in pool_ips]
         elif pooled and transport == "raw":
             corecfg["listen"] = f"0.0.0.0:{port}"
         else:
             corecfg["listen"] = f"{lip}:{port}"
-    elif transport == "dns":
-        pass
     else:
         dial, dport = cfg["remote_ip"], port
         edge = str(cfg.get("edge_ip") or "").strip()
@@ -2062,7 +2052,7 @@ def op_tunnel(d):
             raise ValueError("bad core cipher")
         obj["cipher"] = cipher
         transport = str(d.get("transport") or "udp").strip().lower()
-        if transport not in ("udp", "tcp", "raw", "ws", "dns"):
+        if transport not in ("udp", "tcp", "raw", "ws"):
             raise ValueError("bad core transport")
         obj["transport"] = transport
 
@@ -2075,31 +2065,6 @@ def op_tunnel(d):
                     raise ValueError("bad " + key + " entry (must be an IPv4 address)")
             return out
 
-        if transport == "dns":
-            zone = str(d.get("dns_zone") or "").strip().lower()
-            if not zone or len(zone) > 253 or not re.match(r"^(?!-)[A-Za-z0-9-]{1,63}(?:\.(?!-)[A-Za-z0-9-]{1,63})+$", zone):
-                raise ValueError("bad dns_zone")
-            obj["dns_zone"] = zone
-            resolvers = []
-            for r in (d.get("dns_resolvers") or []):
-                rs = str(r).strip()
-                if not rs:
-                    continue
-                if rs.count(":") == 1:
-                    host, _, port = rs.partition(":")
-                    if not (port.isdigit() and 1 <= int(port) <= 65535):
-                        raise ValueError("bad dns_resolvers port (1..65535)")
-                else:
-                    host = rs
-                if not is_ipv4(host):
-                    raise ValueError("bad dns_resolvers entry (must be IPv4 or IPv4:port)")
-                resolvers.append(rs)
-            if not str(d.get("psk") or "").strip() or cipher == "none":
-                raise ValueError("ترنسپورت dns به رمزنگاری (psk) نیاز دارد — نشست داخلِ کوئری‌های DNS با AEAD رمز و احراز می‌شود")
-            if role == "client" and not resolvers:
-                raise ValueError("کلاینتِ dns به حداقل یک resolverِ معتبر (IPv4) نیاز دارد")
-            if resolvers:
-                obj["dns_resolvers"] = resolvers
         if transport == "ws":
             wh = str(d.get("ws_host") or "").strip()
             if wh:
