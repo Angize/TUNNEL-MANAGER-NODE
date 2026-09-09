@@ -29,7 +29,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 NODE = os.path.join(os.path.dirname(HERE), "tnl-node.py")
 
 LINK_ERR = "Cannot find device \"vx1\""
-CORE_REJECTION = "obfs is not supported on the dns transport (the DNS carrier has no obfs framing)"
+CORE_REJECTION = "transport must be \"udp\", \"tcp\", \"raw\", or \"ws\""
 JOURNAL = "2026/08/02 10:00:05 tnl-core: config: " + CORE_REJECTION + "\n"
 
 fails = []

@@ -30,8 +30,8 @@ if hasattr(sys.stdout, "reconfigure"):
 HERE = os.path.dirname(os.path.abspath(__file__))
 NODE = os.path.join(os.path.dirname(HERE), "tnl-node.py")
 
-# A real rejection, verbatim from a core that was handed obfs on a dns tunnel (config.go:771).
-CORE_REJECTION = "obfs is not supported on the dns transport (the DNS carrier has no obfs framing)"
+# A real rejection, verbatim from a core that was handed a transport it does not have (config.go:452).
+CORE_REJECTION = "transport must be \"udp\", \"tcp\", \"raw\", or \"ws\""
 JOURNAL = (
     "2026/07/29 00:11:02 tnl-core: writing status/events to /etc/tnl/core-cor1.status\n"
     "2026/07/29 00:11:05 tnl-core: config: " + CORE_REJECTION + "\n"
