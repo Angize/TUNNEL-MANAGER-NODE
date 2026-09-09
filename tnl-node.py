@@ -553,8 +553,7 @@ def band_ok(lo, hi):
     return MIN_BAND_LO <= lo <= hi <= 65535 and hi - lo + 1 >= MIN_BAND_SPAN
 
 
-_TUNING_INT_KEYS = ("dead_retest_secs",
-                    "min_liveness_secs")
+_TUNING_INT_KEYS = ("dead_retest_secs",)
 
 REVIVE_STEP_MIN = 10
 REVIVE_STEP_MAX = 3600
