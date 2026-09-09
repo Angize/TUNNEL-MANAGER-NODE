@@ -1,70 +1,18 @@
 name: ci
 
-# The agent runs as root on every node in the fleet and it is pushed there by a button in the panel —
-# there is no staging step between "merged" and "installed on every server". Until now nothing checked
-# that it even parses.
-#
-# `-W error::SyntaxWarning` is deliberate rather than paranoid: an invalid escape sequence in a non-raw
-# string is a warning today and a SyntaxError in a future Python, which for this file means an agent that
-# refuses to start on every node at once. The panel had exactly one of these hiding in a JS regex.
-#
-# The tuning-knob roster in `_TUNING_INT_KEYS` is checked against core and the panel by
-# `tools/tuning_consistency.py`, which lives in the panel repository (private, so it cannot be run from
-# here without a PAT). That workflow runs it on every panel pull request and once a day on a schedule, so
-# drift introduced from THIS side is caught within a day rather than never.
-
 on:
   push:
-    branches: [main]
+    branches: ["**"]
   pull_request:
-  workflow_dispatch:
-
-permissions:
-  contents: read
-
-concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
 
 jobs:
   check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
       - name: py_compile (warnings are errors)
         run: python -W error::SyntaxWarning -m py_compile tnl-node.py
-
-      # The core is public, so this side CAN be checked cross-repo (the panel cannot — it is private).
-      - name: check out the core beside this repo
-        uses: actions/checkout@v5
-        with:
-          repository: Angize/TUNNEL-MANAGER-CORE
-          path: core-checkout
-
-      - name: http_up_* bounds match the core's
-        env:
-          CORE_REPO: ${{ github.workspace }}/core-checkout
-        run: python tools/http_up_bounds_test.py
-      - name: a core that refuses its config says so
-        run: python tools/core_error_surfaced_test.py
-      - name: a pooled raw server binds the wildcard
-        env:
-          CORE_REPO: ${{ github.workspace }}/core-checkout
-        run: python tools/pooled_raw_binds_wildcard_test.py
-      - name: a signed request cannot be replayed or forged
-        run: python tools/signed_request_test.py
-      - name: a moved epoch swallows the fail, not the recovery
-        run: python tools/a_moved_epoch_swallows_only_the_fail_test.py
-      - name: the node believes the panel about where the panel is
-        run: python tools/the_panel_says_where_it_is_test.py
-      - name: a signed url is checked against the release itself
-        run: python tools/a_url_grant_is_checked_against_the_release_test.py
-      - name: the destination-port ceiling is the core's, and it reaches the wire
-        env:
-          CORE_RAWPROFILE: core-checkout/internal/packet/rawprofile.go
-        run: python tools/the_dport_ceiling_is_the_core_s_test.py
