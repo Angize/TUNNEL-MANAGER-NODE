@@ -914,16 +914,17 @@ def build_core(cfg):
         json.dump(corecfg, f, indent=2)
     os.chmod(tmp, 0o600)
     os.replace(tmp, path)
-    _core_relaunch(name)
-    if _as_bool(cfg.get("conntrack_bypass")):
-        _ct_bypass_build(cfg)
+    _core_relaunch(cfg)
 
 
-def _core_relaunch(name):
+def _core_relaunch(cfg):
+    name = cfg["name"]
     unit = _core_unit(name)
     run(["systemctl", "stop", unit])
     run(["systemctl", "reset-failed", unit])
     _sweep_owned_rules(name)
+    if _as_bool(cfg.get("conntrack_bypass")):
+        _ct_bypass_build(cfg)
     for p in _core_status_paths(name):
         try:
             os.remove(p)
@@ -1056,7 +1057,8 @@ def _ct_pressure():
 
 def _ct_bypass_peers(cfg):
     out = []
-    for v in [cfg.get("remote_ip")] + list(cfg.get("peer_ips") or []):
+    for v in ([cfg.get("remote_ip")] + list(cfg.get("peer_ips") or [])
+              + list(cfg.get("peer_src_ips") or [])):
         ip = str(v or "").split(":")[0].strip()
         if is_ipv4(ip) and ip not in out:
             out.append(ip)
@@ -2437,7 +2439,7 @@ def op_core_restart(d):
         return {"ok": False, "msg": "تونل غیرفعال است"}
     if not os.path.exists(_cfg_path(name, ".json")):
         return {"ok": False, "msg": "کانفیگِ هسته روی این نود نیست — تونل را بازسازی کن"}
-    if not _core_relaunch(name):
+    if not _core_relaunch(cfg):
         return {"ok": False, "msg": "هسته بالا نیامد (اینترفیس ظاهر نشد)"}
     return {"ok": True}
 
@@ -2722,6 +2724,7 @@ def op_edge_status(d):
             "active": st["active"],
             "pair": st["pair"],
             "health": [h for h in st["health"] if h["kind"] in ("ip", "sni")],
+            "ready": st["ready"],
             "events": st["events"],
             "ts": st["ts"],
             "now": int(time.time())}
@@ -3295,26 +3298,6 @@ class Handler(BaseHTTPRequestHandler):
                 _conn_sem.release()
                 self._sem_held = False
 
-    def handle(self):
-        if not getattr(self, "_sem_held", False):
-            try:
-                body = b'{"error":"server busy, retry shortly"}'
-                self.wfile.write(b"HTTP/1.1 503 Service Unavailable\r\n"
-                                 b"Content-Type: application/json\r\n"
-                                 b"Content-Length: " + str(len(body)).encode() + b"\r\n"
-                                 b"Connection: close\r\n\r\n" + body)
-            except Exception:
-                pass
-            try:
-                self.connection.setblocking(False)
-                for _ in range(4):
-                    if not self.connection.recv(65536):
-                        break
-            except OSError:
-                pass
-            return
-        BaseHTTPRequestHandler.handle(self)
-
     def _authed(self, method):
         want = self.server.conf.get("token", "")
         if not want:
@@ -3367,10 +3350,20 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return False
 
-    def _handle(self, method):
-        self._handle_locked(method)
+    def _drain(self):
+        try:
+            self.connection.setblocking(False)
+            for _ in range(4):
+                if not self.connection.recv(65536):
+                    break
+        except OSError:
+            pass
 
-    def _handle_locked(self, method):
+    def _handle(self, method):
+        if not getattr(self, "_sem_held", False):
+            self._send(503, {"error": "server busy, retry shortly"})
+            self._drain()
+            return
         path = self.path.split("?", 1)[0]
         if not path.startswith("/api/"):
             self._send(404, {"error": "not found"})
