@@ -540,7 +540,7 @@ def _core_port(cfg):
     return int(cfg.get("port") or 20000)
 
 
-RAW_HEADER_LEN = {"bare": 0, "ipip": 0, "etherip": 2, "ipcomp": 4, "gre": 4, "icmp": 8, "udp": 8,
+RAW_HEADER_LEN = {"bare": 0, "ipip": 20, "etherip": 2, "ipcomp": 4, "gre": 4, "icmp": 8, "udp": 8,
                   "esp": 8, "l2tpv3": 8, "tcp": 32, "ah": 24}
 MAX_WORKERS = 8
 MAX_SPROT_EVERY = 60
@@ -714,7 +714,7 @@ def _core_config(cfg):
         if 2 <= _wk <= MAX_WORKERS and not bool(cfg.get("fec")):
             corecfg["workers"] = _wk
     if transport == "ws":
-        if cfg.get("ws_host"):
+        if cfg.get("ws_host") and str(cfg.get("role")) == "client":
             corecfg["ws_host"] = str(cfg["ws_host"])
         if cfg.get("ws_path"):
             corecfg["ws_path"] = str(cfg["ws_path"])
@@ -1195,10 +1195,13 @@ def apply_config(cfg):
     elif t == "ipsec":
         build_ipsec(cfg)
     elif t == "core":
+        if not cfg.get("enabled", True):
+            _set_link_state(cfg, False)
+            return
         build_core(cfg)
     elif t == "portfw":
         build_portfw(cfg)
-    if t != "portfw" and not cfg.get("enabled", True):
+    if t not in ("portfw", "core") and not cfg.get("enabled", True):
         _set_link_state(cfg, False)
 
 
@@ -1303,6 +1306,7 @@ def peer_of(tunnel_ip, ttype):
 PROBE_PORT = 9
 PROBE_WAIT = 0.8
 PROBE_COUNT = 20
+PROBE_MIN_SAMPLE = 5
 PROBE_MIN_PCT = 15
 PROBE_MIN_PCT_RANGE = (5, 100)
 SWEEP_SLOW = 3.0
@@ -1516,7 +1520,7 @@ def health_of(cfg):
     if up and tip and tip != "N/A":
         epoch_before, ready_before = _read_path_state(name)
         hits, sent, rtt = tun_probe(name, tip, ttype)
-        if sent:
+        if sent >= PROBE_MIN_SAMPLE:
             loss = round((sent - hits) * 100.0 / sent, 1)
             crossed = carrying(hits, sent, probe_min_pct(cfg))
             alive = settle(name, crossed)
