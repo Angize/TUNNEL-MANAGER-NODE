@@ -261,7 +261,7 @@ def base_mtu(dev=None):
         if m:
             return int(m.group(1))
     if asked:
-        raise RuntimeError("MTUِ اینترفیسِ «" + str(asked) + "» خوانده نشد — تونل از همین لینک خارج می‌شود")
+        raise RuntimeError("mtu of iface %s unreadable" % asked)
     return 1500
 
 
@@ -548,6 +548,7 @@ MAX_DPORTS = 16
 MIN_BAND_LO = 1024
 MIN_BAND_SPAN = 100
 MAX_PORT_TRIES = 60
+MAX_FEC_DATA = 64
 QUEUEING_TRANSPORTS = ("raw", "udp")
 
 
@@ -555,7 +556,10 @@ def band_ok(lo, hi):
     return MIN_BAND_LO <= lo <= hi <= 65535 and hi - lo + 1 >= MIN_BAND_SPAN
 
 
-_TUNING_INT_KEYS = ("dead_retest_secs",)
+DEAD_RETEST_MIN = 5
+DEAD_RETEST_MAX = 86400
+
+_TUNING_INT_RANGES = {"dead_retest_secs": (DEAD_RETEST_MIN, DEAD_RETEST_MAX)}
 
 REVIVE_STEP_MIN = 10
 REVIVE_STEP_MAX = 3600
@@ -570,13 +574,13 @@ def _core_tuning(tn):
     if not isinstance(tn, dict):
         return {}
     out = {}
-    for k in _TUNING_INT_KEYS:
+    for k, (lo, hi) in _TUNING_INT_RANGES.items():
         try:
             v = int(tn.get(k) or 0)
         except (TypeError, ValueError):
             continue
         if v > 0:
-            out[k] = v
+            out[k] = max(lo, min(hi, v))
     for k, (lo, hi) in _TUNING_LIST_RANGES.items():
         raw = tn.get(k)
         if not isinstance(raw, (list, tuple)):
@@ -836,15 +840,14 @@ def _netdev_missing_reason(name, ttype):
         return ""
     if ttype == "core":
         if _core_running(name):
-            return ("هستهٔ tnl-core در حال اجراست ولی اینترفیسِ «" + name + "» هنوز بالا نیامده — "
-                    "احتمالاً استارتِ کند؛ چند لحظه بعد دوباره امتحان کن")
+            return "core is up but iface %s has not appeared yet" % name
         why = _core_last_error(name)
         if why:
-            return "هستهٔ tnl-core بالا نیامد — پیامِ خودش: " + why
+            return "core did not come up: " + why
     need = {"vxlan": "vxlan", "gre": "ip_gre", "sit": "sit", "ipip": "ipip",
-            "l2tpv3": "l2tp_eth", "fou": "fou و ipip", "ipsec": "xfrm_interface",
-            "core": "هستهٔ tnl-core"}.get(ttype, ttype)
-    return f"اینترفیسِ {ttype} ساخته نشد — «{need}» روی این نود نصب/فعال نیست"
+            "l2tpv3": "l2tp_eth", "fou": "fou and ipip", "ipsec": "xfrm_interface",
+            "core": "tnl-core"}.get(ttype, ttype)
+    return "iface %s not created: %s is missing on this node" % (ttype, need)
 
 
 def _core_running(name):
@@ -877,7 +880,7 @@ def _atomic_write_json(path, obj):
 
 def _core_status_paths(name):
     base = _cfg_path(name, ".status")
-    return (base, base + ".verdict", base + ".verdict.taken",
+    return (base, base + ".tmp", base + ".verdict", base + ".verdict.taken",
             base + ".select", base + ".select.taken", base + ".echcmd")
 
 
@@ -1007,7 +1010,7 @@ def _set_link_state(cfg, enabled):
         else:
             _core_stop(name)
             if _core_running(name):
-                raise RuntimeError("واحدِ هستهٔ «" + name + "» با وجودِ stop هنوز در حال اجراست")
+                raise RuntimeError("core unit %s still running after stop" % name)
     else:
         must(["ip", "link", "set", name, "up" if enabled else "down"])
 
@@ -1876,9 +1879,8 @@ def do_checkin():
     except Exception:
         return False
     tok = conf.get("token", "")
-    claim = {"fp": hashlib.sha256(tok.encode()).hexdigest(), "ips": all_ips(),
-             "port": conf.get("port"), "hostname": socket.gethostname(),
-             "ctr": int(time.time() * 1000)}
+    claim = {"fp": hashlib.sha256(tok.encode()).hexdigest(),
+             "port": conf.get("port"), "ctr": int(time.time() * 1000)}
     claim["sig"] = base64.b64encode(hmac.new(
         tok.encode(), json.dumps(claim, sort_keys=True, separators=(",", ":")).encode(),
         hashlib.sha256).digest()).decode()
@@ -2052,14 +2054,14 @@ def op_tunnel(d):
                         except (TypeError, ValueError):
                             raise ValueError("bad %s" % _k)
                         if _v < 0 or _v > _up_max[_k]:
-                            raise ValueError("%s باید بین 0 و %d باشد (0 = پیش‌فرض)" % (_k, _up_max[_k]))
+                            raise ValueError("%s must be between 0 and %d" % (_k, _up_max[_k]))
                         if _v:
                             obj[_k] = _v
             if _as_bool(d.get("ws_tls")):
                 obj["ws_tls"] = True
                 _has_pool = bool(d.get("ws_edge_ips")) and bool(d.get("ws_edge_snis"))
                 if role == "client" and not obj.get("ws_host") and not _has_pool:
-                    raise ValueError("ws_tls به ws_host نیاز دارد (SNI/دامنهٔ فرانت‌کننده)")
+                    raise ValueError("ws_tls requires ws_host")
                 ech = str(d.get("ws_ech") or "").strip()
                 if ech:
                     if len(ech) > 4096 or not re.match(r"^[A-Za-z0-9+/=]+$", ech):
@@ -2188,8 +2190,9 @@ def op_tunnel(d):
             obj["fec"] = True
             fd = int(d.get("fec_data") or 16)
             fp = int(d.get("fec_parity") or 4)
-            if fd < 1 or fp < 1 or fd + fp > 255:
-                raise ValueError("fec_data/fec_parity out of range (>=1, sum<=255)")
+            if fd < 1 or fp < 1 or fd + fp > 255 or fd > MAX_FEC_DATA:
+                raise ValueError("fec_data/fec_parity out of range (>=1, sum<=255, fec_data<=%d)"
+                                 % MAX_FEC_DATA)
             obj["fec_data"] = fd
             obj["fec_parity"] = fp
         if transport in ("udp", "tcp", "raw") and role == "client":
@@ -2222,12 +2225,12 @@ def op_tunnel(d):
             raise ValueError("obfs requires a psk and encryption")
         obj["obfs"] = obfs
         if transport == "raw" and (not psk or cipher == "none"):
-            raise ValueError("ترنسپورت raw به رمزنگاری (psk) نیاز دارد — هر فریم با AEAD رمز و احراز می‌شود")
+            raise ValueError("raw requires a psk")
         if _as_bool(d.get("cover")) and transport == "tcp":
             obj["cover"] = True
             sni = str(d.get("cover_sni") or "").strip()
             if not sni:
-                raise ValueError("پوشش TLS به cover_sni نیاز دارد (نام دامنه‌ای که ارائه می‌شود)")
+                raise ValueError("cover requires cover_sni")
             if not re.match(r"^[A-Za-z0-9.-]{1,253}$", sni):
                 raise ValueError("bad cover_sni")
             obj["cover_sni"] = sni
@@ -2437,11 +2440,11 @@ def op_core_restart(d):
     if cfg.get("type") != "core":
         raise ValueError("only a core tunnel has a process to restart")
     if not _as_bool(cfg.get("enabled", True)):
-        return {"ok": False, "msg": "تونل غیرفعال است"}
+        return {"ok": False, "msg": "tunnel disabled"}
     if not os.path.exists(_cfg_path(name, ".json")):
-        return {"ok": False, "msg": "کانفیگِ هسته روی این نود نیست — تونل را بازسازی کن"}
+        return {"ok": False, "msg": "core config missing on this node"}
     if not _core_relaunch(cfg):
-        return {"ok": False, "msg": "هسته بالا نیامد (اینترفیس ظاهر نشد)"}
+        return {"ok": False, "msg": "core did not come up (no iface)"}
     return {"ok": True}
 
 
@@ -2819,14 +2822,14 @@ def _write_cmd(name, kind, key, cmd=""):
         raise ValueError("bad name")
     key = str(key or "").strip()
     if not key or len(key) > 255:
-        raise ValueError("مقدارِ ورودی نامعتبر است")
+        raise ValueError("bad key")
     body = {"kind": kind, "key": key}
     if cmd:
         body["cmd"] = cmd
     path = _cfg_path(name, ".status.select")
     try:
         if os.path.getsize(path) > CMDBOX_MAX:
-            return {"ok": False, "error": "صفِ فرمان پر است — هستهٔ این تونل فرمان‌ها را برنمی‌دارد"}
+            return {"ok": False, "error": "command queue full"}
     except OSError:
         pass
     try:
@@ -2841,7 +2844,7 @@ def op_peer_select(d):
     _require(d, ["name", "key"])
     name = str(d["name"])
     if not _is_peer_pool(name):
-        return {"ok": False, "error": "این تونل استخرِ آی‌پی ندارد"}
+        return {"ok": False, "error": "no ip pool on this tunnel"}
     return _write_cmd(name, "src" if str(d.get("side")) == "src" else "dst", d.get("key"))
 
 
@@ -2849,7 +2852,7 @@ def op_pool_select(d):
     _require(d, ["name", "kind", "key"])
     name = str(d["name"])
     if not _is_ws_pool(name):
-        return {"ok": False, "error": "این تونل استخرِ لبه ندارد"}
+        return {"ok": False, "error": "no edge pool on this tunnel"}
     return _write_cmd(name, "sni" if str(d.get("kind")) == "sni" else "ip", d.get("key"))
 
 
@@ -2858,11 +2861,11 @@ def op_retest_now(d):
     name = str(d["name"])
     kind = str(d.get("kind") or "")
     if kind not in ("dst", "src", "ip", "sni"):
-        raise ValueError("محورِ نامعتبر")
+        raise ValueError("bad axis")
     if kind in ("ip", "sni") and not _is_ws_pool(name):
-        return {"ok": False, "error": "این تونل استخرِ لبه ندارد"}
+        return {"ok": False, "error": "no edge pool on this tunnel"}
     if kind in ("dst", "src") and not _is_peer_pool(name):
-        return {"ok": False, "error": "این تونل استخرِ آی‌پی ندارد"}
+        return {"ok": False, "error": "no ip pool on this tunnel"}
     return _write_cmd(name, kind, d.get("key"), cmd="retest")
 
 
@@ -3103,11 +3106,6 @@ def op_core_apply(d):
             "restarted": restarted, "failed": failed}
 
 
-def op_apply(d):
-    apply_all()
-    return {"ok": True}
-
-
 def op_update(d):
     src = d.get("code")
     if src is None and d.get("url"):
@@ -3172,7 +3170,7 @@ def op_ech_update(d):
     if not NAME_RE.match(name):
         raise ValueError("bad name")
     if not (_is_ws_pool(name) or _is_ws_single(name)):
-        return {"ok": False, "error": "این تونل ws نیست"}
+        return {"ok": False, "error": "not a ws tunnel"}
     snis = d.get("snis") or {}
     if not isinstance(snis, dict):
         raise ValueError("bad snis")
@@ -3208,7 +3206,7 @@ def op_kernel_tune(d):
 
 OPS = {"ping": op_ping, "list": op_list, "check": op_check, "tunnel": op_tunnel,
        "portfw": op_portfw, "portfw-edit": op_portfw_edit, "portfw-next": op_portfw_next,
-       "delete": op_delete, "apply": op_apply, "update": op_update, "wipe": op_wipe,
+       "delete": op_delete, "update": op_update, "wipe": op_wipe,
        "portcheck": op_portcheck, "speedtest": op_speedtest, "edge-status": op_edge_status,
        "peer-status": op_peer_status,
        "peer-select": op_peer_select, "pool-select": op_pool_select, "retest-now": op_retest_now,
@@ -3220,7 +3218,7 @@ OPS = {"ping": op_ping, "list": op_list, "check": op_check, "tunnel": op_tunnel,
 READ_ONLY = {"ping", "list", "check", "portcheck", "edge-status", "peer-status"}
 
 WIRE = {
-    "pg": "ping", "ls": "list", "ck": "check", "mk": "tunnel", "dl": "delete", "ap": "apply",
+    "pg": "ping", "ls": "list", "ck": "check", "mk": "tunnel", "dl": "delete",
     "up": "update", "wz": "wipe", "pf": "portfw", "pe": "portfw-edit", "pn": "portfw-next",
     "pc": "portcheck", "sd": "speedtest", "es": "edge-status", "ps": "peer-status", "pl": "peer-select",
     "qs": "pool-select", "rt": "retest-now", "eu": "ech-update",
