@@ -3483,15 +3483,47 @@ def service_active():
     return run(["systemctl", "is-active", "--quiet", SERVICE])[0] == 0
 
 
+def service_settled(tries=6):
+    for _ in range(tries):
+        if service_active():
+            return True
+        time.sleep(1)
+    return False
+
+
+DEP_PACKAGES = ("iproute2", "iptables", "openssl", "procps", "kmod", "ca-certificates")
+DEP_BINARIES = ("ip", "ss", "iptables", "openssl", "sysctl", "modprobe", "systemctl", "systemd-run")
+
+
+def missing_binaries():
+    return [b for b in DEP_BINARIES if not shutil.which(b)]
+
+
 def install_deps():
-    print("[*] Installing dependencies (iptables, openssl)...")
+    if not missing_binaries():
+        print("[✔] dependencies already present.")
+        return
+    print("[*] installing dependencies: " + " ".join(DEP_PACKAGES))
     env = dict(os.environ, DEBIAN_FRONTEND="noninteractive")
     try:
         subprocess.run(["apt-get", "update", "-qq"], env=env, timeout=300)
-        subprocess.run(["apt-get", "install", "-yqq", "iptables", "openssl"], env=env, timeout=600)
+        subprocess.run(["apt-get", "install", "-yqq", *DEP_PACKAGES], env=env, timeout=900)
     except Exception as e:
         print(f"[!] apt failed: {e}")
-    print("[✔] dependencies ready (native tunnels — no OpenvSwitch needed).")
+    still = missing_binaries()
+    if still:
+        print("[✘] still missing after install: " + " ".join(still))
+        print("    install them by hand and run --install again.")
+        sys.exit(1)
+    print("[✔] dependencies ready.")
+
+
+def check_tun():
+    if not os.path.exists("/dev/net/tun"):
+        run(["modprobe", "tun"])
+    if not os.path.exists("/dev/net/tun"):
+        print("[!] /dev/net/tun is missing — kernel tunnels will work, core tunnels will not start.")
+        print("    a container without TUN cannot run the core; ask the host for /dev/net/tun.")
 
 
 def write_service():
@@ -3527,27 +3559,40 @@ def _finish_install(conf):
         conf["token"] = secrets.token_urlsafe(32)
     save_conf(conf)
     install_deps()
+    check_tun()
     write_service()
     svc("enable")
     svc("restart")
+    if not service_settled():
+        print("[✘] the service did not come up — journalctl -u " + SERVICE)
+        sys.exit(1)
     print("[✔] node agent installed and started.")
 
 
-def do_install():
+def _port_or(value, fallback):
+    try:
+        p = int(str(value).strip())
+    except Exception:
+        return fallback
+    return p if 1 <= p <= 65535 else fallback
+
+
+def do_install(port=""):
     conf = _prepare_install()
-    conf["port"] = int(input(f"Agent port [{conf.get('port', 8099)}]: ").strip() or conf.get("port", 8099))
+    have = conf.get("port", 8099)
+    if port:
+        conf["port"] = _port_or(port, have)
+    elif sys.stdin.isatty():
+        conf["port"] = _port_or(input(f"Agent port [{have}]: "), have)
+    else:
+        conf["port"] = have
     _finish_install(conf)
     do_show()
 
 
 def do_auto_install(port):
     conf = _prepare_install()
-    try:
-        conf["port"] = int(str(port).strip())
-    except Exception:
-        conf["port"] = conf.get("port", 8099)
-    if not 1 <= conf["port"] <= 65535:
-        conf["port"] = 8099
+    conf["port"] = _port_or(port, conf.get("port", 8099))
     _finish_install(conf)
     print("TNL_INSTALL_OK")
     print(f"TNL_NODE_PORT={conf['port']}")
@@ -3717,7 +3762,7 @@ def main():
         if os.geteuid() != 0:
             print("Run as root (sudo).")
             sys.exit(1)
-        do_install()
+        do_install(sys.argv[2] if len(sys.argv) > 2 else "")
     elif arg == "--auto-install":
         if os.geteuid() != 0:
             print("Run as root (sudo).")
