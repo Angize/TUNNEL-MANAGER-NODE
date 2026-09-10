@@ -585,8 +585,7 @@ def _core_tuning(tn):
                 iv = int(x)
             except (TypeError, ValueError):
                 continue
-            if lo <= iv <= hi:
-                steps.append(iv)
+            steps.append(max(lo, min(hi, iv)))
         if steps:
             out[k] = steps
     return out
