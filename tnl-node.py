@@ -1879,9 +1879,8 @@ def do_checkin():
     except Exception:
         return False
     tok = conf.get("token", "")
-    claim = {"fp": hashlib.sha256(tok.encode()).hexdigest(), "ips": all_ips(),
-             "port": conf.get("port"), "hostname": socket.gethostname(),
-             "ctr": int(time.time() * 1000)}
+    claim = {"fp": hashlib.sha256(tok.encode()).hexdigest(),
+             "port": conf.get("port"), "ctr": int(time.time() * 1000)}
     claim["sig"] = base64.b64encode(hmac.new(
         tok.encode(), json.dumps(claim, sort_keys=True, separators=(",", ":")).encode(),
         hashlib.sha256).digest()).decode()
