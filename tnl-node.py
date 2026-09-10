@@ -597,6 +597,17 @@ def _core_tuning(tn):
     return out
 
 
+def _live_local(name, key, ips):
+    live = set(local_ips_flat())
+    keep, gone = [], []
+    for ip in ips:
+        (keep if ip in live else gone).append(ip)
+    if gone:
+        logline("%s: dropped %s from %s -- not an address on this node any more"
+                % (name, ", ".join(gone), key))
+    return keep
+
+
 def _ordered_pool(primary, extras):
     seen, ordered = set(), []
     for x in [primary] + [str(v) for v in (extras or [])]:
@@ -647,7 +658,7 @@ def _core_config(cfg):
     if _tn:
         corecfg["tuning"] = _tn
     _sb = int(cfg.get("sock_buf") or 0)
-    if _sb:
+    if _sb and transport in QUEUEING_TRANSPORTS:
         corecfg["sock_buf"] = _sb
     if bool(cfg.get("cover")) and transport == "tcp" and crypto_on:
         corecfg["cover"] = True
@@ -781,18 +792,23 @@ def _core_config(cfg):
             corecfg["peer_rotate_secs"] = max(0, int(cfg.get("peer_rotate_secs") or 0))
         _src_sel = [str(x).strip() for x in (cfg.get("src_ips") or []) if str(x).strip()]
         sord = _ordered_pool(str(cfg.get("local_ip") or ""), _src_sel)
-        if _src_sel and sord:
-            corecfg["src_ips"] = sord
-            corecfg.setdefault("peer_rotate_secs", max(0, int(cfg.get("peer_rotate_secs") or 0)))
+        if len(sord) >= 2:
+            sord = _live_local(name, "src_ips", sord)
+            if len(sord) >= 2:
+                corecfg["src_ips"] = sord
+                corecfg.setdefault("peer_rotate_secs", max(0, int(cfg.get("peer_rotate_secs") or 0)))
     if cfg.get("role") == "server":
         lip = cfg.get("local_ip") or "0.0.0.0"
-        pool_ips = [str(x).strip() for x in (cfg.get("listen_ips") or []) if str(x).strip()]
         pooled = bool(cfg.get("pool_listen"))
-        if pooled and transport in ("udp", "tcp") and pool_ips:
+        pool_ips = []
+        if pooled and transport in ("udp", "tcp"):
+            pool_ips = _live_local(name, "listen_ips",
+                                   [str(x).strip() for x in (cfg.get("listen_ips") or []) if str(x).strip()])
+        if pool_ips:
             corecfg["listen"] = f"{pool_ips[0]}:{port}"
             corecfg["listen_ips"] = [f"{ip}:{port}" for ip in pool_ips]
-        elif pooled and transport == "raw":
-            corecfg["listen"] = f"0.0.0.0:{port}"
+        elif transport == "raw":
+            corecfg["listen"] = "0.0.0.0" if pooled else lip
         else:
             corecfg["listen"] = f"{lip}:{port}"
     else:
@@ -804,7 +820,7 @@ def _core_config(cfg):
                 dial, dport = h, int(p)
             else:
                 dial, dport = edge, (443 if bool(cfg.get("ws_tls")) else 80)
-        corecfg["peer"] = f"{dial}:{dport}"
+        corecfg["peer"] = dial if transport == "raw" else f"{dial}:{dport}"
         lip = str(cfg.get("local_ip") or "").strip()
         if lip:
             corecfg["bind_ip"] = lip
