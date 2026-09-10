@@ -3613,10 +3613,11 @@ def do_show():
 
 def change_port():
     conf = load_conf() if os.path.isfile(NODE_CONF) else {}
-    p = input(f"New agent port [{conf.get('port', 8099)}]: ").strip()
+    have = conf.get("port", 8099)
+    p = input(f"New agent port [{have}]: ").strip()
     if not p:
         return
-    conf["port"] = int(p)
+    conf["port"] = _port_or(p, have)
     save_conf(conf)
     if os.path.isfile(SERVICE_FILE):
         svc("restart")
