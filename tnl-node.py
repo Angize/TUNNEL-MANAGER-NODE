@@ -506,7 +506,7 @@ def build_ipsec(cfg):
 
 def _core_arch():
     m = os.uname().machine
-    return {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64"}.get(m, "amd64")
+    return {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64"}.get(m, "")
 
 
 def _core_ref():
