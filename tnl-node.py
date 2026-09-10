@@ -560,7 +560,6 @@ REVIVE_STEP_MAX = 3600
 BACKOFF_STEP_MIN = 1
 BACKOFF_STEP_MAX = 86400
 
-_TUNING_LIST_KEYS = ("suspect_backoff", "ladder_revive")
 _TUNING_LIST_RANGES = {"suspect_backoff": (BACKOFF_STEP_MIN, BACKOFF_STEP_MAX),
                        "ladder_revive": (REVIVE_STEP_MIN, REVIVE_STEP_MAX)}
 
@@ -1296,7 +1295,6 @@ def peer_of(tunnel_ip, ttype):
 
 
 PROBE_PORT = 9
-SYN_RTO = 1.0
 PROBE_WAIT = 0.8
 PROBE_COUNT = 20
 PROBE_MIN_PCT = 15
@@ -1471,47 +1469,10 @@ def pool_failover(name, alive, crossed, epoch, session_up, stable):
             + (f" [{err}]" if err else ""))
 
 
-LIVE_WINDOW = 12.0
-_flow_lock = threading.Lock()
-_flow_state = {}
-def _iface_ctr(name, which):
-    try:
-        with open("/sys/class/net/" + name + "/statistics/" + which + "_bytes") as f:
-            return int(f.read().strip())
-    except Exception:
-        return None
-
-
 def _prune_iface_state(names):
-    with _flow_lock:
-        for nm in [n for n in _flow_state if n not in names]:
-            _flow_state.pop(nm, None)
     with _verdict_lock:
         for nm in [n for n in _verdict if n not in names]:
             _verdict.pop(nm, None)
-
-
-def _flow_sample(name):
-    now = time.monotonic()
-    with _flow_lock:
-        rx, tx = _iface_ctr(name, "rx"), _iface_ctr(name, "tx")
-        if rx is None or tx is None:
-            return None, None
-        prev = _flow_state.get(name)
-        rxp = prev.get("rxp") if prev else None
-        txp = prev.get("txp") if prev else None
-        if prev is not None:
-            if rx > prev["rx"]:
-                rxp = now
-            elif rx < prev["rx"]:
-                rxp = None
-            if tx > prev["tx"]:
-                txp = now
-            elif tx < prev["tx"]:
-                txp = None
-        _flow_state[name] = {"rx": rx, "tx": tx, "rxp": rxp, "txp": txp}
-    still = lambda p: None if p is None else max(0.0, now - p)
-    return still(rxp), still(txp)
 
 
 def health_of(cfg):
@@ -1544,7 +1505,6 @@ def health_of(cfg):
                 reachable = False
         return {"active": active, "rule": rule, "reachable": reachable, "up": rule}
     up = os.path.exists("/sys/class/net/" + name)
-    rx_still, tx_still = _flow_sample(name) if up else (None, None)
     alive, rtt, loss, crossed = None, None, None, None
     tip = cfg.get("tunnel_ip", "")
     if up and tip and tip != "N/A":
@@ -1558,7 +1518,7 @@ def health_of(cfg):
             pool_failover(name, alive, crossed, epoch_before, ready_before and ready,
                           epoch == epoch_before)
     return {"up": up, "alive": alive, "dead": alive is False, "rtt_ms": rtt, "loss_pct": loss,
-            "crossed": crossed, "rx_still": rx_still, "tx_still": tx_still, "live_win": int(LIVE_WINDOW)}
+            "crossed": crossed}
 
 
 def _cpu_snap():
