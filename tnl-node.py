@@ -540,7 +540,7 @@ def _core_port(cfg):
     return int(cfg.get("port") or 20000)
 
 
-RAW_HEADER_LEN = {"bare": 0, "ipip": 20, "etherip": 2, "ipcomp": 4, "gre": 4, "icmp": 8, "udp": 8,
+RAW_HEADER_LEN = {"bare": 0, "ipip": 20, "etherip": 2, "ipcomp": 4, "gre": 24, "icmp": 8, "udp": 8,
                   "esp": 8, "l2tpv3": 8, "tcp": 32, "ah": 24}
 MAX_WORKERS = 8
 MAX_SPROT_EVERY = 60
