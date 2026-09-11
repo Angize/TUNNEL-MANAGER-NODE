@@ -781,10 +781,13 @@ def _core_config(cfg):
         corecfg["gso"] = True
     if transport in ("raw", "tcp", "ws") and cfg.get("role") == "client" and bool(cfg.get("fake_desync")):
         corecfg["fake_desync"] = True
-        corecfg["fake_ttl"] = max(1, min(255, int(cfg.get("fake_ttl") or 4)))
         corecfg["fake_count"] = max(1, min(64, int(cfg.get("fake_count") or 2)))
         mode = str(cfg.get("fake_mode") or "ttl").strip().lower()
-        corecfg["fake_mode"] = mode if mode in ("ttl", "badsum", "both") else "ttl"
+        if mode not in ("ttl", "badsum", "both"):
+            mode = "ttl"
+        corecfg["fake_mode"] = mode
+        if not (transport == "raw" and mode == "badsum"):
+            corecfg["fake_ttl"] = max(1, min(255, int(cfg.get("fake_ttl") or 4)))
     if transport in ("udp", "tcp", "raw") and str(cfg.get("role")) == "client":
         ordered = _ordered_pool(str(cfg.get("remote_ip") or ""), cfg.get("peer_ips"))
         if len(ordered) >= 2:
