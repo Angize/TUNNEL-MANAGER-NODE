@@ -2498,6 +2498,13 @@ def op_check(d):
         raise ValueError("not found")
     with _health_lock:
         health = dict(_health_cache.get(cfg["name"]) or {"up": None})
+    name, tip = cfg["name"], cfg.get("tunnel_ip", "")
+    if (cfg.get("type") != "portfw" and tip and tip != "N/A"
+            and os.path.exists("/sys/class/net/" + name)):
+        hits, sent, rtt = tun_probe(name, tip, cfg.get("type"))
+        if sent >= PROBE_MIN_SAMPLE:
+            health["rtt_ms"] = rtt
+            health["loss_pct"] = round((sent - hits) * 100.0 / sent, 1)
     return {"ok": True, "health": health}
 
 
