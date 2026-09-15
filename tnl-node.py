@@ -2331,10 +2331,9 @@ def op_portfw(d):
         if liface and IFACE_RE.match(liface):
             iface = liface
     interval = 0 if len(ips) == 1 else int(d.get("interval_min", 5)) * 60
-    for c in raw_configs():
-        if (c.get("type") == "portfw" and c.get("iface") == iface and str(c.get("listen_port")) == lp
-                and str(c.get("listen_ip") or "") == listen_ip):
-            raise ValueError(f"port {lp} on {iface}{' (' + listen_ip + ')' if listen_ip else ''} is already forwarded (delete it first)")
+    why = _pf_conflict(iface, lp, listen_ip)
+    if why:
+        raise ValueError(why)
     tid = int(d.get("id") or 0) or (max(used_ids(), default=41) + 1)
     name = f"portfw{tid}"
     if os.path.exists(os.path.join(CONFIG_DIR, name + ".json")):
@@ -2389,11 +2388,9 @@ def op_portfw_edit(d):
                 iface = liface
     else:
         listen_ip = str(old.get("listen_ip") or "")
-    for c in raw_configs():
-        if (c.get("name") != old["name"] and c.get("type") == "portfw"
-                and c.get("iface") == iface and str(c.get("listen_port")) == lp
-                and str(c.get("listen_ip") or "") == listen_ip):
-            raise ValueError(f"port {lp} on {iface} is already forwarded")
+    why = _pf_conflict(iface, lp, listen_ip, skip=old["name"])
+    if why:
+        raise ValueError(why)
     teardown_config(old)
     idx = int(old.get("current_index", 0) or 0)
     if idx >= len(ips):
@@ -2533,8 +2530,9 @@ def _decode_hexip(h):
     return None
 
 
-def _port_busy_proc(port, proto, tip=None):
+def _port_listeners_proc(port, proto):
     files = ("/proc/net/tcp", "/proc/net/tcp6") if proto == "tcp" else ("/proc/net/udp", "/proc/net/udp6")
+    found = []
     for path in files:
         try:
             with open(path) as f:
@@ -2552,37 +2550,78 @@ def _port_busy_proc(port, proto, tip=None):
                             continue
                     except ValueError:
                         continue
-                    if tip is None:
-                        return True
-                    lip = _decode_hexip(hexaddr)
-                    if lip is None or lip in _WILD or lip == tip:
-                        return True
+                    found.append((_decode_hexip(hexaddr) or "*", ""))
         except (OSError, StopIteration):
             continue
-    return False
+    return found
+
+
+def _port_listeners(port, proto):
+    rc, out, _ = run(["ss", "-H", "-l", "-n", "-p", "-t" if proto == "tcp" else "-u"])
+    if rc != 0:
+        return _port_listeners_proc(port, proto)
+    found = []
+    for line in out.splitlines():
+        f = line.split()
+        if len(f) < 4 or ":" not in f[3]:
+            continue
+        host, _, lport = f[3].rpartition(":")
+        if lport == str(port):
+            found.append((_norm_ip(host), _ss_proc(line)))
+    return found
+
+
+def _ip_overlap(a, b):
+    return not a or not b or a in _WILD or b in _WILD or a == b
 
 
 def _port_busy(port, proto, ip=None):
     proto = "tcp" if str(proto).lower() == "tcp" else "udp"
-    flag = "-t" if proto == "tcp" else "-u"
-    tip = _norm_ip(ip) or None
-    rc, out, _ = run(["ss", "-H", "-l", "-n", "-p", flag])
-    if rc == 0:
-        for line in out.splitlines():
-            f = line.split()
-            if len(f) < 4:
+    tip = _norm_ip(ip)
+    for host, who in _port_listeners(port, proto):
+        if _ip_overlap(tip, host):
+            return True, who
+    return False, ""
+
+
+def _tunnel_ports(c):
+    t = c.get("type")
+    if t == "core":
+        transport = str(c.get("transport") or "udp").lower()
+        if c.get("role") != "server" or transport == "raw":
+            return []
+        port = _core_port(c)
+        pool = ([str(x).strip() for x in (c.get("listen_ips") or []) if str(x).strip()]
+                if c.get("pool_listen") and transport in ("udp", "tcp") else [])
+        return [(ip, port) for ip in pool] or [(str(c.get("local_ip") or ""), port)]
+    if t == "vxlan":
+        return [("", int(c.get("port") or 4789))]
+    if t == "fou":
+        return [("", _fou_port(c))]
+    if t == "l2tpv3":
+        return [(str(c.get("local_ip") or ""), _l2tp_ids(c)[1])]
+    return []
+
+
+def _pf_conflict(iface, lp, listen_ip, skip=""):
+    port = int(lp)
+    for c in raw_configs():
+        if c.get("name") == skip:
+            continue
+        if c.get("type") == "portfw":
+            if (c.get("iface") == iface and str(c.get("listen_port")) == lp
+                    and _ip_overlap(listen_ip, str(c.get("listen_ip") or ""))):
+                return f"port {lp} on {iface} is already forwarded by {c['name']}"
+            continue
+        for ip, p in _tunnel_ports(c):
+            if p == port and _ip_overlap(listen_ip, ip):
+                return f"port {lp} is used by tunnel {c['name']}"
+    for proto in ("tcp", "udp"):
+        for host, who in _port_listeners(port, proto):
+            if host.startswith("127.") or host == "::1" or not _ip_overlap(listen_ip, host):
                 continue
-            local = f[3]
-            if ":" not in local:
-                continue
-            host, _, lport = local.rpartition(":")
-            if lport != str(port):
-                continue
-            lhost = _norm_ip(host)
-            if tip is None or lhost in _WILD or lhost == tip:
-                return True, _ss_proc(line)
-        return False, ""
-    return _port_busy_proc(port, proto, tip), ""
+            return f"port {lp}/{proto} is in use on this node" + (f" by {who}" if who else "")
+    return ""
 
 
 SPEED_CHUNK = 1 << 16
@@ -2749,6 +2788,11 @@ def op_portcheck(d):
     if ip and not re.match(r"^[0-9A-Fa-f:.]{1,45}$", ip):
         raise ValueError("bad ip")
     busy, who = _port_busy(port, proto, ip)
+    if not busy:
+        who = next((c["name"] for c in raw_configs() if c.get("type") == "portfw"
+                    and str(c.get("listen_port")) == str(port)
+                    and _ip_overlap(ip, str(c.get("listen_ip") or ""))), "")
+        busy = bool(who)
     return {"ok": True, "busy": busy, "who": who, "port": port, "proto": proto, "ip": ip or ""}
 
 
