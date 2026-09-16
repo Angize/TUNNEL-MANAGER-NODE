@@ -187,6 +187,26 @@ def unique_name(ttype, tid):
     return name if rc != 0 else None
 
 
+UPLINK_RE = re.compile(r"^(eth|ens|eno|enp|enx|em|bond|venet|vmbr|br)[0-9a-z]*$|^p[0-9]+p[0-9]+$")
+ROUTE_DEV_TTL = 10
+_route_dev = {"ts": 0.0, "dev": None}
+
+
+def _default_route_dev():
+    now = time.monotonic()
+    if _route_dev["ts"] and now - _route_dev["ts"] < ROUTE_DEV_TTL:
+        return _route_dev["dev"]
+    dev = None
+    rc, out, _ = run(["ip", "route", "show", "default"])
+    for line in out.splitlines():
+        parts = line.split()
+        if "dev" in parts and parts.index("dev") + 1 < len(parts):
+            dev = parts[parts.index("dev") + 1]
+            break
+    _route_dev.update(ts=now, dev=dev)
+    return dev
+
+
 def list_ifaces():
     rc, out, _ = run(["ip", "-o", "link", "show"])
     res = []
@@ -195,8 +215,11 @@ def list_ifaces():
         if len(parts) < 2:
             continue
         name = parts[1].split("@")[0].strip()
-        if re.match(r"^(eth|ens|eno|enp|enx)[0-9a-z]*$", name):
+        if UPLINK_RE.match(name):
             res.append(name)
+    dev = _default_route_dev()
+    if dev and dev not in res and IFACE_RE.match(dev) and dev not in {c.get("name") for c in raw_configs()}:
+        res.append(dev)
     return res
 
 
@@ -222,12 +245,9 @@ def local_ips_flat():
 
 
 def default_iface():
-    rc, out, _ = run(["ip", "route"])
-    for line in out.splitlines():
-        if line.startswith("default"):
-            parts = line.split()
-            if "dev" in parts:
-                return parts[parts.index("dev") + 1]
+    dev = _default_route_dev()
+    if dev:
+        return dev
     ifs = list_ifaces()
     return ifs[0] if ifs else None
 
