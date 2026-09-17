@@ -2355,7 +2355,7 @@ def op_portfw(d):
         liface = iface_for_ip(listen_ip)
         if liface and IFACE_RE.match(liface):
             iface = liface
-    interval = 0 if len(ips) == 1 else int(d.get("interval_min", 5)) * 60
+    interval = int(d.get("interval_min", 5)) * 60 if d.get("rotate") and len(ips) > 1 else 0
     why = _pf_conflict(iface, lp, listen_ip)
     if why:
         raise ValueError(why)
