@@ -1727,27 +1727,28 @@ def _health_harvest(names):
             _health_cache.pop(nm, None)
 
 
+def _health_now(cfg):
+    res = health_of(cfg)
+    with _health_lock:
+        _health_inflight.pop(cfg["name"], None)
+        _health_cache[cfg["name"]] = res
+        _sweep_due[cfg["name"]] = time.monotonic() + _sweep_gap(res)
+
+
 def health_refresh_once(ex):
     cfgs = raw_configs()
-    if not cfgs:
-        with _health_lock:
-            _health_cache.clear()
-        _health_inflight.clear()
-        _sweep_due.clear()
-        _prune_iface_state(set())
-        return
     names = {c["name"] for c in cfgs}
     _health_harvest(names)
-    for nm in [n for n in _health_inflight if n not in names]:
-        _health_inflight.pop(nm, None)
-    for nm in [n for n in _sweep_due if n not in names]:
-        _sweep_due.pop(nm, None)
-    now = time.monotonic()
-    for c in cfgs:
-        if c["name"] in _health_inflight or _sweep_due.get(c["name"], 0.0) > now:
-            continue
-        _health_inflight[c["name"]] = ex.submit(health_of, c)
-    futures_wait(set(_health_inflight.values()), timeout=HEALTH_DEADLINE)
+    with _health_lock:
+        for store in (_health_inflight, _sweep_due):
+            for nm in [n for n in store if n not in names]:
+                store.pop(nm, None)
+        now = time.monotonic()
+        for c in cfgs:
+            if c["name"] not in _health_inflight and _sweep_due.get(c["name"], 0.0) <= now:
+                _health_inflight[c["name"]] = ex.submit(health_of, c)
+        pending = set(_health_inflight.values())
+    futures_wait(pending, timeout=HEALTH_DEADLINE)
     _health_harvest(names)
     _prune_iface_state(names)
 
@@ -2426,6 +2427,7 @@ def op_portfw_edit(d):
         build_portfw(obj)
     except Exception as e:
         return {"ok": False, "msg": str(e)}
+    _health_now(obj)
     return {"ok": True, "name": old["name"]}
 
 
@@ -2441,6 +2443,7 @@ def op_portfw_next(d):
     cfg["last_switch"] = int(time.time())
     write_config(cfg["name"], cfg)
     build_portfw(cfg)
+    _health_now(cfg)
     return {"ok": True, "active": ips[cfg["current_index"]]}
 
 
