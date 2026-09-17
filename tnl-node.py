@@ -1143,18 +1143,18 @@ def _ipt_add_missing(table, chain, rule):
         run(["iptables", "-t", table, "-A", chain] + rule)
 
 
-def _ipt_ins_missing(table, chain, rule):
-    rc, _, _ = run(["iptables", "-t", table, "-C", chain] + rule)
+def _ipt_ins_missing(table, chain, rule, ipt="iptables"):
+    rc, _, _ = run([ipt, "-t", table, "-C", chain] + rule)
     if rc != 0:
-        run(["iptables", "-t", table, "-I", chain, "1"] + rule)
+        run([ipt, "-t", table, "-I", chain, "1"] + rule)
 
 
-def _ipt_del_all(table, chain, rule, tries=64):
+def _ipt_del_all(table, chain, rule, tries=64, ipt="iptables"):
     for _ in range(tries):
-        rc, _, _ = run(["iptables", "-t", table, "-C", chain] + rule)
+        rc, _, _ = run([ipt, "-t", table, "-C", chain] + rule)
         if rc != 0:
             break
-        run(["iptables", "-t", table, "-D", chain] + rule)
+        run([ipt, "-t", table, "-D", chain] + rule)
 
 
 def _pf_acct_build(cfg):
@@ -2650,12 +2650,16 @@ SPEED_MAX_STREAMS = 8
 SPEED_ZERO = bytes(SPEED_CHUNK)
 
 
-def _tun_ip4(name):
-    rc, out, _ = run(["ip", "-o", "-4", "addr", "show", name])
-    m = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", out) if rc == 0 else None
+def _tun_ip(name):
+    rc, out, _ = run(["ip", "-o", "addr", "show", "dev", name, "scope", "global"])
+    m = re.search(r"\binet6? ([0-9A-Fa-f:.]+)", out) if rc == 0 else None
     if not m:
-        raise ValueError("interface %s has no IPv4 address" % name)
+        raise ValueError("interface %s has no address" % name)
     return m.group(1)
+
+
+def _ipt_for(ip):
+    return "ip6tables" if ":" in ip else "iptables"
 
 
 def _speed_rule(name, ip, port):
@@ -2688,7 +2692,7 @@ def _speed_conn(c, secs):
             pass
 
 
-def _speed_serve(s, rule, secs):
+def _speed_serve(s, rule, secs, ipt):
     end = time.time() + secs * 2 + 30
     s.settimeout(2.0)
     try:
@@ -2705,7 +2709,7 @@ def _speed_serve(s, rule, secs):
             s.close()
         except OSError:
             pass
-        _ipt_del_all("filter", "INPUT", rule)
+        _ipt_del_all("filter", "INPUT", rule, ipt=ipt)
 
 
 def _speed_dir(mode, ip, port, src, secs, streams):
@@ -2768,23 +2772,27 @@ def op_speedtest(d):
     secs = min(SPEED_MAX_SECS, max(3, int(d.get("secs") or 8)))
     mode = str(d.get("mode") or "")
     if mode == "serve":
-        ip = _tun_ip4(name)
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        ip = _tun_ip(name)
+        s = socket.socket(socket.AF_INET6 if ":" in ip else socket.AF_INET, socket.SOCK_STREAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind((ip, 0))
         s.listen(SPEED_MAX_STREAMS * 2)
         port = s.getsockname()[1]
         rule = _speed_rule(name, ip, port)
-        _ipt_ins_missing("filter", "INPUT", rule)
-        threading.Thread(target=_speed_serve, args=(s, rule, secs), daemon=True).start()
+        _ipt_ins_missing("filter", "INPUT", rule, _ipt_for(ip))
+        threading.Thread(target=_speed_serve, args=(s, rule, secs, _ipt_for(ip)), daemon=True).start()
         return {"ok": True, "ip": ip, "port": port, "secs": secs}
     if mode == "run":
         ip = str(d.get("peer_ip") or "")
         port = int(d.get("port") or 0)
-        if not is_ipv4(ip) or not 1 <= port <= 65535:
+        try:
+            ipaddress.ip_address(ip)
+        except ValueError:
+            raise ValueError("bad peer")
+        if not 1 <= port <= 65535:
             raise ValueError("bad peer")
         streams = min(SPEED_MAX_STREAMS, max(1, int(d.get("streams") or 4)))
-        src = _tun_ip4(name)
+        src = _tun_ip(name)
         up, nup = _speed_dir(b"U", ip, port, src, secs, streams)
         down, ndown = _speed_dir(b"D", ip, port, src, secs, streams)
         if not nup and not ndown:
