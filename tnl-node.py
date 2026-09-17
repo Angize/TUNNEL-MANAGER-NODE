@@ -1437,6 +1437,13 @@ def carrying(hits, sent, pct):
     return hits * 100 >= sent * pct
 
 
+def probe_verdict(cfg):
+    hits, sent, rtt = tun_probe(cfg["name"], cfg["tunnel_ip"], cfg.get("type"))
+    if sent < PROBE_MIN_SAMPLE:
+        return None, None, None
+    return carrying(hits, sent, probe_min_pct(cfg)), rtt, round((sent - hits) * 100.0 / sent, 1)
+
+
 _verdict_lock = threading.Lock()
 _verdict = {}
 
@@ -1558,10 +1565,8 @@ def health_of(cfg):
     tip = cfg.get("tunnel_ip", "")
     if up and tip and tip != "N/A":
         epoch_before, ready_before = _read_path_state(name)
-        hits, sent, rtt = tun_probe(name, tip, ttype)
-        if sent >= PROBE_MIN_SAMPLE:
-            loss = round((sent - hits) * 100.0 / sent, 1)
-            crossed = carrying(hits, sent, probe_min_pct(cfg))
+        crossed, rtt, loss = probe_verdict(cfg)
+        if crossed is not None:
             alive = settle(name, crossed)
             epoch, ready = _read_path_state(name)
             pool_failover(name, alive, crossed, epoch_before, ready_before and ready,
@@ -2511,18 +2516,14 @@ def op_wipe(d):
 def op_check(d):
     _require(d, ["name"])
     cfg = read_config(d["name"])
-    if not cfg:
+    if not cfg or cfg.get("type") == "portfw":
         raise ValueError("not found")
-    with _health_lock:
-        health = dict(_health_cache.get(cfg["name"]) or {"up": None})
-    name, tip = cfg["name"], cfg.get("tunnel_ip", "")
-    if (cfg.get("type") != "portfw" and tip and tip != "N/A"
-            and os.path.exists("/sys/class/net/" + name)):
-        hits, sent, rtt = tun_probe(name, tip, cfg.get("type"))
-        if sent >= PROBE_MIN_SAMPLE:
-            health["rtt_ms"] = rtt
-            health["loss_pct"] = round((sent - hits) * 100.0 / sent, 1)
-    return {"ok": True, "health": health}
+    up = os.path.exists("/sys/class/net/" + cfg["name"])
+    crossed = rtt = loss = None
+    if up and cfg.get("tunnel_ip") and cfg.get("tunnel_ip") != "N/A":
+        crossed, rtt, loss = probe_verdict(cfg)
+    return {"ok": True, "health": {"up": up, "alive": crossed, "dead": crossed is False, "rtt_ms": rtt,
+                                   "loss_pct": loss, "crossed": crossed}}
 
 
 def _ss_proc(line):
