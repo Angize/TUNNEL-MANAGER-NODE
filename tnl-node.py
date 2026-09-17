@@ -348,8 +348,8 @@ def tuning_status():
 
 def apply_kernel_tuning():
     if not tuning_active():
-        prev = {"cc": _sysctl_get("net.ipv4.tcp_congestion_control"),
-                "qdisc": _sysctl_get("net.core.default_qdisc")}
+        keys = [k for k, _ in KERNEL_TUNING] + ["net.ipv4.tcp_congestion_control"]
+        prev = {k: _sysctl_get(k) for k in keys}
         err = _atomic_write_json(TUNING_PREV, prev)
         if err:
             logline(f"kernel tuning: could not save originals, NOT applying: {err}")
@@ -393,11 +393,9 @@ def revert_kernel_tuning():
             prev = json.load(f)
     except Exception:
         prev = {}
-    cc, qdisc = prev.get("cc"), prev.get("qdisc")
-    if cc:
-        run(["sysctl", "-w", f"net.ipv4.tcp_congestion_control={cc}"])
-    if qdisc:
-        run(["sysctl", "-w", f"net.core.default_qdisc={qdisc}"])
+    for k, v in prev.items():
+        if v:
+            run(["sysctl", "-w", f"{k}={v}"])
     for p in (TUNING_DROPIN, TUNING_MODLOAD, TUNING_PREV):
         try:
             if os.path.isfile(p):
