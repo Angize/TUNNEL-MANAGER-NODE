@@ -2650,6 +2650,7 @@ SPEED_CHUNK = 1 << 16
 SPEED_MAX_SECS = 30
 SPEED_MAX_STREAMS = 8
 SPEED_ZERO = bytes(SPEED_CHUNK)
+_speed_lock = threading.Lock()
 
 
 def _tun_ip(name):
@@ -2711,7 +2712,8 @@ def _speed_serve(s, rule, secs, ipt):
             s.close()
         except OSError:
             pass
-        _ipt_del_all("filter", "INPUT", rule, ipt=ipt)
+        with _apply_lock:
+            _ipt_del_all("filter", "INPUT", rule, ipt=ipt)
 
 
 def _speed_dir(mode, ip, port, src, secs, streams):
@@ -2781,28 +2783,38 @@ def op_speedtest(d):
         s.listen(SPEED_MAX_STREAMS * 2)
         port = s.getsockname()[1]
         rule = _speed_rule(name, ip, port)
-        _ipt_ins_missing("filter", "INPUT", rule, _ipt_for(ip))
+        with _apply_lock:
+            _ipt_ins_missing("filter", "INPUT", rule, _ipt_for(ip))
         threading.Thread(target=_speed_serve, args=(s, rule, secs, _ipt_for(ip)), daemon=True).start()
         return {"ok": True, "ip": ip, "port": port, "secs": secs}
     if mode == "run":
-        ip = str(d.get("peer_ip") or "")
-        port = int(d.get("port") or 0)
+        if not _speed_lock.acquire(blocking=False):
+            raise ValueError("a speed test is already running on this node")
         try:
-            ipaddress.ip_address(ip)
-        except ValueError:
-            raise ValueError("bad peer")
-        if not 1 <= port <= 65535:
-            raise ValueError("bad peer")
-        streams = min(SPEED_MAX_STREAMS, max(1, int(d.get("streams") or 4)))
-        src = _tun_ip(name)
-        up, nup = _speed_dir(b"U", ip, port, src, secs, streams)
-        down, ndown = _speed_dir(b"D", ip, port, src, secs, streams)
-        if not nup and not ndown:
-            raise ValueError("nothing reached %s:%d over %s -- the far end is not listening or the "
-                             "tunnel is not carrying" % (ip, port, name))
-        return {"ok": True, "secs": secs, "streams": streams, "up_mbit": up, "down_mbit": down,
-                "up_streams": nup, "down_streams": ndown}
+            return _speed_run(d, name, secs)
+        finally:
+            _speed_lock.release()
     raise ValueError("bad mode")
+
+
+def _speed_run(d, name, secs):
+    ip = str(d.get("peer_ip") or "")
+    port = int(d.get("port") or 0)
+    try:
+        ipaddress.ip_address(ip)
+    except ValueError:
+        raise ValueError("bad peer")
+    if not 1 <= port <= 65535:
+        raise ValueError("bad peer")
+    streams = min(SPEED_MAX_STREAMS, max(1, int(d.get("streams") or 4)))
+    src = _tun_ip(name)
+    up, nup = _speed_dir(b"U", ip, port, src, secs, streams)
+    down, ndown = _speed_dir(b"D", ip, port, src, secs, streams)
+    if not nup and not ndown:
+        raise ValueError("nothing reached %s:%d over %s -- the far end is not listening or the "
+                         "tunnel is not carrying" % (ip, port, name))
+    return {"ok": True, "secs": secs, "streams": streams, "up_mbit": up, "down_mbit": down,
+            "up_streams": nup, "down_streams": ndown}
 
 
 def op_portcheck(d):
@@ -3320,6 +3332,7 @@ OPS = {"ping": op_ping, "list": op_list, "check": op_check, "tunnel": op_tunnel,
        "kernel-tune": op_kernel_tune,
        "link-enable": op_link_enable, "core-restart": op_core_restart}
 READ_ONLY = {"ping", "list", "check", "portcheck", "edge-status", "peer-status"}
+UNLOCKED = {"speedtest"}
 
 WIRE = {
     "pg": "ping", "ls": "list", "ck": "check", "mk": "tunnel", "dl": "delete",
@@ -3509,11 +3522,14 @@ class Handler(BaseHTTPRequestHandler):
                 if _restart_pending.is_set():
                     self._send(503, {"error": "agent is restarting, retry shortly"})
                     return
-                with _apply_lock:
-                    if _restart_pending.is_set():
-                        self._send(503, {"error": "agent is restarting, retry shortly"})
-                        return
+                if cmd in UNLOCKED:
                     res = OPS[cmd](d)
+                else:
+                    with _apply_lock:
+                        if _restart_pending.is_set():
+                            self._send(503, {"error": "agent is restarting, retry shortly"})
+                            return
+                        res = OPS[cmd](d)
             self._send(200, res)
         except ValueError as e:
             self._send(400, {"error": str(e)})
