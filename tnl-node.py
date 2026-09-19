@@ -872,6 +872,17 @@ def _core_last_error(name, lines=40):
     return ""
 
 
+def _netdev_exists(name):
+    return bool(name) and os.path.exists("/sys/class/net/" + name)
+
+
+def _master_of(name):
+    try:
+        return os.path.basename(os.readlink("/sys/class/net/%s/master" % name))
+    except OSError:
+        return ""
+
+
 def _netdev_missing_reason(name, ttype):
     if run(["ip", "link", "show", name])[0] == 0:
         return ""
@@ -955,7 +966,7 @@ def build_core(cfg):
         json.dump(corecfg, f, indent=2)
     os.chmod(tmp, 0o600)
     os.replace(tmp, path)
-    _core_relaunch(cfg)
+    return _core_relaunch(cfg)
 
 
 def _core_relaunch(cfg):
@@ -975,7 +986,7 @@ def _core_relaunch(cfg):
          "-p", "Restart=always", "-p", "RestartSec=3",
          CORE_BIN, "--config", _cfg_path(name, ".json")])
     for _ in range(80):
-        if os.path.exists("/sys/class/net/" + name):
+        if _netdev_exists(name):
             return True
         time.sleep(0.1)
     return False
@@ -1004,7 +1015,7 @@ def _sweep_owned_rules(name):
             except ValueError:
                 continue
             args[0] = "-D"
-            run(["iptables", "-t", table] + args)
+            _ipt(table, args)
             removed += 1
     if removed:
         logline("%s: swept %d orphaned firewall rule(s) tagged %s%s" % (name, removed, RULE_OWNER_PREFIX, name))
@@ -1040,10 +1051,10 @@ def _set_link_state(cfg, enabled):
         raise ValueError("bad name")
     if cfg.get("type") == "core":
         if enabled:
-            build_core(cfg)
-            why = _netdev_missing_reason(name, "core")
-            if why:
-                raise RuntimeError(why)
+            if not build_core(cfg):
+                why = _netdev_missing_reason(name, "core")
+                _core_stop(name)
+                raise RuntimeError(why or ("core %s did not come up" % name))
         else:
             _core_stop(name)
             if _core_running(name):
@@ -1058,6 +1069,18 @@ def _pf_match(cfg, iface, proto, lp):
     if is_ipv4(lip):
         m += ["-d", lip]
     return m
+
+
+def _pf_dnat(cfg, iface, proto, lp, ip, dp):
+    return _pf_match(cfg, iface, proto, lp) + ["-j", "DNAT", "--to-destination", "%s:%s" % (ip, dp)]
+
+
+def _pf_masq(cfg, proto, ip, dp, lp):
+    m = ["-d", ip, "-p", proto, "--dport", dp, "-m", "conntrack", "--ctstate", "DNAT"]
+    lip = cfg.get("listen_ip") or ""
+    if is_ipv4(lip):
+        m += ["--ctorigdst", lip]
+    return m + ["--ctorigdstport", lp, "-j", "MASQUERADE"]
 
 
 def _pf_acct_rules(cfg):
@@ -1135,28 +1158,45 @@ def _ct_bypass_build(cfg):
     return len(rules)
 
 
-def _ipt_add_missing(table, chain, rule):
-    rc, _, _ = run(["iptables", "-t", table, "-C", chain] + rule)
+IPT_WAIT = "5"
+IPT_NO_RULE = 1
+
+
+def _ipt(table, args, ipt="iptables"):
+    return run([ipt, "-w", IPT_WAIT, "-t", table] + args)
+
+
+def _ipt_must(table, args, ipt="iptables"):
+    rc, out, err = _ipt(table, args, ipt)
     if rc != 0:
-        run(["iptables", "-t", table, "-A", chain] + rule)
+        raise RuntimeError((err or out or ("rc=" + str(rc))).strip()
+                           + "  [" + " ".join([ipt, "-t", table] + args) + "]")
+
+
+def _ipt_has(table, chain, rule, ipt="iptables"):
+    rc, _, _ = _ipt(table, ["-C", chain] + rule, ipt)
+    return True if rc == 0 else (False if rc == IPT_NO_RULE else None)
+
+
+def _ipt_add_missing(table, chain, rule):
+    if _ipt_has(table, chain, rule) is not True:
+        _ipt(table, ["-A", chain] + rule)
 
 
 def _ipt_ins_missing(table, chain, rule, ipt="iptables"):
-    rc, _, _ = run([ipt, "-t", table, "-C", chain] + rule)
-    if rc != 0:
-        run([ipt, "-t", table, "-I", chain, "1"] + rule)
+    if _ipt_has(table, chain, rule, ipt) is not True:
+        _ipt(table, ["-I", chain, "1"] + rule, ipt)
 
 
 def _ipt_del_all(table, chain, rule, tries=64, ipt="iptables"):
     for _ in range(tries):
-        rc, _, _ = run([ipt, "-t", table, "-C", chain] + rule)
-        if rc != 0:
+        if _ipt_has(table, chain, rule, ipt) is not True:
             break
-        run([ipt, "-t", table, "-D", chain] + rule)
+        _ipt(table, ["-D", chain] + rule, ipt)
 
 
 def _pf_acct_build(cfg):
-    run(["iptables", "-t", "mangle", "-N", "PFACCT"])
+    _ipt("mangle", ["-N", "PFACCT"])
     _ipt_add_missing("mangle", "PREROUTING", ["-j", "PFACCT"])
     for r in _pf_acct_rules(cfg):
         _ipt_add_missing("mangle", "PFACCT", r)
@@ -1201,17 +1241,11 @@ def build_portfw(cfg):
         idx = 0
     active = ips[idx]
     for proto in ("tcp", "udp"):
-        match = _pf_match(cfg, iface, proto, lp)
         for ip in ips:
-            _ipt_del_all("nat", "PREROUTING", match + ["-j", "DNAT", "--to-destination", f"{ip}:{dp}"])
-        run(["iptables", "-t", "nat", "-A", "PREROUTING"] + match
-            + ["-j", "DNAT", "--to-destination", f"{active}:{dp}"])
-    for proto in ("tcp", "udp"):
-        for ip in ips:
-            _ipt_del_all("nat", "POSTROUTING",
-                         ["-d", ip, "-p", proto, "--dport", dp, "-o", iface, "-j", "MASQUERADE"])
-        run(["iptables", "-t", "nat", "-A", "POSTROUTING", "-d", active, "-p", proto,
-            "--dport", dp, "-o", iface, "-j", "MASQUERADE"])
+            _ipt_del_all("nat", "PREROUTING", _pf_dnat(cfg, iface, proto, lp, ip, dp))
+            _ipt_del_all("nat", "POSTROUTING", _pf_masq(cfg, proto, ip, dp, lp))
+        _ipt_must("nat", ["-A", "PREROUTING"] + _pf_dnat(cfg, iface, proto, lp, active, dp))
+        _ipt_must("nat", ["-A", "POSTROUTING"] + _pf_masq(cfg, proto, active, dp, lp))
     _pf_acct_build(cfg)
 
 
@@ -1267,18 +1301,11 @@ def teardown_config(cfg):
         iface, lp, dp = cfg.get("iface", ""), str(cfg.get("listen_port", "")), str(cfg.get("dst_port", ""))
         if IFACE_RE.match(iface) and lp.isdigit() and dp.isdigit():
             for proto in ("tcp", "udp"):
-                match = _pf_match(cfg, iface, proto, lp)
                 for ip in cfg.get("dst_ips", []):
                     if not is_ipv4(ip):
                         continue
-                    _ipt_del_all("nat", "PREROUTING",
-                                 match + ["-j", "DNAT", "--to-destination", f"{ip}:{dp}"])
-            for proto in ("tcp", "udp"):
-                for ip in cfg.get("dst_ips", []):
-                    if not is_ipv4(ip):
-                        continue
-                    _ipt_del_all("nat", "POSTROUTING",
-                                 ["-d", ip, "-p", proto, "--dport", dp, "-o", iface, "-j", "MASQUERADE"])
+                    _ipt_del_all("nat", "PREROUTING", _pf_dnat(cfg, iface, proto, lp, ip, dp))
+                    _ipt_del_all("nat", "POSTROUTING", _pf_masq(cfg, proto, ip, dp, lp))
 
 
 def apply_all():
@@ -1287,12 +1314,22 @@ def apply_all():
     pip = primary_ip() if has_default else None
     locals_now = local_ips_flat()
     for cfg in raw_configs():
+        dirty = False
         if cfg.get("type") not in ("portfw", None):
             li = cfg.get("local_ip")
             if li and pip and li not in locals_now:
                 cfg["local_ip"] = pip
-                write_config(cfg["name"], cfg)
+                dirty = True
                 logline(f"self-healed local_ip of {cfg['name']} -> {pip}")
+        ifc = cfg.get("iface")
+        if ifc and not _netdev_exists(ifc):
+            want = iface_for_ip(cfg.get("listen_ip") or cfg.get("local_ip") or "")
+            if want and IFACE_RE.match(want) and want != ifc:
+                cfg["iface"] = want
+                dirty = True
+                logline(f"self-healed iface of {cfg['name']} -> {want}")
+        if dirty:
+            write_config(cfg["name"], cfg)
         try:
             apply_config(cfg)
         except Exception as e:
@@ -1316,7 +1353,11 @@ def rotate_once():
         cfg["current_index"] = (int(cfg.get("current_index", 0) or 0) + 1) % len(ips)
         cfg["last_switch"] = now
         write_config(cfg["name"], cfg)
-        build_portfw(cfg)
+        try:
+            build_portfw(cfg)
+        except Exception as e:
+            logline(f"rotate {cfg['name']} failed: {e}")
+            continue
         logline(f"rotated {cfg['name']} -> index {cfg['current_index']}")
 
 
@@ -1529,6 +1570,24 @@ def _prune_iface_state(names):
             _verdict.pop(nm, None)
 
 
+PF_DEAD_ERRNOS = (errno.EHOSTUNREACH, errno.ENETUNREACH, errno.EHOSTDOWN, errno.ENETDOWN,
+                  errno.ECONNABORTED, errno.ECONNRESET)
+
+
+def _pf_reachable(ip, port):
+    if not (ip and port.isdigit()):
+        return None
+    try:
+        socket.create_connection((ip, int(port)), timeout=2).close()
+        return True
+    except ConnectionRefusedError:
+        return True
+    except socket.timeout:
+        return None
+    except OSError as e:
+        return False if e.errno in PF_DEAD_ERRNOS else None
+
+
 def health_of(cfg):
     ttype, name = cfg.get("type"), cfg.get("name", "")
     if ttype == "portfw":
@@ -1542,23 +1601,12 @@ def health_of(cfg):
         if active and IFACE_RE.match(iface) and lp.isdigit() and dp.isdigit():
             rule = True
             for proto in ("tcp", "udp"):
-                match = _pf_match(cfg, iface, proto, lp)
-                rc, _, _ = run(["iptables", "-t", "nat", "-C", "PREROUTING"] + match
-                               + ["-j", "DNAT", "--to-destination", f"{active}:{dp}"])
-                if rc != 0:
-                    rule = False
+                got = _ipt_has("nat", "PREROUTING", _pf_dnat(cfg, iface, proto, lp, active, dp))
+                if got is not True:
+                    rule = got
                     break
-        reachable = False
-        if active and dp.isdigit():
-            try:
-                socket.create_connection((active, int(dp)), timeout=2).close()
-                reachable = True
-            except ConnectionRefusedError:
-                reachable = True
-            except Exception:
-                reachable = False
-        return {"active": active, "rule": rule, "reachable": reachable, "up": rule}
-    up = os.path.exists("/sys/class/net/" + name)
+        return {"active": active, "rule": rule, "reachable": _pf_reachable(active, dp), "up": rule}
+    up = _netdev_exists(name)
     alive, rtt, loss, crossed = None, None, None, None
     tip = cfg.get("tunnel_ip", "")
     if up and tip and tip != "N/A":
@@ -1640,7 +1688,10 @@ def _read_net(cfgs):
             net[nm] = v
     trx = ttx = 0
     seen = False
-    for ifn in list_ifaces():
+    ifs = list_ifaces()
+    for ifn in ifs:
+        if _master_of(ifn) in ifs:
+            continue
         v = raw.get(ifn)
         if v:
             trx += v[0]
@@ -2407,6 +2458,7 @@ def op_portfw_edit(d):
                 raise ValueError("bad listen IP")
             if listen_ip not in local_ips_flat():
                 raise ValueError(f"{listen_ip} is not a local IP on this node")
+        if not d.get("iface"):
             liface = iface_for_ip(listen_ip)
             if liface and IFACE_RE.match(liface):
                 iface = liface
@@ -3213,8 +3265,12 @@ def op_core_apply(d):
         if c.get("type") != "core" or not c.get("enabled", True):
             continue
         try:
-            build_core(c)
-            restarted += 1
+            if build_core(c):
+                restarted += 1
+            else:
+                failed.append({"name": c.get("name"),
+                               "msg": _netdev_missing_reason(c.get("name", ""), "core")
+                                      or "core did not come up"})
         except Exception as e:
             failed.append({"name": c.get("name"), "msg": str(e)[:120]})
     logline("core %s applied (sha %s); relaunched %d tunnel(s)" % (label, want[:12], restarted))
