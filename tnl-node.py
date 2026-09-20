@@ -663,8 +663,6 @@ def _core_config(cfg):
     mtu = max(576, base_mtu(cfg.get("iface")) - overhead)
     corecfg = {
         "role": cfg.get("role"),
-        "mode": "packet",
-        "profile": "core",
         "transport": transport,
         "obfs": obfs,
         "tun_name": name,
@@ -895,7 +893,7 @@ def _netdev_missing_reason(name, ttype):
     need = {"vxlan": "vxlan", "gre": "ip_gre", "sit": "sit", "ipip": "ipip",
             "l2tpv3": "l2tp_eth", "fou": "fou and ipip", "ipsec": "xfrm_interface",
             "core": "tnl-core"}.get(ttype, ttype)
-    return "iface %s not created: %s is missing on this node" % (ttype, need)
+    return "iface %s not created: %s is missing on this node" % (name, need)
 
 
 def _core_running(name):
@@ -1000,23 +998,25 @@ def _sweep_owned_rules(name):
         return 0
     tag = '--comment "%s%s"' % (RULE_OWNER_PREFIX, name)
     removed = 0
-    for table in ("filter", "raw", "mangle", "nat"):
-        try:
-            out = subprocess.run(["iptables-save", "-t", table], capture_output=True, text=True, timeout=10)
-        except (OSError, subprocess.SubprocessError):
-            continue
-        if out.returncode != 0:
-            continue
-        for line in out.stdout.splitlines():
-            if not line.startswith("-A ") or tag not in line:
-                continue
+    for ipt in ("iptables", "ip6tables"):
+        for table in ("filter", "raw", "mangle", "nat"):
             try:
-                args = shlex.split(line)
-            except ValueError:
+                out = subprocess.run([ipt + "-save", "-t", table],
+                                     capture_output=True, text=True, timeout=10)
+            except (OSError, subprocess.SubprocessError):
                 continue
-            args[0] = "-D"
-            _ipt(table, args)
-            removed += 1
+            if out.returncode != 0:
+                continue
+            for line in out.stdout.splitlines():
+                if not line.startswith("-A ") or tag not in line:
+                    continue
+                try:
+                    args = shlex.split(line)
+                except ValueError:
+                    continue
+                args[0] = "-D"
+                _ipt(table, args, ipt)
+                removed += 1
     if removed:
         logline("%s: swept %d orphaned firewall rule(s) tagged %s%s" % (name, removed, RULE_OWNER_PREFIX, name))
     return removed
@@ -1564,6 +1564,11 @@ def pool_failover(name, alive, crossed, epoch, session_up, stable):
             + (f" [{err}]" if err else ""))
 
 
+def _verdict_forget(name):
+    with _verdict_lock:
+        _verdict.pop(name, None)
+
+
 def _prune_iface_state(names):
     with _verdict_lock:
         for nm in [n for n in _verdict if n not in names]:
@@ -1607,6 +1612,8 @@ def health_of(cfg):
                     break
         return {"active": active, "rule": rule, "reachable": _pf_reachable(active, dp), "up": rule}
     up = _netdev_exists(name)
+    if not up:
+        _verdict_forget(name)
     alive, rtt, loss, crossed = None, None, None, None
     tip = cfg.get("tunnel_ip", "")
     if up and tip and tip != "N/A":
@@ -2519,7 +2526,9 @@ def op_link_enable(d):
         raise ValueError("bad name")
     enabled = _as_bool(d.get("enabled", True))
     cfg = read_config(name)
-    if not cfg or cfg.get("type") == "portfw":
+    if not cfg:
+        raise ValueError("tunnel not found")
+    if cfg.get("type") == "portfw":
         return {"ok": True, "already": True}
     cfg["enabled"] = enabled
     try:
