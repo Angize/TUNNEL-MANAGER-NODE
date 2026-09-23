@@ -789,6 +789,8 @@ def _core_config(cfg):
                                          "path": str(s.get("path") or "").strip()} for s in snis]
                 _wrs = cfg.get("ws_rotate_secs")
                 corecfg["ws_rotate_secs"] = 600 if _wrs is None else max(0, min(28800, int(_wrs)))
+                if bool(cfg.get("ws_port_roll")):
+                    corecfg["ws_port_roll"] = True
     if transport in ("udp", "raw") and bool(cfg.get("fec")):
         corecfg["fec"] = True
         corecfg["fec_data"] = int(cfg.get("fec_data") or 16)
@@ -2219,6 +2221,8 @@ def op_tunnel(d):
                         obj["ws_edge_snis"] = clean_snis
                         _rs = d.get("ws_rotate_secs")
                         obj["ws_rotate_secs"] = max(0, min(28800, int(_rs))) if _rs is not None else 600
+                        if _as_bool(d.get("ws_port_roll")):
+                            obj["ws_port_roll"] = True
             edge = str(d.get("edge_ip") or "").strip()
             if edge:
                 host = edge.rpartition(":")[0] or edge
