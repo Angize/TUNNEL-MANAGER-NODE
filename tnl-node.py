@@ -1310,27 +1310,14 @@ def teardown_config(cfg):
 
 
 def apply_all():
-    rc, rout, _ = run(["ip", "-4", "route"])
-    has_default = any(l.startswith("default") for l in rout.splitlines())
-    pip = primary_ip() if has_default else None
-    locals_now = local_ips_flat()
     for cfg in raw_configs():
-        dirty = False
-        if cfg.get("type") not in ("portfw", None):
-            li = cfg.get("local_ip")
-            if li and pip and li not in locals_now:
-                cfg["local_ip"] = pip
-                dirty = True
-                logline(f"self-healed local_ip of {cfg['name']} -> {pip}")
         ifc = cfg.get("iface")
         if ifc and not _netdev_exists(ifc):
             want = iface_for_ip(cfg.get("listen_ip") or cfg.get("local_ip") or "")
             if want and IFACE_RE.match(want) and want != ifc:
                 cfg["iface"] = want
-                dirty = True
+                write_config(cfg["name"], cfg)
                 logline(f"self-healed iface of {cfg['name']} -> {want}")
-        if dirty:
-            write_config(cfg["name"], cfg)
         try:
             apply_config(cfg)
         except Exception as e:
