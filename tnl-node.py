@@ -3294,29 +3294,27 @@ def op_core_apply(d):
 def op_update(d):
     src = d.get("code")
     if src is None and d.get("url"):
-        if not CORE_SHA_RE.match(str(d.get("sha256") or "").strip().lower()):
-            return {"ok": False, "msg": "url mode needs the sha256 of the agent to install"}
         try:
             raw = _fetch_url(d["url"], FETCH_MAX_AGENT)
         except Exception as e:
-            return {"ok": False, "msg": "download failed: " + str(e)[:140]}
+            return {"ok": False, "code": "download_failed", "msg": str(e)[:140]}
         try:
             src = raw.decode()
         except UnicodeDecodeError:
-            return {"ok": False, "msg": "downloaded agent is not utf-8 text"}
+            return {"ok": False, "code": "bad_agent", "msg": "not utf-8 text"}
     if not isinstance(src, str) or not src.strip():
         raise ValueError("empty code")
     h = hashlib.sha256(src.encode()).hexdigest()
-    if d.get("sha256") and d["sha256"] != h:
-        return {"ok": False, "msg": "checksum mismatch"}
+    if d.get("sha256") != h:
+        return {"ok": False, "code": "sha_mismatch"}
     if not _verify_update_sig(h.encode(), d.get("sig")):
-        return {"ok": False, "msg": "signature verification failed (panel key)"}
+        return {"ok": False, "code": "bad_signature"}
     if h == _SELF_SHA:
         return {"ok": True, "sha256": h, "restarting": False, "already": True}
     try:
         compile(src, "tnl-node.py", "exec")
     except SyntaxError as e:
-        return {"ok": False, "msg": "rejected (syntax): " + str(e)}
+        return {"ok": False, "code": "bad_agent", "msg": str(e)[:140]}
     tmp = INSTALLED + ".new"
     try:
         with open(tmp, "w") as f:
@@ -3328,7 +3326,7 @@ def op_update(d):
             os.remove(tmp)
         except OSError:
             pass
-        return {"ok": False, "msg": "rejected: " + str(e)[:140]}
+        return {"ok": False, "code": "bad_agent", "msg": str(e)[:140]}
     try:
         with open(INSTALLED, "rb") as f:
             disk_sha = hashlib.sha256(f.read()).hexdigest()
