@@ -5,7 +5,7 @@
 روی سرورِ نود — Debian/Ubuntu با systemd، به‌عنوان root:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Angize/TUNNEL-MANAGER-NODE/main/tnl-node.py -o /tmp/tnl-node.py && sudo python3 /tmp/tnl-node.py --install
+curl -fsSL https://github.com/Angize/TUNNEL-MANAGER-NODE/releases/latest/download/tnl-node.py -o /tmp/tnl-node.py && sudo python3 /tmp/tnl-node.py --install
 ```
 
 نصب‌کننده خودش پیش‌نیازها را می‌گیرد (`iproute2`, `iptables`, `openssl`, `procps`, `kmod`,

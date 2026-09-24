@@ -43,6 +43,7 @@ IFACE_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.@-]*$")
 
 MAX_CONNS = 64
 
+AGENT_VERSION = "dev"
 _conn_sem = threading.BoundedSemaphore(MAX_CONNS)
 _apply_lock = threading.Lock()
 _restart_pending = threading.Event()
@@ -2011,7 +2012,7 @@ def op_ping(d):
         stats["net"] = net
     except Exception:
         pass
-    return {"ok": True, "agent": "tnl-node", "ready": True,
+    return {"ok": True, "agent": "tnl-node", "version": AGENT_VERSION, "ready": True,
             "central": central_origin(),
             "hostname": socket.gethostname(), "ips": all_ips(), "sha256": _SELF_SHA,
             "tunnels": len([c for c in cfgs if c.get("type") != "portfw"]),
