@@ -43,7 +43,6 @@ IFACE_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.@-]*$")
 
 MAX_CONNS = 64
 
-AGENT_VERSION = 2
 _conn_sem = threading.BoundedSemaphore(MAX_CONNS)
 _apply_lock = threading.Lock()
 _restart_pending = threading.Event()
@@ -2025,7 +2024,7 @@ def op_ping(d):
         stats["net"] = net
     except Exception:
         pass
-    return {"ok": True, "agent": "tnl-node", "version": AGENT_VERSION, "ready": True,
+    return {"ok": True, "agent": "tnl-node", "ready": True,
             "central": central_origin(),
             "hostname": socket.gethostname(), "ips": all_ips(), "sha256": _SELF_SHA,
             "tunnels": len([c for c in cfgs if c.get("type") != "portfw"]),
@@ -3345,8 +3344,7 @@ def op_update(d):
     subprocess.Popen(["sh", "-c", "sleep 1; systemctl restart tnl-node"],
                      start_new_session=True, stdin=subprocess.DEVNULL,
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    m = re.search(r'"version":\s*(\d+)', src)
-    return {"ok": True, "version": int(m.group(1)) if m else None, "sha256": h, "restarting": True}
+    return {"ok": True, "sha256": h, "restarting": True}
 
 
 def op_ech_update(d):
