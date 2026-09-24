@@ -1,0 +1,69 @@
+name: release-node
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to create/publish, e.g. v1.0.0'
+        required: true
+      ref:
+        description: 'Commit SHA / branch / tag to release (default: main)'
+        required: false
+        default: main
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve tag + ref
+        id: t
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            echo "ref=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+            echo "ref=${{ github.event.inputs.ref }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ steps.t.outputs.ref }}
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Stamp the version into the agent
+        run: |
+          set -eux
+          TAG="${{ steps.t.outputs.tag }}"
+          echo "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'
+          test "$(grep -c '^AGENT_VERSION = "dev"$' tnl-node.py)" = 1
+          sed -i "s/^AGENT_VERSION = \"dev\"$/AGENT_VERSION = \"$TAG\"/" tnl-node.py
+          grep -qx "AGENT_VERSION = \"$TAG\"" tnl-node.py
+          python -W error::SyntaxWarning -m py_compile tnl-node.py
+          mkdir -p out
+          cp tnl-node.py out/tnl-node.py
+          ( cd out && sha256sum tnl-node.py > tnl-node.py.sha256 )
+          cat out/tnl-node.py.sha256
+
+      - name: Publish the release + assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eux
+          TAG="${{ steps.t.outputs.tag }}"
+          SHA="$(git rev-parse HEAD)"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" out/* --clobber
+          else
+            gh release create "$TAG" --target "$SHA" --title "$TAG" --notes "tnl-node $TAG" out/*
+          fi
