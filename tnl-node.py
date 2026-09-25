@@ -337,29 +337,39 @@ def tuning_active():
     return os.path.isfile(TUNING_PREV)
 
 
+def _tuning_knobs(bbr):
+    return KERNEL_TUNING + ([("net.ipv4.tcp_congestion_control", "bbr")] if bbr else [])
+
+
 def tuning_status():
+    active = tuning_active()
+    bbr = _bbr_available()
+    overridden = []
+    if active:
+        for k, want in _tuning_knobs(bbr):
+            now = _sysctl_get(k)
+            if now != want:
+                overridden.append({"key": k, "want": want, "now": now})
     return {
-        "active": tuning_active(),
+        "active": active,
         "cc": _sysctl_get("net.ipv4.tcp_congestion_control"),
         "qdisc": _sysctl_get("net.core.default_qdisc"),
-        "bbr_available": _bbr_available(),
+        "bbr_available": bbr,
+        "overridden": overridden,
     }
 
 
 def apply_kernel_tuning():
     if not tuning_active():
-        keys = [k for k, _ in KERNEL_TUNING] + ["net.ipv4.tcp_congestion_control"]
-        prev = {k: _sysctl_get(k) for k in keys}
+        prev = {k: _sysctl_get(k) for k, _ in _tuning_knobs(True)}
         err = _atomic_write_json(TUNING_PREV, prev)
         if err:
             logline(f"kernel tuning: could not save originals, NOT applying: {err}")
             return err
-    knobs = list(KERNEL_TUNING)
     bbr = _bbr_available()
-    if bbr:
-        knobs.append(("net.ipv4.tcp_congestion_control", "bbr"))
-    else:
+    if not bbr:
         logline("kernel tuning: bbr unavailable — leaving the default congestion control")
+    knobs = _tuning_knobs(bbr)
     for k, v in knobs:
         run(["sysctl", "-w", f"{k}={v}"])
     if bbr:
