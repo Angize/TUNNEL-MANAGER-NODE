@@ -568,6 +568,7 @@ MIN_BAND_SPAN = 100
 MAX_PORT_TRIES = 60
 MAX_FEC_DATA = 64
 QUEUEING_TRANSPORTS = ("raw", "udp")
+BUF_KNOBS = (("sock_buf", QUEUEING_TRANSPORTS), ("tcp_buf", ("tcp", "ws")))
 
 
 def band_ok(lo, hi):
@@ -673,9 +674,10 @@ def _core_config(cfg):
     _tn = _core_tuning(cfg.get("tuning"))
     if _tn:
         corecfg["tuning"] = _tn
-    _sb = int(cfg.get("sock_buf") or 0)
-    if _sb and transport in QUEUEING_TRANSPORTS:
-        corecfg["sock_buf"] = _sb
+    for _k, _carriers in BUF_KNOBS:
+        _v = int(cfg.get(_k) or 0)
+        if _v and transport in _carriers:
+            corecfg[_k] = _v
     if bool(cfg.get("cover")) and transport == "tcp" and crypto_on:
         corecfg["cover"] = True
         sni = str(cfg.get("cover_sni") or "").strip()
@@ -2111,9 +2113,11 @@ def op_tunnel(d):
         _tn = _core_tuning(d.get("tuning"))
         if _tn:
             obj["tuning"] = _tn
-    if ttype == "core" and d.get("sock_buf") not in (None, ""):
-        _sb = int(d["sock_buf"])
-        obj["sock_buf"] = -1 if _sb < 0 else min(_sb, 64 << 20)
+    if ttype == "core":
+        for _k, _ in BUF_KNOBS:
+            if d.get(_k) not in (None, ""):
+                _v = int(d[_k])
+                obj[_k] = -1 if _v < 0 else min(_v, 64 << 20)
     if ttype in ("l2tpv3", "fou", "core", "vxlan"):
         if d.get("port") not in (None, ""):
             port = int(d["port"])
