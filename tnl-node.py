@@ -837,7 +837,7 @@ def _core_config(cfg):
         edge = str(cfg.get("edge_ip") or "").strip()
         if transport == "ws" and edge:
             h, sep, p = edge.rpartition(":")
-            if sep and p.isdigit():
+            if sep:
                 dial, dport = h, int(p)
             else:
                 dial, dport = edge, (443 if bool(cfg.get("ws_tls")) else 80)
@@ -887,7 +887,7 @@ def _netdev_missing_reason(name, ttype):
     if run(["ip", "link", "show", name])[0] == 0:
         return ""
     if ttype == "core":
-        if _core_running(name):
+        if _core_alive(name):
             return "core is up but iface %s has not appeared yet" % name
         why = _core_last_error(name)
         if why:
@@ -901,6 +901,14 @@ def _netdev_missing_reason(name, ttype):
 def _core_running(name):
     _, out, _ = run(["systemctl", "is-active", _core_unit(name)], timeout=10)
     return out.strip() in ("active", "activating")
+
+
+def _core_alive(name):
+    _, out, _ = run(["systemctl", "show", "-p", "ActiveState", "-p", "SubState", "-p", "NRestarts",
+                     _core_unit(name)], timeout=10)
+    st = dict(ln.split("=", 1) for ln in out.splitlines() if "=" in ln)
+    return (st.get("ActiveState") in ("active", "activating") and st.get("SubState") != "auto-restart"
+            and st.get("NRestarts", "0") == "0")
 
 
 def _cfg_path(name, suffix=""):
@@ -1251,6 +1259,25 @@ def build_portfw(cfg):
     _pf_acct_build(cfg)
 
 
+_PF_RUNTIME = ("current_index", "last_switch")
+
+
+def _pf_swap(new, old=None):
+    if old and any(old.get(k) != new.get(k) for k in set(old) | set(new) if k not in _PF_RUNTIME):
+        teardown_config(old)
+    try:
+        build_portfw(new)
+    except Exception as e:
+        teardown_config(new)
+        if old:
+            try:
+                build_portfw(old)
+            except Exception as e2:
+                raise RuntimeError(f"{e}; restoring the previous forward also failed: {e2}") from None
+        raise
+    write_config(new["name"], new)
+
+
 def apply_config(cfg):
     t = cfg.get("type")
     if t == "vxlan":
@@ -1339,15 +1366,14 @@ def rotate_once():
             continue
         if now - int(cfg.get("last_switch", 0) or 0) < interval:
             continue
-        cfg["current_index"] = (int(cfg.get("current_index", 0) or 0) + 1) % len(ips)
-        cfg["last_switch"] = now
-        write_config(cfg["name"], cfg)
+        nxt = {**cfg, "current_index": (int(cfg.get("current_index", 0) or 0) + 1) % len(ips), "last_switch": now}
         try:
-            build_portfw(cfg)
+            _pf_swap(nxt, cfg)
         except Exception as e:
+            write_config(cfg["name"], {**cfg, "last_switch": now})
             logline(f"rotate {cfg['name']} failed: {e}")
             continue
-        logline(f"rotated {cfg['name']} -> index {cfg['current_index']}")
+        logline(f"rotated {cfg['name']} -> index {nxt['current_index']}")
 
 
 def rotation_loop():
@@ -2212,8 +2238,11 @@ def op_tunnel(d):
                             obj["ws_port_roll"] = True
             edge = str(d.get("edge_ip") or "").strip()
             if edge:
-                host = edge.rpartition(":")[0] or edge
-                if not re.match(r"^[A-Za-z0-9.\-]{1,253}$", host):
+                host, sep, eport = edge.rpartition(":")
+                if not sep:
+                    host = edge
+                if not re.match(r"^[A-Za-z0-9.\-]{1,253}$", host) or (
+                        sep and not (eport.isdigit() and 1 <= int(eport) <= 65535)):
                     raise ValueError("bad edge_ip")
                 obj["edge_ip"] = edge
         if transport == "raw":
@@ -2414,9 +2443,8 @@ def op_portfw(d):
     obj = {"name": name, "type": "portfw", "id": tid, "iface": iface, "listen_port": lp,
            "listen_ip": listen_ip, "dst_ips": ips, "dst_port": dp, "switch_interval": interval,
            "current_index": 0, "last_switch": int(time.time())}
-    write_config(name, obj)
     try:
-        build_portfw(obj)
+        _pf_swap(obj)
     except Exception as e:
         return {"ok": False, "msg": str(e)}
     return {"ok": True, "name": name}
@@ -2465,16 +2493,14 @@ def op_portfw_edit(d):
     why = _pf_conflict(iface, lp, listen_ip, skip=old["name"])
     if why:
         raise ValueError(why)
-    teardown_config(old)
     idx = int(old.get("current_index", 0) or 0)
     if idx >= len(ips):
         idx = 0
     obj = {"name": old["name"], "type": "portfw", "id": old.get("id"), "iface": iface,
            "listen_port": lp, "listen_ip": listen_ip, "dst_ips": ips, "dst_port": dp,
            "switch_interval": interval, "current_index": idx, "last_switch": int(time.time())}
-    write_config(old["name"], obj)
     try:
-        build_portfw(obj)
+        _pf_swap(obj, old)
     except Exception as e:
         return {"ok": False, "msg": str(e)}
     _health_now(obj)
@@ -2489,12 +2515,11 @@ def op_portfw_next(d):
     ips = [ip for ip in cfg.get("dst_ips", []) if is_ipv4(ip)]
     if len(ips) < 2:
         raise ValueError("need >=2 destinations to rotate")
-    cfg["current_index"] = (int(cfg.get("current_index", 0) or 0) + 1) % len(ips)
-    cfg["last_switch"] = int(time.time())
-    write_config(cfg["name"], cfg)
-    build_portfw(cfg)
-    _health_now(cfg)
-    return {"ok": True, "active": ips[cfg["current_index"]]}
+    nxt = {**cfg, "current_index": (int(cfg.get("current_index", 0) or 0) + 1) % len(ips),
+           "last_switch": int(time.time())}
+    _pf_swap(nxt, cfg)
+    _health_now(nxt)
+    return {"ok": True, "active": ips[nxt["current_index"]]}
 
 
 def op_delete(d):
@@ -2932,7 +2957,8 @@ def _read_status(name):
         health.append({"key": str(h.get("key")), "kind": str(h.get("kind") or ""),
                        "state": str(h.get("state") or "healthy"),
                        "fails": int(h.get("fails") or 0),
-                       "next_retest_unix": int(h.get("next_retest_unix") or 0)})
+                       "next_retest_unix": int(h.get("next_retest_unix") or 0),
+                       "retest_secs": int(h.get("retest_secs") or 0)})
     events = []
     for e in (st.get("events") or [])[:64]:
         if not isinstance(e, dict):
@@ -2970,7 +2996,7 @@ def _axis_rows(st, kind):
 def _axis_section(st, kind, active):
     rows = _axis_rows(st, kind)
     return {"active": active, "addrs": [h["key"] for h in rows][:64],
-            "health": [{k: h[k] for k in ("key", "state", "fails", "next_retest_unix")} for h in rows],
+            "health": [{k: h[k] for k in ("key", "state", "fails", "next_retest_unix", "retest_secs")} for h in rows],
             "ts": st["ts"]}
 
 
@@ -3157,7 +3183,7 @@ def op_set_update_key(d):
     conf = load_conf()
     cur = str(conf.get("update_pubkey") or "").strip()
     if cur and cur != pub:
-        return {"ok": False, "msg": "update key already set (re-provision over SSH to change)"}
+        return {"ok": False, "msg": "update key already set by another panel (delete this node in the panel and add it again)"}
     if not cur:
         conf["update_pubkey"] = pub
         save_conf(conf)
