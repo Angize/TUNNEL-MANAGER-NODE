@@ -581,10 +581,6 @@ QUEUEING_TRANSPORTS = ("raw", "udp")
 BUF_KNOBS = (("sock_buf", QUEUEING_TRANSPORTS), ("tcp_buf", ("tcp", "ws")))
 
 
-def workers_carrier(transport, cdn):
-    return transport in QUEUEING_TRANSPORTS or transport == "tcp" or (transport == "ws" and cdn not in ("http", "grpc"))
-
-
 def band_ok(lo, hi):
     return MIN_BAND_LO <= lo <= hi <= 65535 and hi - lo + 1 >= MIN_BAND_SPAN
 
@@ -749,13 +745,12 @@ def _core_config(cfg):
         _ptries = 0
     if 1 <= _ptries <= MAX_PORT_TRIES:
         corecfg["port_tries"] = _ptries
-    if workers_carrier(transport, str(cfg.get("cdn_carrier") or "").strip().lower()):
-        try:
-            _wk = int(cfg.get("workers") or 0)
-        except (TypeError, ValueError):
-            _wk = 0
-        if 2 <= _wk <= MAX_WORKERS and not bool(cfg.get("fec")):
-            corecfg["workers"] = _wk
+    try:
+        _wk = int(cfg.get("workers") or 0)
+    except (TypeError, ValueError):
+        _wk = 0
+    if 2 <= _wk <= MAX_WORKERS and not bool(cfg.get("fec")):
+        corecfg["workers"] = _wk
     if transport == "ws":
         if cfg.get("ws_host") and str(cfg.get("role")) == "client":
             corecfg["ws_host"] = str(cfg["ws_host"])
@@ -2323,12 +2318,11 @@ def op_tunnel(d):
             raise ValueError("bad port_tries")
         if ptries:
             obj["port_tries"] = ptries
-        if workers_carrier(transport, obj.get("cdn_carrier", "")):
-            wk = int(d.get("workers") or 0)
-            if wk and not (1 <= wk <= MAX_WORKERS):
-                raise ValueError("bad workers")
-            if wk > 1:
-                obj["workers"] = wk
+        wk = int(d.get("workers") or 0)
+        if wk and not (1 <= wk <= MAX_WORKERS):
+            raise ValueError("bad workers")
+        if wk > 1:
+            obj["workers"] = wk
         if transport in ("udp", "raw") and _as_bool(d.get("fec")):
             obj["fec"] = True
             fd = int(d.get("fec_data") or 16)
