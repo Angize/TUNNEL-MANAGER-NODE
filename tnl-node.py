@@ -1080,6 +1080,15 @@ def _set_link_state(cfg, enabled):
             _core_stop(name)
             if _core_running(name):
                 raise RuntimeError("core unit %s still running after stop" % name)
+    elif cfg.get("type") == "portfw":
+        if not enabled:
+            teardown_config(cfg)
+            return
+        try:
+            build_portfw(cfg)
+        except Exception:
+            teardown_config(cfg)
+            raise
     else:
         must(["ip", "link", "set", name, "up" if enabled else "down"])
 
@@ -1311,7 +1320,8 @@ def apply_config(cfg):
             return
         build_core(cfg)
     elif t == "portfw":
-        build_portfw(cfg)
+        if cfg.get("enabled", True):
+            build_portfw(cfg)
     if t not in ("portfw", "core") and not cfg.get("enabled", True):
         _set_link_state(cfg, False)
 
@@ -1366,7 +1376,7 @@ def apply_all():
 def rotate_once():
     now = int(time.time())
     for cfg in raw_configs():
-        if cfg.get("type") != "portfw":
+        if cfg.get("type") != "portfw" or not cfg.get("enabled", True):
             continue
         try:
             interval = int(cfg.get("switch_interval", 0) or 0)
@@ -1628,6 +1638,8 @@ def health_of(cfg):
         if idx >= len(ips):
             idx = 0
         active = ips[idx] if ips else ""
+        if not cfg.get("enabled", True):
+            return {"active": active, "rule": False, "reachable": None, "up": False}
         rule = False
         if active and IFACE_RE.match(iface) and lp.isdigit() and dp.isdigit():
             rule = True
@@ -2455,6 +2467,10 @@ def op_portfw(d):
     obj = {"name": name, "type": "portfw", "id": tid, "iface": iface, "listen_port": lp,
            "listen_ip": listen_ip, "dst_ips": ips, "dst_port": dp, "switch_interval": interval,
            "current_index": 0, "last_switch": int(time.time())}
+    if not _as_bool(d.get("enabled", True)):
+        obj["enabled"] = False
+        write_config(name, obj)
+        return {"ok": True, "name": name}
     try:
         _pf_swap(obj)
     except Exception as e:
@@ -2511,6 +2527,11 @@ def op_portfw_edit(d):
     obj = {"name": old["name"], "type": "portfw", "id": old.get("id"), "iface": iface,
            "listen_port": lp, "listen_ip": listen_ip, "dst_ips": ips, "dst_port": dp,
            "switch_interval": interval, "current_index": idx, "last_switch": int(time.time())}
+    if not old.get("enabled", True):
+        obj["enabled"] = False
+        write_config(obj["name"], obj)
+        _health_now(obj)
+        return {"ok": True, "name": old["name"]}
     try:
         _pf_swap(obj, old)
     except Exception as e:
@@ -2524,6 +2545,8 @@ def op_portfw_next(d):
     cfg = read_config(d["name"])
     if not cfg or cfg.get("type") != "portfw":
         raise ValueError("not found")
+    if not cfg.get("enabled", True):
+        raise ValueError("port forward is off")
     ips = [ip for ip in cfg.get("dst_ips", []) if is_ipv4(ip)]
     if len(ips) < 2:
         raise ValueError("need >=2 destinations to rotate")
@@ -2556,14 +2579,14 @@ def op_link_enable(d):
     cfg = read_config(name)
     if not cfg:
         raise ValueError("tunnel not found")
-    if cfg.get("type") == "portfw":
-        return {"ok": True, "already": True}
     cfg["enabled"] = enabled
     try:
         _set_link_state(cfg, enabled)
     except Exception as e:
         return {"ok": False, "msg": str(e)}
     write_config(name, cfg)
+    if cfg.get("type") == "portfw":
+        _health_now(cfg)
     return {"ok": True, "enabled": enabled}
 
 
