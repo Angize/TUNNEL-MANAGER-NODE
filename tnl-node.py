@@ -800,8 +800,8 @@ def _core_config(cfg):
                                          "path": str(s.get("path") or "").strip()} for s in snis]
                 _wrs = cfg.get("ws_rotate_secs")
                 corecfg["ws_rotate_secs"] = 600 if _wrs is None else max(0, min(28800, int(_wrs)))
-                if bool(cfg.get("ws_port_roll")):
-                    corecfg["ws_port_roll"] = True
+        if bool(cfg.get("ws_port_roll")):
+            corecfg["ws_port_roll"] = True
     if transport in ("udp", "raw") and bool(cfg.get("fec")):
         corecfg["fec"] = True
         corecfg["fec_data"] = int(cfg.get("fec_data") or 16)
@@ -1569,7 +1569,8 @@ def _report_carrying(name, edge, epoch):
 
 
 def pool_failover(name, alive, crossed, epoch, session_up, stable):
-    if str(_read_core_cfg(name).get("role") or "") != "client":
+    cc = _read_core_cfg(name)
+    if str(cc.get("role") or "") != "client":
         return
     counted = stable and not crossed
     low, high = "", ""
@@ -1591,6 +1592,8 @@ def pool_failover(name, alive, crossed, epoch, session_up, stable):
             _report_carrying(name, was_red and alive is True, epoch)
         return
     if not counted or onbad < RED_SWEEPS:
+        return
+    if not (low or high) and cc.get("transport") == "ws" and not cc.get("ws_port_roll"):
         return
     err = _atomic_write_json(_cfg_path(name, ".status.verdict"),
                              {"cmd": "fail", "low": low, "high": high, "epoch": epoch})
@@ -2259,8 +2262,8 @@ def op_tunnel(d):
                         obj["ws_edge_snis"] = clean_snis
                         _rs = d.get("ws_rotate_secs")
                         obj["ws_rotate_secs"] = max(0, min(28800, int(_rs))) if _rs is not None else 600
-                        if _as_bool(d.get("ws_port_roll")):
-                            obj["ws_port_roll"] = True
+            if role == "client" and _as_bool(d.get("ws_port_roll")):
+                obj["ws_port_roll"] = True
             edge = str(d.get("edge_ip") or "").strip()
             if edge:
                 host, sep, eport = edge.rpartition(":")
