@@ -1519,6 +1519,17 @@ def probe_verdict(cfg):
     return carrying(hits, sent, probe_min_pct(cfg)), rtt, round((sent - hits) * 100.0 / sent, 1)
 
 
+def route_leak(cfg):
+    tip, ttype = cfg["tunnel_ip"], cfg.get("type")
+    rc, out, _ = run(["ip", "-6" if ttype == "sit" else "-4", "route", "get", peer_of(tip, ttype),
+                      "from", tip.split("/")[0]], timeout=5)
+    parts = out.split()
+    if rc != 0 or "dev" not in parts[:-1]:
+        return ""
+    dev = parts[parts.index("dev") + 1]
+    return "" if dev == cfg["name"] else dev
+
+
 _verdict_lock = threading.Lock()
 _verdict = {}
 
@@ -1655,7 +1666,7 @@ def health_of(cfg):
     up = _netdev_exists(name)
     if not up:
         _verdict_forget(name)
-    alive, rtt, loss, crossed = None, None, None, None
+    alive, rtt, loss, crossed, leak = None, None, None, None, ""
     tip = cfg.get("tunnel_ip", "")
     if up and tip and tip != "N/A":
         epoch_before, ready_before = _read_path_state(name)
@@ -1665,8 +1676,11 @@ def health_of(cfg):
             epoch, ready = _read_path_state(name)
             pool_failover(name, alive, crossed, epoch_before, ready_before and ready,
                           epoch == epoch_before)
+            leak = route_leak(cfg)
+            if leak:
+                alive = False
     return {"up": up, "alive": alive, "dead": alive is False, "rtt_ms": rtt, "loss_pct": loss,
-            "crossed": crossed}
+            "crossed": crossed, "leak": leak}
 
 
 def _cpu_snap():
@@ -2636,10 +2650,14 @@ def op_check(d):
         raise ValueError("not found")
     up = os.path.exists("/sys/class/net/" + cfg["name"])
     crossed = rtt = loss = None
+    leak = ""
     if up and cfg.get("tunnel_ip") and cfg.get("tunnel_ip") != "N/A":
         crossed, rtt, loss = probe_verdict(cfg)
-    return {"ok": True, "health": {"up": up, "alive": crossed, "dead": crossed is False, "rtt_ms": rtt,
-                                   "loss_pct": loss, "crossed": crossed}}
+        if crossed is not None:
+            leak = route_leak(cfg)
+    alive = False if leak else crossed
+    return {"ok": True, "health": {"up": up, "alive": alive, "dead": alive is False, "rtt_ms": rtt,
+                                   "loss_pct": loss, "crossed": crossed, "leak": leak}}
 
 
 def _ss_proc(line):
