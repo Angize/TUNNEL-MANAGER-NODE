@@ -505,13 +505,17 @@ def _ipsec_params(cfg):
     return tid, enc, auth, spi_out, spi_in
 
 
+def _ipsec_policy_key(dirn, tid):
+    return ["dir", dirn, "src", "0.0.0.0/0", "dst", "0.0.0.0/0", "if_id", str(tid)]
+
+
 def _ipsec_clear(cfg):
     name = cfg["name"]
     tid = int(cfg["id"])
     for spi in (0x10000 + tid, 0x20000 + tid):
         run(["ip", "xfrm", "state", "deleteall", "proto", "esp", "spi", hex(spi)])
     for dirn in ("out", "in", "fwd"):
-        run(["ip", "xfrm", "policy", "deleteall", "dir", dirn, "if_id", str(tid)])
+        run(["ip", "xfrm", "policy", "delete"] + _ipsec_policy_key(dirn, tid))
     run(["ip", "link", "del", name])
 
 
@@ -527,8 +531,8 @@ def build_ipsec(cfg):
     must(["ip", "xfrm", "state", "add", "src", local, "dst", remote, "spi", hex(spi_out)] + common)
     must(["ip", "xfrm", "state", "add", "src", remote, "dst", local, "spi", hex(spi_in)] + common)
     for dirn, s, dst in (("out", local, remote), ("in", remote, local), ("fwd", remote, local)):
-        must(["ip", "xfrm", "policy", "add", "dir", dirn, "if_id", str(tid),
-             "tmpl", "src", s, "dst", dst, "proto", "esp", "reqid", str(tid), "mode", "tunnel"])
+        must(["ip", "xfrm", "policy", "add"] + _ipsec_policy_key(dirn, tid) +
+             ["tmpl", "src", s, "dst", dst, "proto", "esp", "reqid", str(tid), "mode", "tunnel"])
     phys = iface_for_ip(local) or default_iface()
     must(["ip", "link", "add", name, "type", "xfrm", "dev", phys, "if_id", str(tid)])
     _up_netdev(name, cfg, 80)
