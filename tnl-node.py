@@ -3672,12 +3672,33 @@ def service_active():
     return run(["systemctl", "is-active", "--quiet", SERVICE])[0] == 0
 
 
-def service_settled(tries=6):
-    for _ in range(tries):
-        if service_active():
-            return True
-        time.sleep(1)
-    return False
+SETTLE_SECS = 6
+
+
+def _unit_state():
+    out = run(["systemctl", "show", "-p", "ActiveState", "-p", "SubState", "-p", "ExecMainStatus", SERVICE],
+              timeout=10)[1]
+    return dict(ln.split("=", 1) for ln in out.splitlines() if "=" in ln)
+
+
+def service_restart():
+    svc("stop")
+    svc("reset-failed")
+    svc("start")
+    end = time.monotonic() + SETTLE_SECS
+    while True:
+        st = _unit_state()
+        if st.get("ActiveState") == "failed" or st.get("SubState", "").startswith("auto-restart"):
+            return "port" if st.get("ExecMainStatus") == str(errno.EADDRINUSE) else "down"
+        if time.monotonic() >= end:
+            return "" if st.get("ActiveState") == "active" else "down"
+        time.sleep(0.25)
+
+
+def _restart_problem(why, port):
+    if why == "port":
+        return f"[✘] port {port} is used by another program on this node - pick another port"
+    return "[✘] the service did not come up — journalctl -u " + SERVICE
 
 
 DEP_PACKAGES = ("iproute2", "iptables", "openssl", "procps", "kmod", "ca-certificates")
@@ -3751,11 +3772,9 @@ def _finish_install(conf):
     check_tun()
     write_service()
     svc("enable")
-    svc("restart")
-    if not service_settled():
-        print("[✘] the service did not come up — journalctl -u " + SERVICE)
-        sys.exit(1)
-    print("[✔] node agent installed and started.")
+    why = service_restart()
+    print(_restart_problem(why, conf["port"]) if why else "[✔] node agent installed and started.")
+    return why
 
 
 def _port_or(value, fallback):
@@ -3775,14 +3794,18 @@ def do_install(port=""):
         conf["port"] = _port_or(input(f"Agent port [{have}]: "), have)
     else:
         conf["port"] = have
-    _finish_install(conf)
+    if _finish_install(conf):
+        sys.exit(1)
     do_show()
 
 
 def do_auto_install(port):
     conf = _prepare_install()
     conf["port"] = _port_or(port, conf.get("port", 8099))
-    _finish_install(conf)
+    why = _finish_install(conf)
+    if why:
+        print(f"TNL_INSTALL_FAIL={why}")
+        sys.exit(1)
     print("TNL_INSTALL_OK")
     print(f"TNL_NODE_PORT={conf['port']}")
     print(f"TNL_NODE_TOKEN={conf['token']}")
@@ -3806,11 +3829,22 @@ def change_port():
     p = input(f"New agent port [{have}]: ").strip()
     if not p:
         return
-    conf["port"] = _port_or(p, have)
+    new = _port_or(p, have)
+    conf["port"] = new
     save_conf(conf)
-    if os.path.isfile(SERVICE_FILE):
-        svc("restart")
-    print(f"[✔] port set to {conf['port']} - open it to the central server only.")
+    why = service_restart() if os.path.isfile(SERVICE_FILE) else ""
+    if why == "port":
+        conf["port"] = have
+        save_conf(conf)
+        why = service_restart()
+        print(f"[✘] port {new} is used by another program - the agent stays on {have}")
+        if why:
+            print(_restart_problem(why, have))
+        return
+    if why:
+        print(_restart_problem(why, new))
+        return
+    print(f"[✔] port set to {new} - open it to the central server only.")
 
 
 def regen_token():
@@ -3819,8 +3853,9 @@ def regen_token():
     conf = load_conf() if os.path.isfile(NODE_CONF) else {}
     conf["token"] = secrets.token_urlsafe(32)
     save_conf(conf)
-    if os.path.isfile(SERVICE_FILE):
-        svc("restart")
+    why = service_restart() if os.path.isfile(SERVICE_FILE) else ""
+    if why:
+        print(_restart_problem(why, conf.get("port", 8099)))
     print("[✔] new token - update it in the central panel:")
     do_show()
 
@@ -3849,9 +3884,9 @@ def do_restart():
         print("Not installed yet - run Install first.")
         return
     print("[*] restarting the agent (tunnels rebuild on boot, brief blip)...")
-    svc("restart")
-    print("[✔] restarted, agent active." if service_active()
-          else "[!] restarted but not active - check Status / logs.")
+    why = service_restart()
+    port = (load_conf() if os.path.isfile(NODE_CONF) else {}).get("port", 8099)
+    print(_restart_problem(why, port) if why else "[✔] restarted, agent active.")
 
 
 def status():
@@ -3917,6 +3952,13 @@ def serve():
         print("Run as root (sudo).")
         sys.exit(1)
     conf = load_conf()
+    port = int(conf.get("port", 8099))
+    httpd = ThreadingHTTPServer(("0.0.0.0", port), Handler, bind_and_activate=False)
+    try:
+        httpd.server_bind()
+    except OSError as e:
+        print(f"tnl-node did not start - port {port}: {e.strerror}")
+        sys.exit(e.errno or 1)
     try:
         os.chmod(CONFIG_DIR, 0o700)
     except Exception:
@@ -3935,9 +3977,9 @@ def serve():
     _seed_central_cb()
     _seed_req_ctr()
     threading.Thread(target=checkin_loop, daemon=True).start()
-    httpd = ThreadingHTTPServer(("0.0.0.0", int(conf.get("port", 8099))), Handler)
+    httpd.server_activate()
     httpd.conf = conf
-    print(f"tnl-node agent on http://0.0.0.0:{conf.get('port', 8099)}/  (self-contained, token-auth)")
+    print(f"tnl-node agent on http://0.0.0.0:{port}/  (self-contained, token-auth)")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
