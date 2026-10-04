@@ -58,13 +58,24 @@ def load_conf():
         return json.load(f)
 
 
+def _write_json_durable(path, obj):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+    fd = os.open(os.path.dirname(path), os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def save_conf(conf):
     os.makedirs(CONFIG_DIR, exist_ok=True)
-    tmp = NODE_CONF + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(conf, f, indent=2)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, NODE_CONF)
+    _write_json_durable(NODE_CONF, conf)
 
 
 def run(args, timeout=60):
@@ -161,12 +172,7 @@ def read_config(name):
 def write_config(name, obj):
     if not NAME_RE.match(name):
         raise ValueError("bad name")
-    path = os.path.join(CONFIG_DIR, name + ".json")
-    tmp = path + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(obj, f, indent=2)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, path)
+    _write_json_durable(os.path.join(CONFIG_DIR, name + ".json"), obj)
 
 
 def used_ids():
@@ -985,12 +991,7 @@ def build_core(cfg):
 
 
 def _write_core_json(name, corecfg):
-    path = _cfg_path(name, ".json")
-    tmp = path + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(corecfg, f, indent=2)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, path)
+    _write_json_durable(_cfg_path(name, ".json"), corecfg)
 
 
 def _core_relaunch(cfg):
