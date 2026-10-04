@@ -2624,11 +2624,13 @@ def op_wipe(d):
         revert_kernel_tuning()
     except Exception as e:
         logline(f"wipe: kernel tuning revert failed: {e}")
+    script = ("sleep 1; systemctl stop " + SERVICE + "; systemctl disable " + SERVICE + "; "
+              "rm -f " + SERVICE_FILE + "; systemctl daemon-reload; rm -rf " + CONFIG_DIR)
+    rc, _out, err = run(["systemd-run", "--unit", "tnl-node-wipe", "--collect", "sh", "-c", script])
+    if rc != 0:
+        logline(f"wipe: cleanup unit did not start: {err.strip()[:200]}")
+        return {"ok": False}
     _restart_pending.set()
-    script = ("sleep 1; systemctl stop tnl-node 2>/dev/null; systemctl disable tnl-node 2>/dev/null; "
-              "rm -f " + SERVICE_FILE + "; systemctl daemon-reload 2>/dev/null; rm -rf " + CONFIG_DIR)
-    subprocess.Popen(["sh", "-c", script], start_new_session=True, stdin=subprocess.DEVNULL,
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     logline("node wiped by panel request")
     return {"ok": True, "wiped": True}
 
