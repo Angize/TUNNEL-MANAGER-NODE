@@ -979,16 +979,18 @@ def _is_peer_pool(name):
 
 
 def build_core(cfg):
-    name = cfg["name"]
     _ensure_core()
-    corecfg = _core_config(cfg)
+    _write_core_json(cfg["name"], _core_config(cfg))
+    return _core_relaunch(cfg)
+
+
+def _write_core_json(name, corecfg):
     path = _cfg_path(name, ".json")
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
         json.dump(corecfg, f, indent=2)
     os.chmod(tmp, 0o600)
     os.replace(tmp, path)
-    return _core_relaunch(cfg)
 
 
 def _core_relaunch(cfg):
@@ -3399,6 +3401,17 @@ def op_update(d):
     return {"ok": True, "sha256": h, "restarting": True}
 
 
+def _ech_patch(obj, clean):
+    snis = obj.get("ws_edge_snis")
+    if snis:
+        for s in snis:
+            if isinstance(s, dict) and s.get("host") in clean:
+                s["ech"] = clean[s["host"]]
+    elif obj.get("ws_host") in clean:
+        obj["ws_ech"] = clean[obj["ws_host"]]
+    return obj
+
+
 def op_ech_update(d):
     _require(d, ["name", "snis"])
     name = str(d["name"])
@@ -3416,6 +3429,8 @@ def op_ech_update(d):
             clean[str(h)[:255]] = e
     if not clean:
         return {"ok": False, "error": "no valid ech"}
+    write_config(name, _ech_patch(read_config(name), clean))
+    _write_core_json(name, _ech_patch(_read_core_cfg(name), clean))
     path = _cfg_path(name, ".status.echcmd")
     err = _atomic_write_json(path, {"snis": clean})
     if err:
