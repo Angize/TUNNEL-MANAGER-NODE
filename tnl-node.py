@@ -1932,55 +1932,34 @@ def _self_sha():
 _SELF_SHA = _self_sha()
 
 
-REQ_CTR_STEP = 256
 REQ_CTR_WINDOW = 4096
+REQ_CTR_AHEAD = 60000
 _REQ_CTR_MASK = (1 << REQ_CTR_WINDOW) - 1
 
 _req_ctr_lock = threading.Lock()
 _req_ctr = 0
 _req_seen = 0
-_req_ctr_hwm = 0
 
 
 def _seed_req_ctr():
-    global _req_ctr, _req_seen, _req_ctr_hwm
-    try:
-        v = int(load_conf().get("req_ctr") or 0)
-    except Exception:
-        v = 0
+    global _req_ctr, _req_seen
     with _req_ctr_lock:
-        _req_ctr = _req_ctr_hwm = v
+        _req_ctr = int(time.time() * 1000) + REQ_CTR_AHEAD
         _req_seen = _REQ_CTR_MASK
 
 
-def _persist_req_ctr(hwm):
-    with _apply_lock:
-        try:
-            conf = load_conf()
-            if int(conf.get("req_ctr") or 0) < hwm:
-                conf["req_ctr"] = hwm
-                save_conf(conf)
-        except Exception as e:
-            logline(f"req_ctr persist: {e}")
-
-
 def _accept_ctr(ctr):
-    global _req_ctr, _req_seen, _req_ctr_hwm
-    hwm = None
+    global _req_ctr, _req_seen
     with _req_ctr_lock:
         if ctr > _req_ctr:
             step = ctr - _req_ctr
             _req_seen = 1 if step >= REQ_CTR_WINDOW else ((_req_seen << step) | 1) & _REQ_CTR_MASK
             _req_ctr = ctr
-            if ctr >= _req_ctr_hwm:
-                _req_ctr_hwm = hwm = ctr + REQ_CTR_STEP
         else:
             bit = _req_ctr - ctr
             if bit >= REQ_CTR_WINDOW or (_req_seen >> bit) & 1:
                 return False
             _req_seen |= 1 << bit
-    if hwm is not None:
-        threading.Thread(target=_persist_req_ctr, args=(hwm,), daemon=True).start()
     return True
 
 
