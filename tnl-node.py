@@ -1519,6 +1519,43 @@ def probe_verdict(cfg):
     return carrying(hits, sent, probe_min_pct(cfg)), rtt, round((sent - hits) * 100.0 / sent, 1)
 
 
+RTM_NEWROUTE, RTM_GETROUTE, RTA_DST, RTA_SRC, RTA_OIF = 24, 26, 1, 2, 4
+
+
+def _rta(kind, data):
+    return struct.pack("HH", 4 + len(data), kind) + data + b"\0" * (-len(data) % 4)
+
+
+def route_leak(cfg):
+    tip, ttype = cfg["tunnel_ip"], cfg.get("type")
+    fam = socket.AF_INET6 if ttype == "sit" else socket.AF_INET
+    dst = socket.inet_pton(fam, peer_of(tip, ttype))
+    src = socket.inet_pton(fam, tip.split("/")[0])
+    body = struct.pack("BBBBBBBBI", fam, len(dst) * 8, len(src) * 8, 0, 0, 0, 0, 0, 0) + _rta(RTA_DST, dst) + _rta(RTA_SRC, src)
+    try:
+        with socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, socket.NETLINK_ROUTE) as s:
+            s.settimeout(5)
+            s.send(struct.pack("IHHII", 16 + len(body), RTM_GETROUTE, 1, 1, 0) + body)
+            data = s.recv(65536)
+    except OSError:
+        return ""
+    if len(data) < 28 or struct.unpack_from("H", data, 4)[0] != RTM_NEWROUTE:
+        return ""
+    off, end = 28, min(struct.unpack_from("I", data, 0)[0], len(data))
+    while off + 4 <= end:
+        ln, kind = struct.unpack_from("HH", data, off)
+        if ln < 4:
+            break
+        if kind == RTA_OIF:
+            try:
+                dev = socket.if_indextoname(struct.unpack_from("I", data, off + 4)[0])
+            except OSError:
+                return ""
+            return "" if dev == cfg["name"] else dev
+        off += (ln + 3) & ~3
+    return ""
+
+
 _verdict_lock = threading.Lock()
 _verdict = {}
 
@@ -1655,7 +1692,7 @@ def health_of(cfg):
     up = _netdev_exists(name)
     if not up:
         _verdict_forget(name)
-    alive, rtt, loss, crossed = None, None, None, None
+    alive, rtt, loss, crossed, leak = None, None, None, None, ""
     tip = cfg.get("tunnel_ip", "")
     if up and tip and tip != "N/A":
         epoch_before, ready_before = _read_path_state(name)
@@ -1665,8 +1702,11 @@ def health_of(cfg):
             epoch, ready = _read_path_state(name)
             pool_failover(name, alive, crossed, epoch_before, ready_before and ready,
                           epoch == epoch_before)
+            leak = route_leak(cfg)
+            if leak:
+                alive = False
     return {"up": up, "alive": alive, "dead": alive is False, "rtt_ms": rtt, "loss_pct": loss,
-            "crossed": crossed}
+            "crossed": crossed, "leak": leak}
 
 
 def _cpu_snap():
@@ -2636,10 +2676,14 @@ def op_check(d):
         raise ValueError("not found")
     up = os.path.exists("/sys/class/net/" + cfg["name"])
     crossed = rtt = loss = None
+    leak = ""
     if up and cfg.get("tunnel_ip") and cfg.get("tunnel_ip") != "N/A":
         crossed, rtt, loss = probe_verdict(cfg)
-    return {"ok": True, "health": {"up": up, "alive": crossed, "dead": crossed is False, "rtt_ms": rtt,
-                                   "loss_pct": loss, "crossed": crossed}}
+        if crossed is not None:
+            leak = route_leak(cfg)
+    alive = False if leak else crossed
+    return {"ok": True, "health": {"up": up, "alive": alive, "dead": alive is False, "rtt_ms": rtt,
+                                   "loss_pct": loss, "crossed": crossed, "leak": leak}}
 
 
 def _ss_proc(line):
