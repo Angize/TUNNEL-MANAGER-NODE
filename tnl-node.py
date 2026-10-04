@@ -15,6 +15,7 @@ import re
 import secrets
 import shutil
 import socket
+import ssl
 import struct
 import subprocess
 import sys
@@ -31,6 +32,8 @@ LOG = os.path.join(CONFIG_DIR, "node-agent.log")
 SERVICE_FILE = "/etc/systemd/system/tnl-node.service"
 SELF_PATH = os.path.realpath(__file__)
 INSTALLED = os.path.join(CONFIG_DIR, "tnl-node.py")
+TLS_PEM = os.path.join(CONFIG_DIR, "tls.pem")
+_tls_pin = ""
 
 CORE_BIN = os.path.join(CONFIG_DIR, "tnl-core")
 _core_lock = threading.Lock()
@@ -59,9 +62,13 @@ def load_conf():
 
 
 def _write_json_durable(path, obj):
+    _write_durable(path, json.dumps(obj, indent=2))
+
+
+def _write_durable(path, text):
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
-        json.dump(obj, f, indent=2)
+        f.write(text)
         f.flush()
         os.fsync(f.fileno())
     os.chmod(tmp, 0o600)
@@ -2091,7 +2098,7 @@ def op_ping(d):
         pass
     return {"ok": True, "agent": "tnl-node", "version": AGENT_VERSION, "ready": True,
             "central": central_origin(),
-            "hostname": socket.gethostname(), "ips": all_ips(), "sha256": _SELF_SHA,
+            "hostname": socket.gethostname(), "ips": all_ips(), "sha256": _SELF_SHA, "pin": _tls_pin,
             "tunnels": len([c for c in cfgs if c.get("type") != "portfw"]),
             "portfw": len([c for c in cfgs if c.get("type") == "portfw"]),
             "core_ver": _core_ref(), "core_sha": _installed_core_sha()[:12], "arch": _core_arch(),
@@ -3502,12 +3509,72 @@ WIRE = {
 }
 
 
+def _tls_context():
+    global _tls_pin
+    if not os.path.isfile(TLS_PEM):
+        key = TLS_PEM + ".key"
+        _, crt, _ = must(["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
+                          "-nodes", "-days", "3650", "-subj", "/CN=tnl-node", "-keyout", key])
+        with open(key) as f:
+            pem = crt + f.read()
+        os.remove(key)
+        _write_durable(TLS_PEM, pem)
+    with open(TLS_PEM) as f:
+        pem = f.read()
+    a = pem.index(ssl.PEM_HEADER)
+    der = ssl.PEM_cert_to_DER_cert(pem[a:pem.index(ssl.PEM_FOOTER, a) + len(ssl.PEM_FOOTER)])
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.load_cert_chain(TLS_PEM)
+    _tls_pin = hashlib.sha256(der).hexdigest()
+    return ctx
+
+
+def _tls_accept(ctx, sock, until):
+    conn = None
+    try:
+        conn = ctx.wrap_socket(sock, server_side=True, do_handshake_on_connect=False)
+        conn.setblocking(False)
+        while True:
+            try:
+                conn.do_handshake()
+                conn.until = until
+                return conn
+            except ssl.SSLWantReadError:
+                rw = ([conn], [])
+            except ssl.SSLWantWriteError:
+                rw = ([], [conn])
+            left = until - time.monotonic()
+            if left <= 0 or not any(select.select(*rw, [], left)):
+                break
+    except OSError:
+        pass
+    if conn is not None:
+        conn.close()
+    return None
+
+
+class NodeServer(ThreadingHTTPServer):
+    def finish_request(self, request, client_address):
+        if not _conn_sem.acquire(blocking=False):
+            return
+        try:
+            conn = _tls_accept(self.tls, request, time.monotonic() + Handler.header_budget)
+            if conn is not None:
+                try:
+                    self.RequestHandlerClass(conn, client_address, self)
+                finally:
+                    self.shutdown_request(conn)
+        finally:
+            _conn_sem.release()
+
+
 class HeaderDeadline:
     def __init__(self, raw, sock, idle):
         self.raw, self.sock, self.idle, self.until = raw, sock, idle, None
 
-    def arm(self, budget):
-        self.until = time.monotonic() + budget
+    def arm(self, until):
+        self.until = until
 
     def disarm(self):
         self.until = None
@@ -3550,10 +3617,9 @@ class Handler(BaseHTTPRequestHandler):
     def setup(self):
         BaseHTTPRequestHandler.setup(self)
         self.rfile = HeaderDeadline(self.rfile, self.connection, self.timeout)
-        self._sem_held = _conn_sem.acquire(blocking=False)
 
     def handle_one_request(self):
-        self.rfile.arm(self.header_budget)
+        self.rfile.arm(self.connection.until)
         try:
             BaseHTTPRequestHandler.handle_one_request(self)
         finally:
@@ -3563,14 +3629,6 @@ class Handler(BaseHTTPRequestHandler):
         got = BaseHTTPRequestHandler.parse_request(self)
         self.rfile.disarm()
         return got
-
-    def finish(self):
-        try:
-            BaseHTTPRequestHandler.finish(self)
-        finally:
-            if getattr(self, "_sem_held", False):
-                _conn_sem.release()
-                self._sem_held = False
 
     def _authed(self, method):
         want = self.server.conf.get("token", "")
@@ -3624,20 +3682,7 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return False
 
-    def _drain(self):
-        try:
-            self.connection.setblocking(False)
-            for _ in range(4):
-                if not self.connection.recv(65536):
-                    break
-        except OSError:
-            pass
-
     def _handle(self, method):
-        if not getattr(self, "_sem_held", False):
-            self._send(503, {"error": "server busy, retry shortly"})
-            self._drain()
-            return
         path = self.path.split("?", 1)[0]
         if not path.startswith("/api/"):
             self._send(404, {"error": "not found"})
@@ -3994,7 +4039,7 @@ def serve():
         sys.exit(1)
     conf = load_conf()
     port = int(conf.get("port", 8099))
-    httpd = ThreadingHTTPServer(("0.0.0.0", port), Handler, bind_and_activate=False)
+    httpd = NodeServer(("0.0.0.0", port), Handler, bind_and_activate=False)
     try:
         httpd.server_bind()
     except OSError as e:
@@ -4004,6 +4049,11 @@ def serve():
         os.chmod(CONFIG_DIR, 0o700)
     except Exception:
         pass
+    try:
+        httpd.tls = _tls_context()
+    except Exception as e:
+        print(f"tnl-node did not start - tls: {e}")
+        sys.exit(1)
     for _ in range(30):
         rc, out, _ = run(["ip", "-4", "route"])
         if any(l.startswith("default") for l in out.splitlines()):
@@ -4020,7 +4070,7 @@ def serve():
     threading.Thread(target=checkin_loop, daemon=True).start()
     httpd.server_activate()
     httpd.conf = conf
-    print(f"tnl-node agent on http://0.0.0.0:{port}/  (self-contained, token-auth)")
+    print(f"tnl-node agent on https://0.0.0.0:{port}/  (self-contained, token-auth)")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
