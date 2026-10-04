@@ -796,8 +796,7 @@ def _core_config(cfg):
             if ips and snis:
                 corecfg["ws_edge_ips"] = ips
                 corecfg["ws_edge_snis"] = [{"host": str(s["host"]).strip(),
-                                         "ech": str(s.get("ech") or "").strip(),
-                                         "path": str(s.get("path") or "").strip()} for s in snis]
+                                         "ech": str(s.get("ech") or "").strip()} for s in snis]
                 _wrs = cfg.get("ws_rotate_secs")
                 corecfg["ws_rotate_secs"] = 600 if _wrs is None else max(0, min(28800, int(_wrs)))
         if bool(cfg.get("ws_port_roll")):
@@ -2253,10 +2252,7 @@ def op_tunnel(d):
                         se = str(s.get("ech") or "").strip()
                         if se and (len(se) > 4096 or not re.match(r"^[A-Za-z0-9+/=]+$", se)):
                             raise ValueError("bad ws_edge_sni ech")
-                        sp = str(s.get("path") or "").strip()
-                        if sp and (len(sp) > 1024 or not re.match(r"^/[\x21-\x7e]*$", sp)):
-                            raise ValueError("bad ws_edge_sni path")
-                        clean_snis.append({"host": h, "ech": se, "path": sp})
+                        clean_snis.append({"host": h, "ech": se})
                     if pips and clean_snis:
                         obj["ws_edge_ips"] = pips
                         obj["ws_edge_snis"] = clean_snis
