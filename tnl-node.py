@@ -87,9 +87,9 @@ def save_conf(conf):
     _write_json_durable(NODE_CONF, conf)
 
 
-def run(args, timeout=60):
+def run(args, timeout=60, stdin=None):
     try:
-        p = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        p = subprocess.run(args, input=stdin, capture_output=True, text=True, timeout=timeout)
         return p.returncode, p.stdout, p.stderr
     except subprocess.TimeoutExpired:
         return 124, "", "timeout"
@@ -97,8 +97,8 @@ def run(args, timeout=60):
         return 127, "", str(e)
 
 
-def must(args, timeout=60):
-    rc, out, err = run(args, timeout=timeout)
+def must(args, timeout=60, stdin=None):
+    rc, out, err = run(args, timeout=timeout, stdin=stdin)
     if rc != 0:
         raise RuntimeError((err or out or ("rc=" + str(rc))).strip() + "  [" + " ".join(args) + "]")
     return rc, out, err
@@ -541,10 +541,10 @@ def build_ipsec(cfg):
         raise ValueError("ipsec needs a psk")
     _modprobe("esp4", "xfrm_interface")
     _ipsec_clear(cfg)
-    common = ["proto", "esp", "mode", "tunnel", "reqid", str(tid),
-              "enc", "cbc(aes)", "0x" + enc, "auth", "hmac(sha256)", "0x" + auth, "if_id", str(tid)]
-    must(["ip", "xfrm", "state", "add", "src", local, "dst", remote, "spi", hex(spi_out)] + common)
-    must(["ip", "xfrm", "state", "add", "src", remote, "dst", local, "spi", hex(spi_in)] + common)
+    common = " proto esp mode tunnel reqid %d replay-window 32 enc cbc(aes) 0x%s auth hmac(sha256) 0x%s if_id %d\n" % (
+        tid, enc, auth, tid)
+    must(["ip", "-batch", "-"], stdin="xfrm state add src %s dst %s spi %s%sxfrm state add src %s dst %s spi %s%s" % (
+        local, remote, hex(spi_out), common, remote, local, hex(spi_in), common))
     for dirn, s, dst in (("out", local, remote), ("in", remote, local), ("fwd", remote, local)):
         must(["ip", "xfrm", "policy", "add"] + _ipsec_policy_key(dirn, tid) +
              ["tmpl", "src", s, "dst", dst, "proto", "esp", "reqid", str(tid), "mode", "tunnel"])
