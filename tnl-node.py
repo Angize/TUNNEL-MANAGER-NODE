@@ -1176,9 +1176,6 @@ def _pf_acct_rules(cfg):
     return out
 
 
-CT_BYPASS_PROFILES = PORTED_RAW_PROFILES
-
-
 def _ct_pressure():
     try:
         with open("/proc/sys/net/netfilter/nf_conntrack_count") as f:
@@ -1209,7 +1206,7 @@ def _ct_bypass_rules(cfg):
     if cfg.get("type") != "core" or str(cfg.get("transport") or "").lower() != "raw":
         return []
     prof = str(cfg.get("raw_profile") or "bare").lower()
-    if prof not in CT_BYPASS_PROFILES:
+    if prof not in PORTED_RAW_PROFILES:
         return []
     tag = ["-m", "comment", "--comment", RULE_OWNER_PREFIX + name]
     out = []
@@ -2396,7 +2393,7 @@ def op_tunnel(d):
             rrot = int(d.get("raw_sport_rotate") or 0)
             if rrot and profile not in PORTED_RAW_PROFILES:
                 raise ValueError("raw_sport_rotate cycles a forged source port, so it needs a profile "
-                                 "that builds one (udp, tcp or sctp)")
+                                 "that builds one (%s)" % ", ".join(PORTED_RAW_PROFILES))
             if rrot and not (1 <= rrot <= MAX_SPROT_EVERY):
                 raise ValueError("bad raw_sport_rotate")
             if rrot and (int(d.get("raw_sport") or 0) or _as_bool(d.get("raw_sport_random"))):
@@ -2404,9 +2401,10 @@ def op_tunnel(d):
             if rrot:
                 obj["raw_sport_rotate"] = rrot
             if _as_bool(d.get("conntrack_bypass")):
-                if profile not in CT_BYPASS_PROFILES:
+                if profile not in PORTED_RAW_PROFILES:
                     raise ValueError("conntrack bypass only means something for a profile that forges "
-                                     "ports (udp, tcp or sctp); others mint one flow, not one per packet")
+                                     "ports (%s); others mint one flow, not one per packet"
+                                     % ", ".join(PORTED_RAW_PROFILES))
                 obj["conntrack_bypass"] = True
             rdp = int(d.get("raw_dports") or 0)
             if rdp and not rrot:
