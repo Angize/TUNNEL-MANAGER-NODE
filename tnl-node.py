@@ -595,7 +595,8 @@ def _core_port(cfg):
 
 
 RAW_HEADER_LEN = {"bare": 0, "ipip": 28, "etherip": 2, "ipcomp": 4, "gre": 32, "icmp": 8, "udp": 8,
-                  "esp": 8, "l2tpv3": 8, "tcp": 32, "ah": 24}
+                  "esp": 8, "l2tpv3": 8, "tcp": 32, "ah": 24, "sctp": 12}
+PORTED_RAW_PROFILES = ("udp", "tcp", "sctp")
 MAX_WORKERS = 8
 MAX_SPROT_EVERY = 60
 MAX_DPORTS = 16
@@ -736,21 +737,21 @@ def _core_config(cfg):
             _rport = int(cfg.get("raw_port") or 0)
         except (TypeError, ValueError):
             _rport = 0
-        if raw_profile in ("udp", "tcp") and 1 <= _rport <= 65535:
+        if raw_profile in PORTED_RAW_PROFILES and 1 <= _rport <= 65535:
             corecfg["raw_port"] = _rport
         try:
             _rsport = int(cfg.get("raw_sport") or 0)
         except (TypeError, ValueError):
             _rsport = 0
-        if raw_profile in ("udp", "tcp") and _as_bool(cfg.get("raw_sport_random")):
+        if raw_profile in PORTED_RAW_PROFILES and _as_bool(cfg.get("raw_sport_random")):
             corecfg["raw_sport_random"] = True
-        elif raw_profile in ("udp", "tcp") and 1 <= _rsport <= 65535:
+        elif raw_profile in PORTED_RAW_PROFILES and 1 <= _rsport <= 65535:
             corecfg["raw_sport"] = _rsport
         try:
             _rrot = int(cfg.get("raw_sport_rotate") or 0)
         except (TypeError, ValueError):
             _rrot = 0
-        if raw_profile in ("udp", "tcp") and 1 <= _rrot <= MAX_SPROT_EVERY:
+        if raw_profile in PORTED_RAW_PROFILES and 1 <= _rrot <= MAX_SPROT_EVERY:
             corecfg["raw_sport_rotate"] = _rrot
             try:
                 _rdp = int(cfg.get("raw_dports") or 0)
@@ -1175,7 +1176,7 @@ def _pf_acct_rules(cfg):
     return out
 
 
-CT_BYPASS_PROFILES = ("udp", "tcp")
+CT_BYPASS_PROFILES = PORTED_RAW_PROFILES
 
 
 def _ct_pressure():
@@ -2377,7 +2378,7 @@ def op_tunnel(d):
                     raise ValueError("bad raw_proto")
                 if rproto:
                     obj["raw_proto"] = rproto
-            if profile in ("udp", "tcp"):
+            if profile in PORTED_RAW_PROFILES:
                 rport = int(d.get("raw_port") or 0)
                 if rport and not (1 <= rport <= 65535):
                     raise ValueError("bad raw_port")
@@ -2393,9 +2394,9 @@ def op_tunnel(d):
                 elif rsport:
                     obj["raw_sport"] = rsport
             rrot = int(d.get("raw_sport_rotate") or 0)
-            if rrot and profile not in ("udp", "tcp"):
+            if rrot and profile not in PORTED_RAW_PROFILES:
                 raise ValueError("raw_sport_rotate cycles a forged source port, so it needs a profile "
-                                 "that builds one (udp or tcp)")
+                                 "that builds one (udp, tcp or sctp)")
             if rrot and not (1 <= rrot <= MAX_SPROT_EVERY):
                 raise ValueError("bad raw_sport_rotate")
             if rrot and (int(d.get("raw_sport") or 0) or _as_bool(d.get("raw_sport_random"))):
@@ -2405,7 +2406,7 @@ def op_tunnel(d):
             if _as_bool(d.get("conntrack_bypass")):
                 if profile not in CT_BYPASS_PROFILES:
                     raise ValueError("conntrack bypass only means something for a profile that forges "
-                                     "ports (udp or tcp); others mint one flow, not one per packet")
+                                     "ports (udp, tcp or sctp); others mint one flow, not one per packet")
                 obj["conntrack_bypass"] = True
             rdp = int(d.get("raw_dports") or 0)
             if rdp and not rrot:
