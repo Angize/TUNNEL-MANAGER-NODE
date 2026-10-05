@@ -3350,22 +3350,29 @@ def _granted(d, kind):
     return m, None
 
 
-def op_set_update_key(d):
-    pub = str(d.get("pubkey") or "").strip()
-    if "PUBLIC KEY" not in pub or len(pub) > 8192:
+def _update_pub(pem):
+    pem = str(pem or "").strip()
+    if "PUBLIC KEY" not in pem or len(pem) > 8192:
         raise ValueError("bad pubkey")
+    return pem
+
+
+def op_set_update_key(d):
+    pub = _update_pub(d.get("pubkey"))
     conf = load_conf()
     cur = str(conf.get("update_pubkey") or "").strip()
     if cur == pub:
         return {"ok": True, "already": True}
-    if cur:
-        m = _statement(str(d.get("rotate") or ""), ROTATE_TAG, d.get("sig"))
-        if m is None or m.get("pubkey_sha256") != hashlib.sha256(pub.encode()).hexdigest():
-            return {"ok": False, "code": "key_mismatch",
-                    "msg": "update key already set by another panel (delete this node in the panel and add it again)"}
+    if not cur:
+        return {"ok": False, "code": "no_update_key",
+                "msg": "this node was installed without the panel key; reinstall it with the panel's install command"}
+    m = _statement(str(d.get("rotate") or ""), ROTATE_TAG, d.get("sig"))
+    if m is None or m.get("pubkey_sha256") != hashlib.sha256(pub.encode()).hexdigest():
+        return {"ok": False, "code": "key_mismatch",
+                "msg": "update key set by another panel; reinstall this node with this panel's install command"}
     conf["update_pubkey"] = pub
     save_conf(conf)
-    return {"ok": True, "already": False, "rotated": bool(cur)}
+    return {"ok": True, "rotated": True}
 
 
 CORE_STAGED = CORE_BIN + ".new"
@@ -3943,9 +3950,31 @@ def _prepare_install():
     return load_conf() if os.path.isfile(NODE_CONF) else {}
 
 
-def _finish_install(conf):
+def _panel_key(text):
+    try:
+        return _update_pub(base64.b64decode(str(text).strip(), validate=True).decode())
+    except Exception:
+        print("[✘] the panel key is not valid - copy it from the panel again")
+        return ""
+
+
+def _cli_key():
+    if len(sys.argv) < 4:
+        return ""
+    key = _panel_key(sys.argv[3])
+    if not key:
+        sys.exit(1)
+    return key
+
+
+def _finish_install(conf, key):
     if not conf.get("token"):
         conf["token"] = secrets.token_urlsafe(32)
+    if key:
+        conf["update_pubkey"] = key
+    if not conf.get("update_pubkey"):
+        print("[!] no panel key: this node refuses agent and core updates until it is reinstalled "
+              "with the install command from the panel")
     save_conf(conf)
     install_deps()
     check_tun()
@@ -3964,7 +3993,7 @@ def _port_or(value, fallback):
     return p if 1 <= p <= 65535 else fallback
 
 
-def do_install(port=""):
+def do_install(port="", key=""):
     conf = _prepare_install()
     have = conf.get("port", 8099)
     if port:
@@ -3973,15 +4002,20 @@ def do_install(port=""):
         conf["port"] = _port_or(input(f"Agent port [{have}]: "), have)
     else:
         conf["port"] = have
-    if _finish_install(conf):
+    while not key and not conf.get("update_pubkey") and sys.stdin.isatty():
+        typed = input("Panel key (from the panel's manual add dialog, Enter to skip): ").strip()
+        if not typed:
+            break
+        key = _panel_key(typed)
+    if _finish_install(conf, key):
         sys.exit(1)
     do_show()
 
 
-def do_auto_install(port):
+def do_auto_install(port, key=""):
     conf = _prepare_install()
     conf["port"] = _port_or(port, conf.get("port", 8099))
-    why = _finish_install(conf)
+    why = _finish_install(conf, key)
     if why:
         print(f"TNL_INSTALL_FAIL={why}")
         sys.exit(1)
@@ -4179,12 +4213,12 @@ def main():
         if os.geteuid() != 0:
             print("Run as root (sudo).")
             sys.exit(1)
-        do_install(sys.argv[2] if len(sys.argv) > 2 else "")
+        do_install(sys.argv[2] if len(sys.argv) > 2 else "", _cli_key())
     elif arg == "--auto-install":
         if os.geteuid() != 0:
             print("Run as root (sudo).")
             sys.exit(1)
-        do_auto_install(sys.argv[2] if len(sys.argv) > 2 else "8099")
+        do_auto_install(sys.argv[2] if len(sys.argv) > 2 else "8099", _cli_key())
     elif arg == "--show":
         do_show()
     else:
