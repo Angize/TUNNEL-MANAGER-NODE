@@ -3318,59 +3318,66 @@ def _verify_update_sig(msg, sig_b64):
                 pass
 
 
+MANIFEST_TAG = "tnl-manifest-v1"
+ROTATE_TAG = "tnl-rotate-v1"
+STALE = {"ok": False, "code": "stale_manifest"}
+
+
+def _statement(text, tag, sig):
+    lines = text.split("\n")
+    m = dict(ln.split("=", 1) for ln in lines[1:] if "=" in ln)
+    if lines[0] != tag or not _verify_update_sig(text.encode(), sig):
+        return None
+    return m
+
+
+def _fresh(m, kind, conf=None):
+    seen = ((load_conf() if conf is None else conf).get("issued") or {}).get(kind)
+    return int(m["issued_ms"]) > (seen if isinstance(seen, int) else 0)
+
+
+def _note_issued(conf, kind, m):
+    conf["issued"] = {**(conf.get("issued") or {}), kind: int(m["issued_ms"])}
+
+
+def _granted(d, kind):
+    m = _statement(str(d.get("manifest") or ""), MANIFEST_TAG, d.get("sig"))
+    if m is None:
+        return None, {"ok": False, "code": "bad_signature"}
+    if (m.get("kind") != kind or m.get("arch") != ("any" if kind == "agent" else _core_arch())
+            or not CORE_SHA_RE.match(m.get("sha256", "")) or not CORE_VER_RE.match(m.get("version", ""))
+            or not m.get("issued_ms", "").isdigit()):
+        return None, {"ok": False, "code": "bad_manifest"}
+    return m, None
+
+
 def op_set_update_key(d):
     pub = str(d.get("pubkey") or "").strip()
     if "PUBLIC KEY" not in pub or len(pub) > 8192:
         raise ValueError("bad pubkey")
     conf = load_conf()
     cur = str(conf.get("update_pubkey") or "").strip()
-    if cur and cur != pub:
-        return {"ok": False, "msg": "update key already set by another panel (delete this node in the panel and add it again)"}
-    if not cur:
-        conf["update_pubkey"] = pub
-        save_conf(conf)
-    return {"ok": True, "already": bool(cur)}
+    if cur == pub:
+        return {"ok": True, "already": True}
+    if cur:
+        m = _statement(str(d.get("rotate") or ""), ROTATE_TAG, d.get("sig"))
+        if m is None or m.get("pubkey_sha256") != hashlib.sha256(pub.encode()).hexdigest():
+            return {"ok": False, "code": "key_mismatch",
+                    "msg": "update key already set by another panel (delete this node in the panel and add it again)"}
+    conf["update_pubkey"] = pub
+    save_conf(conf)
+    return {"ok": True, "already": False, "rotated": bool(cur)}
 
 
 CORE_STAGED = CORE_BIN + ".new"
 
 
-def _release_checksum(url):
-    txt = _fetch_url(str(url) + ".sha256", 4096, timeout=20).decode("utf-8", "replace")
-    sha = (txt.split() or [""])[0].strip().lower()
-    if not CORE_SHA_RE.match(sha):
-        raise ValueError("the release published no usable checksum")
-    return sha
-
-
-def _granted_sha(d):
-    want = str(d.get("sha256") or "").strip().lower()
-    if want:
-        if not CORE_SHA_RE.match(want):
-            raise ValueError("bad sha256")
-        if not _verify_update_sig(want.encode(), d.get("sig")):
-            return "", {"ok": False, "code": "bad_signature"}
-        return want, None
-    url = str(d.get("url") or "").strip()
-    if not url:
-        raise ValueError("bad sha256")
-    if not _verify_update_sig(url.encode(), d.get("sig")):
-        return "", {"ok": False, "code": "bad_signature"}
-    try:
-        return _release_checksum(url), None
-    except Exception as e:
-        return "", {"ok": False, "code": "checksum_unavailable", "msg": str(e)[:140]}
-
-
-def _core_bytes(d):
-    want, bad = _granted_sha(d)
-    if bad:
-        return None, want, bad
+def _core_bytes(d, want):
     if d.get("data") is None and d.get("url"):
         try:
             raw = _fetch_url(d["url"], FETCH_MAX_CORE)
         except Exception as e:
-            return None, want, {"ok": False, "code": "download_failed", "msg": str(e)[:140]}
+            return None, {"ok": False, "code": "download_failed", "msg": str(e)[:140]}
     else:
         _require(d, ["data"])
         try:
@@ -3378,28 +3385,28 @@ def _core_bytes(d):
         except Exception:
             raise ValueError("bad base64 payload")
     if len(raw) < 100000:
-        return None, want, {"ok": False, "code": "too_small"}
+        return None, {"ok": False, "code": "too_small"}
     if hashlib.sha256(raw).hexdigest() != want:
-        return None, want, {"ok": False, "code": "sha_mismatch"}
-    return raw, want, None
-
-
-def _core_label(d):
-    label = str(d.get("version") or "custom").strip() or "custom"
-    return label if CORE_VER_RE.match(label) else "custom"
+        return None, {"ok": False, "code": "sha_mismatch"}
+    return raw, None
 
 
 def op_core_put(d):
-    raw, want, bad = _core_bytes(d)
+    m, bad = _granted(d, "core")
+    if bad:
+        return bad
+    want = m["sha256"]
+    raw, bad = _core_bytes(d, want)
     if bad:
         return bad
     if os.path.isfile(CORE_BIN) and _installed_core_sha() == want:
         conf = load_conf()
-        label = _core_label(d)
-        if conf.get("core_version") != label:
-            conf["core_version"] = label
+        if conf.get("core_version") != m["version"]:
+            conf["core_version"] = m["version"]
             save_conf(conf)
         return {"ok": True, "code": "same", "core_sha": want[:12]}
+    if not _fresh(m, "core"):
+        return STALE
     with _core_lock:
         tmp = CORE_STAGED + ".tmp"
         with open(tmp, "wb") as f:
@@ -3410,23 +3417,27 @@ def op_core_put(d):
 
 
 def op_core_apply(d):
-    want, bad = _granted_sha(d)
+    m, bad = _granted(d, "core")
     if bad:
         return bad
+    want = m["sha256"]
     with _core_lock:
         if not os.path.isfile(CORE_STAGED):
             if os.path.isfile(CORE_BIN) and _installed_core_sha() == want:
                 return {"ok": True, "code": "same", "core_sha": want[:12], "restarted": 0}
             return {"ok": False, "code": "nothing_staged"}
+        conf = load_conf()
+        if not _fresh(m, "core", conf):
+            return STALE
         with open(CORE_STAGED, "rb") as f:
             got = hashlib.sha256(f.read()).hexdigest()
         if got != want:
             os.remove(CORE_STAGED)
             return {"ok": False, "code": "sha_mismatch"}
         os.replace(CORE_STAGED, CORE_BIN)
-    label = _core_label(d)
-    conf = load_conf()
+    label = m["version"]
     conf["core_version"] = label
+    _note_issued(conf, "core", m)
     save_conf(conf)
     restarted, failed = 0, []
     for c in raw_configs():
@@ -3447,6 +3458,9 @@ def op_core_apply(d):
 
 
 def op_update(d):
+    m, bad = _granted(d, "agent")
+    if bad:
+        return bad
     src = d.get("code")
     if src is None and d.get("url"):
         try:
@@ -3460,12 +3474,12 @@ def op_update(d):
     if not isinstance(src, str) or not src.strip():
         raise ValueError("empty code")
     h = hashlib.sha256(src.encode()).hexdigest()
-    if d.get("sha256") != h:
+    if m["sha256"] != h:
         return {"ok": False, "code": "sha_mismatch"}
-    if not _verify_update_sig(h.encode(), d.get("sig")):
-        return {"ok": False, "code": "bad_signature"}
     if h == _SELF_SHA:
         return {"ok": True, "sha256": h, "restarting": False, "already": True}
+    if not _fresh(m, "agent"):
+        return STALE
     try:
         compile(src, "tnl-node.py", "exec")
     except SyntaxError as e:
@@ -3493,6 +3507,12 @@ def op_update(d):
         except OSError:
             pass
     os.replace(tmp, INSTALLED)
+    try:
+        conf = load_conf()
+        _note_issued(conf, "agent", m)
+        save_conf(conf)
+    except Exception as e:
+        logline(f"issued persist: {e}")
     logline(f"agent updated -> sha {h[:12]}, restarting")
     _restart_pending.set()
     subprocess.Popen(["sh", "-c", "sleep 1; systemctl restart tnl-node"],
