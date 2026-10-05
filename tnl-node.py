@@ -2000,18 +2000,18 @@ def _accept_ctr(ctr):
     return True
 
 
-def _sig_msg(method, path, ctr, body_sha):
-    return "%s\n%s\n%s\n%s" % (method, path, ctr, body_sha)
+def _sig_msg(method, path, ctr, body_sha, central):
+    return "%s\n%s\n%s\n%s\n%s" % (method, path, ctr, body_sha, central)
 
 
 def _resp_sig_msg(ctr, status, body_sha):
     return "resp\n%s\n%s\n%s" % (ctr, status, body_sha)
 
 
-def _sig_ok(secret, method, path, ctr, body_sha, sig_b64):
+def _sig_ok(secret, method, path, ctr, body_sha, central, sig_b64):
     try:
         want = hmac.new(secret.encode("utf-8"),
-                        _sig_msg(method, path, ctr, body_sha).encode("utf-8"),
+                        _sig_msg(method, path, ctr, body_sha, central).encode("utf-8"),
                         hashlib.sha256).digest()
         got = base64.b64decode(sig_b64, validate=True)
     except Exception:
@@ -3709,8 +3709,9 @@ class Handler(BaseHTTPRequestHandler):
         sig = self.headers.get("X-Sig", "")
         if not sig:
             return ""
+        central = "|".join(self.headers.get(h, "") for h in ("X-Central-Host", "X-Central-Port", "X-Central-TLS"))
         return "sig" if _sig_ok(want, method, self.path, self.headers.get("X-Ctr", ""),
-                                self.headers.get("X-Body", ""), sig) else ""
+                                self.headers.get("X-Body", ""), central, sig) else ""
 
     def _resp_sig(self, code, data):
         tok = self.server.conf.get("token", "")
@@ -3774,11 +3775,6 @@ class Handler(BaseHTTPRequestHandler):
                     cur = _req_ctr
                 self._send(409, {"error": "stale counter", "ctr": cur})
                 return
-        cp = self.headers.get("X-Central-Port")
-        if cp:
-            ch = str(self.headers.get("X-Central-Host", "")).strip()
-            note_central(ch if is_ipv4(ch) else self.client_address[0], cp,
-                         str(self.headers.get("X-Central-TLS", "")).strip() not in ("", "0"))
         if cmd not in OPS:
             self._send(404, {"error": "unknown endpoint"})
             return
@@ -3791,6 +3787,11 @@ class Handler(BaseHTTPRequestHandler):
             self._send(401, {"error": "body does not match the signature"})
             return
         _trust(self.client_address[0])
+        cp = self.headers.get("X-Central-Port")
+        if cp:
+            ch = str(self.headers.get("X-Central-Host", "")).strip()
+            note_central(ch if is_ipv4(ch) else self.client_address[0], cp,
+                         str(self.headers.get("X-Central-TLS", "")).strip() not in ("", "0"))
         try:
             if cmd in READ_ONLY:
                 res = OPS[cmd](d)
