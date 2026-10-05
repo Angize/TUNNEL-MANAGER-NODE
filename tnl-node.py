@@ -2113,7 +2113,7 @@ def get_central():
         return _central_cb
 
 
-def do_checkin():
+def do_checkin(ips):
     cb = get_central()
     if not cb:
         return False
@@ -2123,7 +2123,7 @@ def do_checkin():
         return False
     tok = conf.get("token", "")
     claim = {"fp": hashlib.sha256(tok.encode()).hexdigest(),
-             "port": conf.get("port"), "ctr": int(time.time() * 1000)}
+             "port": conf.get("port"), "ctr": int(time.time() * 1000), "ips": ips}
     claim["sig"] = base64.b64encode(hmac.new(
         tok.encode(), json.dumps(claim, sort_keys=True, separators=(",", ":")).encode(),
         hashlib.sha256).digest()).decode()
@@ -2145,7 +2145,7 @@ def checkin_loop():
         try:
             flat = sorted(local_ips_flat())
             if flat and flat != _last_reported_ips:
-                if do_checkin():
+                if do_checkin(flat):
                     _last_reported_ips = flat
         except Exception as e:
             logline(f"checkin: {e}")
