@@ -36,6 +36,8 @@ TLS_PEM = os.path.join(CONFIG_DIR, "tls.pem")
 _tls_pin = ""
 
 CORE_BIN = os.path.join(CONFIG_DIR, "tnl-core")
+CORE_DIR = os.path.join(CONFIG_DIR, "core")
+XTABLES_LOCK = "/run/xtables.lock"
 _core_lock = threading.Lock()
 _core_sha_cache = {"mtime": None, "sha": ""}
 _core_sha_lock = threading.Lock()
@@ -939,7 +941,7 @@ def _core_alive(name):
 
 
 def _cfg_path(name, suffix=""):
-    return os.path.join(CONFIG_DIR, "core-" + name + suffix)
+    return os.path.join(CORE_DIR, name, "core" + suffix)
 
 
 _tmp_seq = itertools.count(1)
@@ -998,7 +1000,26 @@ def build_core(cfg):
 
 
 def _write_core_json(name, corecfg):
+    os.makedirs(os.path.dirname(_cfg_path(name)), mode=0o700, exist_ok=True)
     _write_json_durable(_cfg_path(name, ".json"), corecfg)
+
+
+CORE_UNIT_PROPS = (
+    "Restart=always", "RestartSec=3", "NoNewPrivileges=yes",
+    "CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE",
+    "ProtectSystem=strict", "ReadOnlyPaths=/run", "ProtectHome=yes", "PrivateTmp=yes",
+    "ProtectKernelTunables=yes", "ProtectControlGroups=yes",
+    "PrivateDevices=yes", "BindPaths=/dev/net/tun", "DeviceAllow=/dev/net/tun rw",
+    "InaccessiblePaths=-/dev/shm -/dev/mqueue",
+    "RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_PACKET",
+    "LockPersonality=yes", "MemoryDenyWriteExecute=yes", "RestrictRealtime=yes", "RestrictSUIDSGID=yes",
+    "SystemCallArchitectures=native",
+)
+
+
+def _core_unit_props(name):
+    return CORE_UNIT_PROPS + ("TemporaryFileSystem=%s:ro" % CONFIG_DIR, "BindReadOnlyPaths=" + CORE_BIN,
+                              "BindPaths=" + os.path.dirname(_cfg_path(name)), "ReadWritePaths=" + XTABLES_LOCK)
 
 
 def _core_relaunch(cfg):
@@ -1014,9 +1035,9 @@ def _core_relaunch(cfg):
             os.remove(p)
         except OSError:
             pass
-    run(["systemd-run", "--unit", unit, "--collect",
-         "-p", "Restart=always", "-p", "RestartSec=3",
-         CORE_BIN, "--config", _cfg_path(name, ".json")])
+    open(XTABLES_LOCK, "a").close()
+    must(["systemd-run", "--unit", unit, "--collect"] + [a for p in _core_unit_props(name) for a in ("-p", p)] +
+         [CORE_BIN, "--config", _cfg_path(name, ".json")])
     for _ in range(80):
         if _netdev_exists(name):
             return True
@@ -1073,10 +1094,11 @@ def _core_teardown(cfg):
     if not NAME_RE.match(name):
         return
     _core_stop(name)
-    try:
-        os.remove(_cfg_path(name, ".json"))
-    except OSError:
-        pass
+    for rm, p in ((os.remove, _cfg_path(name, ".json")), (os.rmdir, os.path.dirname(_cfg_path(name)))):
+        try:
+            rm(p)
+        except OSError:
+            pass
 
 
 def _set_link_state(cfg, enabled):
@@ -2633,7 +2655,11 @@ def op_core_restart(d):
         return {"ok": False, "msg": "tunnel disabled"}
     if not os.path.exists(_cfg_path(name, ".json")):
         return {"ok": False, "msg": "core config missing on this node"}
-    if not _core_relaunch(cfg):
+    try:
+        up = _core_relaunch(cfg)
+    except RuntimeError as e:
+        return {"ok": False, "msg": str(e)[:300]}
+    if not up:
         return {"ok": False, "msg": "core did not come up (no iface)"}
     return {"ok": True}
 
