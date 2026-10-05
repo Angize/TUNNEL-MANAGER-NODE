@@ -46,10 +46,17 @@ OBFS_DATA_PAD_MAX = 64
 NAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
 IFACE_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.@-]*$")
 
-MAX_CONNS = 64
+TRUSTED_CONNS = 32
+OPEN_CONNS = 32
+OPEN_PER_IP = 4
+TRUSTED_MAX = 8
 
 AGENT_VERSION = "dev"
-_conn_sem = threading.BoundedSemaphore(MAX_CONNS)
+_trusted_sem = threading.BoundedSemaphore(TRUSTED_CONNS)
+_open_sem = threading.BoundedSemaphore(OPEN_CONNS)
+_open_per_ip = {}
+_trusted_ips = []
+_slot_lock = threading.Lock()
 _apply_lock = threading.Lock()
 _restart_pending = threading.Event()
 _central_cb = None
@@ -2025,20 +2032,19 @@ def note_central(ip, port, tls):
         if _central_cb == cb:
             return
         _central_cb = cb
-    _save_central_cb(cb)
+    _conf_put("central_cb", lambda: list(cb))
 
 
-def _save_central_cb(cb):
+def _conf_put(key, value):
     with _apply_lock:
         try:
             conf = load_conf()
-            want = [cb[0], cb[1], cb[2]]
-            if conf.get("central_cb") == want:
-                return
-            conf["central_cb"] = want
-            save_conf(conf)
+            want = value()
+            if conf.get(key) != want:
+                conf[key] = want
+                save_conf(conf)
         except Exception as e:
-            logline(f"central_cb persist: {e}")
+            logline(f"{key} persist: {e}")
 
 
 def _seed_central_cb():
@@ -2056,6 +2062,43 @@ def _seed_central_cb():
     if is_ipv4(str(cb[0])) and 1 <= p <= 65535:
         with _central_cb_lock:
             _central_cb = (str(cb[0]), p, bool(cb[2]))
+
+
+def _take_slot(ip):
+    if ip in _trusted_ips and _trusted_sem.acquire(blocking=False):
+        return _trusted_sem.release
+    with _slot_lock:
+        if _open_per_ip.get(ip, 0) >= OPEN_PER_IP or not _open_sem.acquire(blocking=False):
+            return None
+        _open_per_ip[ip] = _open_per_ip.get(ip, 0) + 1
+
+    def release():
+        with _slot_lock:
+            n = _open_per_ip.pop(ip) - 1
+            if n:
+                _open_per_ip[ip] = n
+        _open_sem.release()
+    return release
+
+
+def _trust(ip):
+    if ip in _trusted_ips or not is_ipv4(ip):
+        return
+    with _slot_lock:
+        if ip in _trusted_ips:
+            return
+        _trusted_ips.append(ip)
+        del _trusted_ips[:-TRUSTED_MAX]
+    _conf_put("trusted_ips", lambda: list(_trusted_ips))
+
+
+def _seed_trusted():
+    try:
+        ips = load_conf().get("trusted_ips")
+    except Exception:
+        return
+    if isinstance(ips, list):
+        _trusted_ips[:] = [ip for ip in ips if isinstance(ip, str) and is_ipv4(ip)][-TRUSTED_MAX:]
 
 
 def central_origin():
@@ -3581,8 +3624,11 @@ def _tls_accept(ctx, sock, until):
 
 
 class NodeServer(ThreadingHTTPServer):
+    request_queue_size = 128
+
     def finish_request(self, request, client_address):
-        if not _conn_sem.acquire(blocking=False):
+        release = _take_slot(client_address[0])
+        if release is None:
             return
         try:
             conn = _tls_accept(self.tls, request, time.monotonic() + Handler.header_budget)
@@ -3592,7 +3638,7 @@ class NodeServer(ThreadingHTTPServer):
                 finally:
                     self.shutdown_request(conn)
         finally:
-            _conn_sem.release()
+            release()
 
 
 class HeaderDeadline:
@@ -3744,6 +3790,7 @@ class Handler(BaseHTTPRequestHandler):
         if how == "sig" and not self._body_matches_sig():
             self._send(401, {"error": "body does not match the signature"})
             return
+        _trust(self.client_address[0])
         try:
             if cmd in READ_ONLY:
                 res = OPS[cmd](d)
@@ -4092,6 +4139,7 @@ def serve():
     threading.Thread(target=rotation_loop, daemon=True).start()
     threading.Thread(target=health_loop, daemon=True).start()
     _seed_central_cb()
+    _seed_trusted()
     _seed_req_ctr()
     threading.Thread(target=checkin_loop, daemon=True).start()
     httpd.server_activate()
