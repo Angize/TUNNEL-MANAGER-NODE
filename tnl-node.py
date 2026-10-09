@@ -822,8 +822,10 @@ def _core_config(cfg):
             snis = [s for s in (cfg.get("ws_edge_snis") or []) if isinstance(s, dict) and str(s.get("host") or "").strip()]
             if ips and snis:
                 corecfg["ws_edge_ips"] = ips
-                corecfg["ws_edge_snis"] = [{"host": str(s["host"]).strip(),
-                                         "ech": str(s.get("ech") or "").strip()} for s in snis]
+                corecfg["ws_edge_snis"] = [{"host": str(s["host"]).strip(), "ech": str(s.get("ech") or "").strip(),
+                                         **({"group": s["group"]} if s.get("group") else {})} for s in snis]
+                if cfg.get("ws_edge_ip_groups"):
+                    corecfg["ws_edge_ip_groups"] = dict(cfg["ws_edge_ip_groups"])
                 _wrs = cfg.get("ws_rotate_secs")
                 corecfg["ws_rotate_secs"] = 600 if _wrs is None else max(0, min(28800, int(_wrs)))
         if bool(cfg.get("ws_port_roll")):
@@ -2329,14 +2331,19 @@ def op_tunnel(d):
                 if pips or psnis:
                     if len(pips) > 64 or len(psnis) > 64:
                         raise ValueError("ws edge pool too large")
-                    npips = []
-                    for ip in pips:
+                    def _edge(ip):
                         h = ip.rpartition(":")[0] if ":" in ip else ip
                         p = ip.rpartition(":")[2] if ":" in ip else "443"
                         if not is_ipv4(h) or not (p.isdigit() and 1 <= int(p) <= 65535):
                             raise ValueError("bad ws_edge_ip (must be IPv4:port)")
-                        npips.append("%s:%s" % (h, p))
-                    pips = npips
+                        return "%s:%s" % (h, p)
+
+                    def _group(v, what):
+                        v = str(v or "").strip()
+                        if v and not re.match(r"^[a-z0-9_-]{1,16}$", v):
+                            raise ValueError("bad %s group" % what)
+                        return v
+                    pips = [_edge(ip) for ip in pips]
                     clean_snis = []
                     for s in psnis:
                         if not isinstance(s, dict):
@@ -2347,10 +2354,19 @@ def op_tunnel(d):
                         se = str(s.get("ech") or "").strip()
                         if se and (len(se) > 4096 or not re.match(r"^[A-Za-z0-9+/=]+$", se)):
                             raise ValueError("bad ws_edge_sni ech")
-                        clean_snis.append({"host": h, "ech": se})
+                        sg = _group(s.get("group"), "ws_edge_sni")
+                        clean_snis.append({"host": h, "ech": se, **({"group": sg} if sg else {})})
+                    raw_groups = d.get("ws_edge_ip_groups") or {}
+                    if not isinstance(raw_groups, dict):
+                        raise ValueError("bad ws_edge_ip_groups")
+                    ip_groups = {_edge(str(k).strip()): _group(v, "ws_edge_ip") for k, v in raw_groups.items()}
+                    if not set(ip_groups) <= set(pips):
+                        raise ValueError("ws_edge_ip_groups names an IP that is not in ws_edge_ips")
                     if pips and clean_snis:
                         obj["ws_edge_ips"] = pips
                         obj["ws_edge_snis"] = clean_snis
+                        if ip_groups:
+                            obj["ws_edge_ip_groups"] = ip_groups
                         _rs = d.get("ws_rotate_secs")
                         obj["ws_rotate_secs"] = max(0, min(28800, int(_rs))) if _rs is not None else 600
             if role == "client" and _as_bool(d.get("ws_port_roll")):
