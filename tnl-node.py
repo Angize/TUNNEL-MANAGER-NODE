@@ -2765,6 +2765,22 @@ def _ss_proc(line):
     return m.group(1) if m else ""
 
 
+_CORE_CGROUP = re.compile(r"/" + re.escape(_core_unit("")) + r"(.+)\.service$", re.M)
+
+
+def _pid_tunnel(pid):
+    try:
+        with open("/proc/%s/cgroup" % pid) as f:
+            m = _CORE_CGROUP.search(f.read())
+    except OSError:
+        return ""
+    return m.group(1) if m else ""
+
+
+def _ss_tunnels(line):
+    return {_pid_tunnel(pid) for pid in re.findall(r"pid=(\d+)", line)}
+
+
 def _norm_ip(x):
     return str(x or "").strip().strip("[]")
 
@@ -2805,7 +2821,7 @@ def _port_listeners_proc(port, proto):
                             continue
                     except ValueError:
                         continue
-                    found.append((_decode_hexip(hexaddr) or "*", ""))
+                    found.append((_decode_hexip(hexaddr) or "*", "", set()))
         except (OSError, StopIteration):
             continue
     return found
@@ -2822,7 +2838,7 @@ def _port_listeners(port, proto):
             continue
         host, _, lport = f[3].rpartition(":")
         if lport == str(port):
-            found.append((_norm_ip(host), _ss_proc(line)))
+            found.append((_norm_ip(host), _ss_proc(line), _ss_tunnels(line)))
     return found
 
 
@@ -2830,13 +2846,14 @@ def _ip_overlap(a, b):
     return not a or not b or a in _WILD or b in _WILD or a == b
 
 
-def _port_busy(port, proto, ip=None):
+def _port_busy(port, proto, ip=None, own=""):
     proto = "tcp" if str(proto).lower() == "tcp" else "udp"
     tip = _norm_ip(ip)
-    for host, who in _port_listeners(port, proto):
-        if _ip_overlap(tip, host):
-            return True, who
-    return False, ""
+    for host, who, tunnels in _port_listeners(port, proto):
+        if not _ip_overlap(tip, host) or (own and tunnels == {own}):
+            continue
+        return True, who, next((t for t in tunnels if t), "")
+    return False, "", ""
 
 
 def _tunnel_ports(c):
@@ -2872,7 +2889,7 @@ def _pf_conflict(iface, lp, listen_ip, skip=""):
             if p == port and _ip_overlap(listen_ip, ip):
                 return f"port {lp} is used by tunnel {c['name']}"
     for proto in ("tcp", "udp"):
-        for host, who in _port_listeners(port, proto):
+        for host, who, _ in _port_listeners(port, proto):
             if host.startswith("127.") or host == "::1" or not _ip_overlap(listen_ip, host):
                 continue
             return f"port {lp}/{proto} is in use on this node" + (f" by {who}" if who else "")
@@ -3062,13 +3079,13 @@ def op_portcheck(d):
     ip = _norm_ip(d.get("ip")) or None
     if ip and not re.match(r"^[0-9A-Fa-f:.]{1,45}$", ip):
         raise ValueError("bad ip")
-    busy, who = _port_busy(port, proto, ip)
+    busy, who, tunnel = _port_busy(port, proto, ip, str(d.get("own") or ""))
     if not busy:
         who = next((c["name"] for c in raw_configs() if c.get("type") == "portfw"
                     and str(c.get("listen_port")) == str(port)
                     and _ip_overlap(ip, str(c.get("listen_ip") or ""))), "")
         busy = bool(who)
-    return {"ok": True, "busy": busy, "who": who, "port": port, "proto": proto, "ip": ip or ""}
+    return {"ok": True, "busy": busy, "who": who, "tunnel": tunnel, "port": port, "proto": proto, "ip": ip or ""}
 
 
 def op_edge_status(d):
