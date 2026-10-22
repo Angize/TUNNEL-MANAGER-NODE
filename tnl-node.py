@@ -818,6 +818,9 @@ def _core_config(cfg):
             ech = str(cfg.get("ws_ech") or "").strip()
             if ech:
                 corecfg["ws_ech"] = ech
+            ca = str(cfg.get("ws_ca") or "").strip()
+            if ca:
+                corecfg["ws_ca"] = ca
             ips = [str(x).strip() for x in (cfg.get("ws_edge_ips") or []) if str(x).strip()]
             snis = [s for s in (cfg.get("ws_edge_snis") or []) if isinstance(s, dict) and str(s.get("host") or "").strip()]
             if ips and snis:
@@ -830,6 +833,17 @@ def _core_config(cfg):
                 corecfg["ws_rotate_secs"] = 600 if _wrs is None else max(0, min(28800, int(_wrs)))
         if bool(cfg.get("ws_port_roll")):
             corecfg["ws_port_roll"] = True
+        if cfg.get("role") == "server":
+            sc = str(cfg.get("srv_cert") or "")
+            sk = str(cfg.get("srv_key") or "")
+            if sc and sk:
+                corecfg["srv_cert"] = sc
+                corecfg["srv_key"] = sk
+                ek = str(cfg.get("srv_ech_key") or "").strip()
+                ec = str(cfg.get("srv_ech_conf") or "").strip()
+                if ek and ec:
+                    corecfg["srv_ech_key"] = ek
+                    corecfg["srv_ech_conf"] = ec
     if transport in ("udp", "raw") and bool(cfg.get("fec")):
         corecfg["fec"] = True
         corecfg["fec_data"] = int(cfg.get("fec_data") or 16)
