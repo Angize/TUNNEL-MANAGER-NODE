@@ -2325,6 +2325,11 @@ def op_tunnel(d):
                     if len(ech) > 4096 or not re.match(r"^[A-Za-z0-9+/=]+$", ech):
                         raise ValueError("bad ws_ech")
                     obj["ws_ech"] = ech
+                ca = str(d.get("ws_ca") or "")
+                if ca.strip():
+                    if len(ca) > 16384 or "BEGIN CERTIFICATE" not in ca:
+                        raise ValueError("bad ws_ca")
+                    obj["ws_ca"] = ca
                 if _as_bool(d.get("sni_split")):
                     obj["sni_split"] = True
                     sp = int(d.get("split_pos") or 0)
@@ -2394,6 +2399,23 @@ def op_tunnel(d):
                         sep and not (eport.isdigit() and 1 <= int(eport) <= 65535)):
                     raise ValueError("bad edge_ip")
                 obj["edge_ip"] = edge
+            if role == "server":
+                sc = str(d.get("srv_cert") or "")
+                sk = str(d.get("srv_key") or "")
+                if sc.strip() or sk.strip():
+                    if ("BEGIN CERTIFICATE" not in sc or "BEGIN" not in sk
+                            or len(sc) > 16384 or len(sk) > 16384):
+                        raise ValueError("bad srv_cert/srv_key")
+                    obj["srv_cert"] = sc
+                    obj["srv_key"] = sk
+                    ek = str(d.get("srv_ech_key") or "").strip()
+                    ec = str(d.get("srv_ech_conf") or "").strip()
+                    if ek or ec:
+                        if (not re.match(r"^[0-9a-fA-F]+$", ek) or len(ek) > 256
+                                or not re.match(r"^[A-Za-z0-9+/=]+$", ec) or len(ec) > 8192):
+                            raise ValueError("bad srv_ech")
+                        obj["srv_ech_key"] = ek
+                        obj["srv_ech_conf"] = ec
         if transport == "raw":
             profile = str(d.get("raw_profile") or "bare").strip().lower()
             if profile not in RAW_HEADER_LEN:
