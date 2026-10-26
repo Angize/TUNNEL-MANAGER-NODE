@@ -14,6 +14,7 @@ import py_compile
 import re
 import secrets
 import shutil
+import signal
 import socket
 import ssl
 import struct
@@ -37,6 +38,9 @@ _tls_pin = ""
 
 CORE_BIN = os.path.join(CONFIG_DIR, "tnl-core")
 CORE_DIR = os.path.join(CONFIG_DIR, "core")
+FRONT_DIR = os.path.join(CONFIG_DIR, "front")
+FRONT_CFG = os.path.join(FRONT_DIR, "front.json")
+FRONT_UNIT = "tnl-front"
 XTABLES_LOCK = "/run/xtables.lock"
 _core_lock = threading.Lock()
 _core_sha_cache = {"mtime": None, "sha": ""}
@@ -2737,6 +2741,115 @@ def op_link_enable(d):
     return {"ok": True, "enabled": enabled}
 
 
+FRONT_UNIT_PROPS = (
+    "Restart=always", "RestartSec=3", "NoNewPrivileges=yes",
+    "CapabilityBoundingSet=CAP_NET_BIND_SERVICE",
+    "AmbientCapabilities=CAP_NET_BIND_SERVICE",
+    "ProtectSystem=strict", "ProtectHome=yes", "PrivateTmp=yes", "PrivateDevices=yes",
+    "ProtectKernelTunables=yes", "ProtectControlGroups=yes",
+    "RestrictAddressFamilies=AF_INET AF_INET6",
+    "LockPersonality=yes", "MemoryDenyWriteExecute=yes", "RestrictRealtime=yes",
+    "RestrictSUIDSGID=yes", "SystemCallArchitectures=native",
+    "TemporaryFileSystem=%s:ro" % CONFIG_DIR, "BindReadOnlyPaths=" + CORE_BIN,
+    "BindReadOnlyPaths=" + FRONT_DIR,
+)
+
+
+def _front_running():
+    _, out, _ = run(["systemctl", "is-active", FRONT_UNIT], timeout=10)
+    return out.strip() in ("active", "activating")
+
+
+def _front_pid():
+    _, out, _ = run(["systemctl", "show", "-p", "MainPID", "--value", FRONT_UNIT], timeout=10)
+    try:
+        return int(out.strip())
+    except ValueError:
+        return 0
+
+
+def _front_launch():
+    run(["systemctl", "stop", FRONT_UNIT])
+    run(["systemctl", "reset-failed", FRONT_UNIT])
+    must(["systemd-run", "--unit", FRONT_UNIT, "--collect"]
+         + [a for p in FRONT_UNIT_PROPS for a in ("-p", p)]
+         + [CORE_BIN, "--config", FRONT_CFG])
+
+
+def _front_build(d):
+    listen = str(d.get("listen") or "").strip()
+    host, sep, port = listen.rpartition(":")
+    if not sep or not port.isdigit() or not 1 <= int(port) <= 65535:
+        raise ValueError("front: listen must be \"ip:port\"")
+    ek = str(d.get("srv_ech_key") or "").strip()
+    ec = str(d.get("srv_ech_conf") or "").strip()
+    if (ek == "") != (ec == ""):
+        raise ValueError("front: srv_ech_key and srv_ech_conf must be set together")
+    if ek and (not re.match(r"^[0-9a-fA-F]+$", ek) or len(ek) > 256
+               or not re.match(r"^[A-Za-z0-9+/=]+$", ec) or len(ec) > 8192):
+        raise ValueError("front: bad srv_ech")
+    routes_in = d.get("routes")
+    if not isinstance(routes_in, list) or not routes_in:
+        raise ValueError("front: at least one route is required")
+    seen = set()
+    routes = []
+    for r in routes_in:
+        if not isinstance(r, dict):
+            raise ValueError("front: each route must be an object")
+        inner = str(r.get("inner") or "").strip().lower()
+        if not re.match(r"^[a-z0-9.-]{1,253}$", inner):
+            raise ValueError("front: bad inner name")
+        if inner in seen:
+            raise ValueError("front: duplicate inner name %s" % inner)
+        seen.add(inner)
+        backend = str(r.get("backend") or "").strip()
+        bh, bsep, bp = backend.rpartition(":")
+        if not bsep or not is_ipv4(bh) or not bp.isdigit() or not 1 <= int(bp) <= 65535:
+            raise ValueError("front: route %s backend must be \"ipv4:port\"" % inner)
+        cert = str(r.get("cert") or "")
+        key = str(r.get("key") or "")
+        if "BEGIN CERTIFICATE" not in cert or "BEGIN" not in key or len(cert) > 16384 or len(key) > 16384:
+            raise ValueError("front: route %s needs a valid cert and key" % inner)
+        routes.append({"inner": inner, "backend": backend, "cert": cert, "key": key})
+    obj = {"role": "front", "listen": listen, "routes": routes}
+    if ek:
+        obj["srv_ech_key"] = ek
+        obj["srv_ech_conf"] = ec
+    return obj
+
+
+def op_front(d):
+    if _as_bool(d.get("stop")):
+        run(["systemctl", "stop", FRONT_UNIT])
+        run(["systemctl", "reset-failed", FRONT_UNIT])
+        try:
+            os.remove(FRONT_CFG)
+        except FileNotFoundError:
+            pass
+        return {"ok": True, "stopped": True}
+    obj = _front_build(d)
+    os.makedirs(FRONT_DIR, exist_ok=True)
+    _write_json_durable(FRONT_CFG, obj)
+    reloaded = False
+    if _front_running():
+        pid = _front_pid()
+        if pid > 0:
+            try:
+                os.kill(pid, signal.SIGHUP)
+                reloaded = True
+            except OSError:
+                pass
+    if not reloaded:
+        _front_launch()
+        for _ in range(60):
+            if _front_running():
+                break
+            time.sleep(0.1)
+        if not _front_running():
+            return {"ok": False, "msg": "front did not come up"}
+    return {"ok": True, "routes": len(obj["routes"]), "reloaded": reloaded}
+
+
 def op_core_restart(d):
     name = _req_name(d)
     cfg = read_config(name)
@@ -3658,7 +3771,8 @@ OPS = {"ping": op_ping, "list": op_list, "check": op_check, "tunnel": op_tunnel,
        "core-put": op_core_put, "core-apply": op_core_apply,
        "set-update-key": op_set_update_key,
        "kernel-tune": op_kernel_tune,
-       "link-enable": op_link_enable, "core-restart": op_core_restart}
+       "link-enable": op_link_enable, "core-restart": op_core_restart,
+       "front": op_front}
 READ_ONLY = {"ping", "list", "check", "portcheck", "edge-status", "peer-status"}
 UNLOCKED = {"speedtest"}
 
@@ -3668,7 +3782,7 @@ WIRE = {
     "pc": "portcheck", "sd": "speedtest", "es": "edge-status", "ps": "peer-status", "pl": "peer-select",
     "qs": "pool-select", "rt": "retest-now", "eu": "ech-update",
     "cp": "core-put", "ca": "core-apply", "sk": "set-update-key", "kt": "kernel-tune", "le": "link-enable",
-    "cr": "core-restart",
+    "cr": "core-restart", "fr": "front",
 }
 
 
