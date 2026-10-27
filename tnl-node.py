@@ -2871,9 +2871,8 @@ def _front_build(d):
         if "BEGIN CERTIFICATE" not in cert or "BEGIN" not in key or len(cert) > 16384 or len(key) > 16384:
             raise ValueError("front: route %s needs a valid cert and key" % inner)
         routes.append({"inner": inner, "backend": backend, "cert": cert, "key": key})
-    tb = int(d.get("tcp_buf") or 0)
     return {"role": "front", "listen": "0.0.0.0:%d" % int(port), "routes": routes,
-            "srv_ech_key": ek, "srv_ech_conf": ec, "tcp_buf": -1 if tb < 0 else min(tb, 64 << 20)}
+            "srv_ech_key": ek, "srv_ech_conf": ec, "tcp_buf": int(d.get("tcp_buf") or 0)}
 
 
 def op_front(d):
