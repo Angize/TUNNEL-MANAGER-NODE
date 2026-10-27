@@ -2197,8 +2197,7 @@ def op_ping(d):
             "tunnels": len([c for c in cfgs if c.get("type") != "portfw"]),
             "portfw": len([c for c in cfgs if c.get("type") == "portfw"]),
             "core_ver": _core_ref(), "core_sha": _installed_core_sha()[:12], "arch": _core_arch(),
-            **({"front": _unit_show(FRONT_UNIT, "SubState").get("SubState") == "running"}
-               if os.path.isfile(FRONT_CFG) else {}),
+            **({"front": _front_up()} if os.path.isfile(FRONT_CFG) else {}),
             "stats": stats}
 
 
@@ -2758,8 +2757,7 @@ def op_link_enable(d):
 
 FRONT_UNIT_PROPS = (
     "Restart=always", "RestartSec=3", "NoNewPrivileges=yes",
-    "CapabilityBoundingSet=CAP_NET_BIND_SERVICE",
-    "AmbientCapabilities=CAP_NET_BIND_SERVICE",
+    "CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE",
     "ProtectSystem=strict", "ProtectHome=yes", "PrivateTmp=yes", "PrivateDevices=yes",
     "ProtectKernelTunables=yes", "ProtectControlGroups=yes",
     "RestrictAddressFamilies=AF_INET AF_INET6",
@@ -2775,6 +2773,10 @@ FRONT_RELOAD_WAIT = 3.0
 def _front_stop():
     run(["systemctl", "stop", FRONT_UNIT])
     run(["systemctl", "reset-failed", FRONT_UNIT])
+
+
+def _front_up():
+    return _unit_show(FRONT_UNIT, "SubState").get("SubState") == "running"
 
 
 def _front_read():
@@ -2794,26 +2796,32 @@ def _front_settled():
     return why
 
 
-def _front_reloads(q):
-    rc, out, _ = run(q, timeout=10)
-    return [ln for ln in out.splitlines() if "front: " in ln and "reload" in ln] if rc == 0 else []
+def _front_start():
+    try:
+        _front_launch()
+    except Exception as e:
+        return str(e)
+    return _front_settled()
 
 
 def _front_reload():
     inv = _unit_show(FRONT_UNIT, "InvocationID").get("InvocationID", "")
-    q = ["journalctl", "-u", FRONT_UNIT, "--no-pager", "-o", "cat", "_SYSTEMD_INVOCATION_ID=" + inv]
-    before = len(_front_reloads(q))
+    q = ["journalctl", "-u", FRONT_UNIT, "--no-pager", "-o", "cat", "--show-cursor", "_SYSTEMD_INVOCATION_ID=" + inv]
+    cursor = run(q + ["-n", "1"], timeout=10)[1].rpartition("-- cursor: ")[2].strip()
     rc, _, err = run(["systemctl", "kill", "--kill-who=main", "-s", "HUP", FRONT_UNIT], timeout=10)
     if rc != 0:
         return "front reload: " + (err.strip() or "the front is not running")[:200]
     end = time.monotonic() + FRONT_RELOAD_WAIT
     while time.monotonic() < end:
-        got = _front_reloads(q)
-        if len(got) > before:
-            last = got[-1]
-            return "" if "routes reloaded" in last else last[last.find("front: "):][:300]
+        for ln in run(q + ["--after-cursor=" + cursor], timeout=10)[1].splitlines():
+            if ln.startswith("-- cursor: "):
+                cursor = ln[len("-- cursor: "):].strip()
+            elif "tnl-core: front: routes reloaded" in ln:
+                return ""
+            elif "tnl-core: front: reload rejected" in ln:
+                return ln[ln.find("front: "):][:300]
         time.sleep(0.1)
-    return ""
+    return None
 
 
 def _front_launch():
@@ -2848,8 +2856,8 @@ def _front_build(d):
     for r in routes_in:
         if not isinstance(r, dict):
             raise ValueError("front: each route must be an object")
-        inner = str(r.get("inner") or "").strip().lower()
-        if not re.match(r"^[a-z0-9.-]{1,253}$", inner):
+        inner = str(r.get("inner") or "").strip()
+        if len(inner) > 253 or not re.match(r"^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*$", inner):
             raise ValueError("front: bad inner name")
         if inner in seen:
             raise ValueError("front: duplicate inner name %s" % inner)
@@ -2881,19 +2889,18 @@ def op_front(d):
     os.makedirs(FRONT_DIR, exist_ok=True)
     _write_json_durable(FRONT_CFG, obj)
     warm = bool(prev) and all(prev.get(k) == obj.get(k) for k in ("listen", "srv_ech_key", "srv_ech_conf"))
-    if warm and _unit_alive(FRONT_UNIT):
+    if warm and _front_up():
         why = _front_reload()
+        if why == "":
+            return {"ok": True, "routes": len(obj["routes"]), "reloaded": True}
         if why:
             _write_json_durable(FRONT_CFG, prev)
             return {"ok": False, "msg": why}
-        return {"ok": True, "routes": len(obj["routes"]), "reloaded": True}
-    _front_launch()
-    why = _front_settled()
+    why = _front_start()
     if why:
         if prev:
             _write_json_durable(FRONT_CFG, prev)
-            _front_launch()
-            back = _front_settled()
+            back = _front_start()
             if back:
                 why = "%s; the previous front did not come back either: %s" % (why, back)
         else:
@@ -3693,11 +3700,7 @@ def op_core_apply(d):
         except Exception as e:
             failed.append({"name": c.get("name"), "msg": str(e)[:120]})
     if os.path.isfile(FRONT_CFG):
-        try:
-            _front_launch()
-            why = _front_settled()
-        except Exception as e:
-            why = str(e)
+        why = _front_start()
         if why:
             failed.append({"name": FRONT_UNIT, "msg": why[:120]})
     logline("core %s applied (sha %s); relaunched %d tunnel(s)" % (label, want[:12], restarted))
