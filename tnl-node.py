@@ -14,7 +14,6 @@ import py_compile
 import re
 import secrets
 import shutil
-import signal
 import socket
 import ssl
 import struct
@@ -959,14 +958,25 @@ def _netdev_missing_reason(name, ttype):
 
 
 def _core_running(name):
-    _, out, _ = run(["systemctl", "is-active", _core_unit(name)], timeout=10)
+    return _unit_running(_core_unit(name))
+
+
+def _unit_running(unit):
+    _, out, _ = run(["systemctl", "is-active", unit], timeout=10)
     return out.strip() in ("active", "activating")
 
 
 def _core_alive(name):
-    _, out, _ = run(["systemctl", "show", "-p", "ActiveState", "-p", "SubState", "-p", "NRestarts",
-                     _core_unit(name)], timeout=10)
-    st = dict(ln.split("=", 1) for ln in out.splitlines() if "=" in ln)
+    return _unit_alive(_core_unit(name))
+
+
+def _unit_show(unit, *props):
+    _, out, _ = run(["systemctl", "show", unit] + [a for p in props for a in ("-p", p)], timeout=10)
+    return dict(ln.split("=", 1) for ln in out.splitlines() if "=" in ln)
+
+
+def _unit_alive(unit):
+    st = _unit_show(unit, "ActiveState", "SubState", "NRestarts")
     return (st.get("ActiveState") in ("active", "activating") and st.get("SubState") != "auto-restart"
             and st.get("NRestarts", "0") == "0")
 
@@ -2187,7 +2197,8 @@ def op_ping(d):
             "tunnels": len([c for c in cfgs if c.get("type") != "portfw"]),
             "portfw": len([c for c in cfgs if c.get("type") == "portfw"]),
             "core_ver": _core_ref(), "core_sha": _installed_core_sha()[:12], "arch": _core_arch(),
-            **({"front": _front_alive()} if os.path.isfile(FRONT_CFG) else {}),
+            **({"front": _unit_show(FRONT_UNIT, "SubState").get("SubState") == "running"}
+               if os.path.isfile(FRONT_CFG) else {}),
             "stats": stats}
 
 
@@ -2761,37 +2772,9 @@ FRONT_SETTLE = 1.5
 FRONT_RELOAD_WAIT = 3.0
 
 
-def _front_running():
-    _, out, _ = run(["systemctl", "is-active", FRONT_UNIT], timeout=10)
-    return out.strip() in ("active", "activating")
-
-
-def _front_state():
-    _, out, _ = run(["systemctl", "show", "-p", "ActiveState", "-p", "SubState", "-p", "NRestarts",
-                     "-p", "MainPID", "-p", "InvocationID", FRONT_UNIT], timeout=10)
-    return dict(ln.split("=", 1) for ln in out.splitlines() if "=" in ln)
-
-
-def _front_alive():
-    st = _front_state()
-    return (st.get("ActiveState") == "active" and st.get("SubState") == "running"
-            and st.get("NRestarts", "0") == "0" and st.get("MainPID", "0") not in ("", "0"))
-
-
-def _front_pid():
-    try:
-        return int(_front_state().get("MainPID") or 0)
-    except ValueError:
-        return 0
-
-
-def _front_reloads():
-    inv = _front_state().get("InvocationID", "")
-    if not inv:
-        return []
-    rc, out, _ = run(["journalctl", "-u", FRONT_UNIT, "--no-pager", "-o", "cat",
-                      "_SYSTEMD_INVOCATION_ID=" + inv], timeout=10)
-    return [ln for ln in out.splitlines() if "front: " in ln and "reload" in ln] if rc == 0 else []
+def _front_stop():
+    run(["systemctl", "stop", FRONT_UNIT])
+    run(["systemctl", "reset-failed", FRONT_UNIT])
 
 
 def _front_read():
@@ -2804,23 +2787,28 @@ def _front_read():
 
 def _front_settled():
     time.sleep(FRONT_SETTLE)
-    if _front_alive():
+    if _unit_alive(FRONT_UNIT):
         return ""
     why = _unit_last_error(FRONT_UNIT) or "front did not stay up"
-    run(["systemctl", "stop", FRONT_UNIT])
-    run(["systemctl", "reset-failed", FRONT_UNIT])
+    _front_stop()
     return why
 
 
+def _front_reloads(q):
+    rc, out, _ = run(q, timeout=10)
+    return [ln for ln in out.splitlines() if "front: " in ln and "reload" in ln] if rc == 0 else []
+
+
 def _front_reload():
-    before = len(_front_reloads())
-    try:
-        os.kill(_front_pid(), signal.SIGHUP)
-    except OSError as e:
-        return "front reload: %s" % e
+    inv = _unit_show(FRONT_UNIT, "InvocationID").get("InvocationID", "")
+    q = ["journalctl", "-u", FRONT_UNIT, "--no-pager", "-o", "cat", "_SYSTEMD_INVOCATION_ID=" + inv]
+    before = len(_front_reloads(q))
+    rc, _, err = run(["systemctl", "kill", "--kill-who=main", "-s", "HUP", FRONT_UNIT], timeout=10)
+    if rc != 0:
+        return "front reload: " + (err.strip() or "the front is not running")[:200]
     end = time.monotonic() + FRONT_RELOAD_WAIT
     while time.monotonic() < end:
-        got = _front_reloads()
+        got = _front_reloads(q)
         if len(got) > before:
             last = got[-1]
             return "" if "routes reloaded" in last else last[last.find("front: "):][:300]
@@ -2829,25 +2817,21 @@ def _front_reload():
 
 
 def _front_launch():
-    run(["systemctl", "stop", FRONT_UNIT])
-    run(["systemctl", "reset-failed", FRONT_UNIT])
+    _front_stop()
     must(["systemd-run", "--unit", FRONT_UNIT, "--collect"]
          + [a for p in FRONT_UNIT_PROPS for a in ("-p", p)]
          + [CORE_BIN, "--config", FRONT_CFG])
 
 
 def _front_resume():
-    if os.path.isfile(FRONT_CFG) and not _front_running():
+    if os.path.isfile(FRONT_CFG) and not _unit_running(FRONT_UNIT):
         _front_launch()
 
 
 def _front_build(d):
-    listen = str(d.get("listen") or "").strip()
-    host, sep, port = listen.rpartition(":")
-    if not sep or not port.isdigit() or not 1 <= int(port) <= 65535:
-        raise ValueError("front: listen must be \"ip:port\"")
-    if host != "0.0.0.0" and host not in local_ips_flat():
-        raise ValueError("front: %s is not a local IP on this node" % host)
+    port = str(d.get("port") or "").strip()
+    if not port.isdigit() or not 1 <= int(port) <= 65535:
+        raise ValueError("front: port must be 1..65535")
     ek = str(d.get("srv_ech_key") or "").strip()
     ec = str(d.get("srv_ech_conf") or "").strip()
     if not ek or not ec:
@@ -2879,14 +2863,13 @@ def _front_build(d):
         if "BEGIN CERTIFICATE" not in cert or "BEGIN" not in key or len(cert) > 16384 or len(key) > 16384:
             raise ValueError("front: route %s needs a valid cert and key" % inner)
         routes.append({"inner": inner, "backend": backend, "cert": cert, "key": key})
-    return {"role": "front", "listen": listen, "routes": routes,
+    return {"role": "front", "listen": "0.0.0.0:%d" % int(port), "routes": routes,
             "srv_ech_key": ek, "srv_ech_conf": ec}
 
 
 def op_front(d):
     if _as_bool(d.get("stop")):
-        run(["systemctl", "stop", FRONT_UNIT])
-        run(["systemctl", "reset-failed", FRONT_UNIT])
+        _front_stop()
         try:
             os.remove(FRONT_CFG)
         except FileNotFoundError:
@@ -2898,7 +2881,7 @@ def op_front(d):
     os.makedirs(FRONT_DIR, exist_ok=True)
     _write_json_durable(FRONT_CFG, obj)
     warm = bool(prev) and all(prev.get(k) == obj.get(k) for k in ("listen", "srv_ech_key", "srv_ech_conf"))
-    if warm and _front_alive():
+    if warm and _unit_alive(FRONT_UNIT):
         why = _front_reload()
         if why:
             _write_json_durable(FRONT_CFG, prev)
@@ -2946,8 +2929,7 @@ def op_wipe(d):
             os.remove(os.path.join(CONFIG_DIR, c["name"] + ".json"))
         except Exception:
             pass
-    run(["systemctl", "stop", FRONT_UNIT])
-    run(["systemctl", "reset-failed", FRONT_UNIT])
+    _front_stop()
     try:
         revert_kernel_tuning()
     except Exception as e:
@@ -3711,8 +3693,11 @@ def op_core_apply(d):
         except Exception as e:
             failed.append({"name": c.get("name"), "msg": str(e)[:120]})
     if os.path.isfile(FRONT_CFG):
-        _front_launch()
-        why = _front_settled()
+        try:
+            _front_launch()
+            why = _front_settled()
+        except Exception as e:
+            why = str(e)
         if why:
             failed.append({"name": FRONT_UNIT, "msg": why[:120]})
     logline("core %s applied (sha %s); relaunched %d tunnel(s)" % (label, want[:12], restarted))
