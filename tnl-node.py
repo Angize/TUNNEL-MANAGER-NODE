@@ -37,6 +37,9 @@ _tls_pin = ""
 
 CORE_BIN = os.path.join(CONFIG_DIR, "tnl-core")
 CORE_DIR = os.path.join(CONFIG_DIR, "core")
+FRONT_DIR = os.path.join(CONFIG_DIR, "front")
+FRONT_CFG = os.path.join(FRONT_DIR, "front.json")
+FRONT_UNIT = "tnl-front"
 XTABLES_LOCK = "/run/xtables.lock"
 _core_lock = threading.Lock()
 _core_sha_cache = {"mtime": None, "sha": ""}
@@ -906,7 +909,10 @@ def _core_unit(name):
 
 
 def _core_last_error(name, lines=40):
-    unit = _core_unit(name)
+    return _unit_last_error(_core_unit(name), lines)
+
+
+def _unit_last_error(unit, lines=40):
     args = ["journalctl", "-u", unit, "-n", str(int(lines)), "--no-pager", "-o", "cat"]
     _, inv, _ = run(["systemctl", "show", "-p", "InvocationID", "--value", unit], timeout=10)
     inv = inv.strip()
@@ -952,14 +958,25 @@ def _netdev_missing_reason(name, ttype):
 
 
 def _core_running(name):
-    _, out, _ = run(["systemctl", "is-active", _core_unit(name)], timeout=10)
+    return _unit_running(_core_unit(name))
+
+
+def _unit_running(unit):
+    _, out, _ = run(["systemctl", "is-active", unit], timeout=10)
     return out.strip() in ("active", "activating")
 
 
 def _core_alive(name):
-    _, out, _ = run(["systemctl", "show", "-p", "ActiveState", "-p", "SubState", "-p", "NRestarts",
-                     _core_unit(name)], timeout=10)
-    st = dict(ln.split("=", 1) for ln in out.splitlines() if "=" in ln)
+    return _unit_alive(_core_unit(name))
+
+
+def _unit_show(unit, *props):
+    _, out, _ = run(["systemctl", "show", unit] + [a for p in props for a in ("-p", p)], timeout=10)
+    return dict(ln.split("=", 1) for ln in out.splitlines() if "=" in ln)
+
+
+def _unit_alive(unit):
+    st = _unit_show(unit, "ActiveState", "SubState", "NRestarts")
     return (st.get("ActiveState") in ("active", "activating") and st.get("SubState") != "auto-restart"
             and st.get("NRestarts", "0") == "0")
 
@@ -2180,6 +2197,7 @@ def op_ping(d):
             "tunnels": len([c for c in cfgs if c.get("type") != "portfw"]),
             "portfw": len([c for c in cfgs if c.get("type") == "portfw"]),
             "core_ver": _core_ref(), "core_sha": _installed_core_sha()[:12], "arch": _core_arch(),
+            **({"front": _front_up()} if os.path.isfile(FRONT_CFG) else {}),
             "stats": stats}
 
 
@@ -2737,6 +2755,160 @@ def op_link_enable(d):
     return {"ok": True, "enabled": enabled}
 
 
+FRONT_UNIT_PROPS = (
+    "Restart=always", "RestartSec=3", "NoNewPrivileges=yes",
+    "CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE",
+    "ProtectSystem=strict", "ProtectHome=yes", "PrivateTmp=yes", "PrivateDevices=yes",
+    "ProtectKernelTunables=yes", "ProtectControlGroups=yes",
+    "RestrictAddressFamilies=AF_INET AF_INET6",
+    "LockPersonality=yes", "MemoryDenyWriteExecute=yes", "RestrictRealtime=yes",
+    "RestrictSUIDSGID=yes", "SystemCallArchitectures=native",
+    "TemporaryFileSystem=%s:ro" % CONFIG_DIR, "BindReadOnlyPaths=" + CORE_BIN,
+    "BindReadOnlyPaths=" + FRONT_DIR, "InaccessiblePaths=-/dev/shm -/dev/mqueue",
+)
+FRONT_SETTLE = 1.5
+FRONT_RELOAD_WAIT = 3.0
+
+
+def _front_stop():
+    run(["systemctl", "stop", FRONT_UNIT])
+    run(["systemctl", "reset-failed", FRONT_UNIT])
+
+
+def _front_up():
+    return _unit_show(FRONT_UNIT, "SubState").get("SubState") == "running"
+
+
+def _front_read():
+    try:
+        with open(FRONT_CFG) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def _front_settled():
+    time.sleep(FRONT_SETTLE)
+    if _unit_alive(FRONT_UNIT):
+        return ""
+    why = _unit_last_error(FRONT_UNIT) or "front did not stay up"
+    _front_stop()
+    return why
+
+
+def _front_start():
+    try:
+        _front_launch()
+    except Exception as e:
+        return str(e)
+    return _front_settled()
+
+
+def _front_reload():
+    inv = _unit_show(FRONT_UNIT, "InvocationID").get("InvocationID", "")
+    q = ["journalctl", "-u", FRONT_UNIT, "--no-pager", "-o", "cat", "--show-cursor", "_SYSTEMD_INVOCATION_ID=" + inv]
+    cursor = run(q + ["-n", "1"], timeout=10)[1].rpartition("-- cursor: ")[2].strip()
+    rc, _, err = run(["systemctl", "kill", "--kill-who=main", "-s", "HUP", FRONT_UNIT], timeout=10)
+    if rc != 0:
+        return "front reload: " + (err.strip() or "the front is not running")[:200]
+    end = time.monotonic() + FRONT_RELOAD_WAIT
+    while time.monotonic() < end:
+        for ln in run(q + ["--after-cursor=" + cursor], timeout=10)[1].splitlines():
+            if ln.startswith("-- cursor: "):
+                cursor = ln[len("-- cursor: "):].strip()
+            elif "tnl-core: front: routes reloaded" in ln:
+                return ""
+            elif "tnl-core: front: reload rejected" in ln:
+                return ln[ln.find("front: "):][:300]
+        time.sleep(0.1)
+    return None
+
+
+def _front_launch():
+    _front_stop()
+    must(["systemd-run", "--unit", FRONT_UNIT, "--collect"]
+         + [a for p in FRONT_UNIT_PROPS for a in ("-p", p)]
+         + [CORE_BIN, "--config", FRONT_CFG])
+
+
+def _front_resume():
+    if os.path.isfile(FRONT_CFG) and not _unit_running(FRONT_UNIT):
+        _front_launch()
+
+
+def _front_build(d):
+    port = str(d.get("port") or "").strip()
+    if not port.isdigit() or not 1 <= int(port) <= 65535:
+        raise ValueError("front: port must be 1..65535")
+    ek = str(d.get("srv_ech_key") or "").strip()
+    ec = str(d.get("srv_ech_conf") or "").strip()
+    if not ek or not ec:
+        raise ValueError("front: srv_ech_key and srv_ech_conf are required (without ECH every inner name "
+                         "travels in the clear)")
+    if (not re.match(r"^[0-9a-fA-F]+$", ek) or len(ek) > 256
+            or not re.match(r"^[A-Za-z0-9+/=]+$", ec) or len(ec) > 8192):
+        raise ValueError("front: bad srv_ech")
+    routes_in = d.get("routes")
+    if not isinstance(routes_in, list) or not routes_in:
+        raise ValueError("front: at least one route is required")
+    seen = set()
+    routes = []
+    for r in routes_in:
+        if not isinstance(r, dict):
+            raise ValueError("front: each route must be an object")
+        inner = str(r.get("inner") or "").strip()
+        if len(inner) > 253 or not re.match(r"^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*$", inner):
+            raise ValueError("front: bad inner name")
+        if inner in seen:
+            raise ValueError("front: duplicate inner name %s" % inner)
+        seen.add(inner)
+        backend = str(r.get("backend") or "").strip()
+        bh, bsep, bp = backend.rpartition(":")
+        if not bsep or not is_ipv4(bh) or not bp.isdigit() or not 1 <= int(bp) <= 65535:
+            raise ValueError("front: route %s backend must be \"ipv4:port\"" % inner)
+        cert = str(r.get("cert") or "")
+        key = str(r.get("key") or "")
+        if "BEGIN CERTIFICATE" not in cert or "BEGIN" not in key or len(cert) > 16384 or len(key) > 16384:
+            raise ValueError("front: route %s needs a valid cert and key" % inner)
+        routes.append({"inner": inner, "backend": backend, "cert": cert, "key": key})
+    return {"role": "front", "listen": "0.0.0.0:%d" % int(port), "routes": routes,
+            "srv_ech_key": ek, "srv_ech_conf": ec}
+
+
+def op_front(d):
+    if _as_bool(d.get("stop")):
+        _front_stop()
+        try:
+            os.remove(FRONT_CFG)
+        except FileNotFoundError:
+            pass
+        return {"ok": True, "stopped": True}
+    obj = _front_build(d)
+    _ensure_core()
+    prev = _front_read()
+    os.makedirs(FRONT_DIR, exist_ok=True)
+    _write_json_durable(FRONT_CFG, obj)
+    warm = bool(prev) and all(prev.get(k) == obj.get(k) for k in ("listen", "srv_ech_key", "srv_ech_conf"))
+    if warm and _front_up():
+        why = _front_reload()
+        if why == "":
+            return {"ok": True, "routes": len(obj["routes"]), "reloaded": True}
+        if why:
+            _write_json_durable(FRONT_CFG, prev)
+            return {"ok": False, "msg": why}
+    why = _front_start()
+    if why:
+        if prev:
+            _write_json_durable(FRONT_CFG, prev)
+            back = _front_start()
+            if back:
+                why = "%s; the previous front did not come back either: %s" % (why, back)
+        else:
+            os.remove(FRONT_CFG)
+        return {"ok": False, "msg": why}
+    return {"ok": True, "routes": len(obj["routes"]), "reloaded": False}
+
+
 def op_core_restart(d):
     name = _req_name(d)
     cfg = read_config(name)
@@ -2764,6 +2936,7 @@ def op_wipe(d):
             os.remove(os.path.join(CONFIG_DIR, c["name"] + ".json"))
         except Exception:
             pass
+    _front_stop()
     try:
         revert_kernel_tuning()
     except Exception as e:
@@ -3526,6 +3699,10 @@ def op_core_apply(d):
                                       or "core did not come up"})
         except Exception as e:
             failed.append({"name": c.get("name"), "msg": str(e)[:120]})
+    if os.path.isfile(FRONT_CFG):
+        why = _front_start()
+        if why:
+            failed.append({"name": FRONT_UNIT, "msg": why[:120]})
     logline("core %s applied (sha %s); relaunched %d tunnel(s)" % (label, want[:12], restarted))
     return {"ok": True, "code": "applied", "version": label, "core_sha": want[:12],
             "restarted": restarted, "failed": failed}
@@ -3658,7 +3835,8 @@ OPS = {"ping": op_ping, "list": op_list, "check": op_check, "tunnel": op_tunnel,
        "core-put": op_core_put, "core-apply": op_core_apply,
        "set-update-key": op_set_update_key,
        "kernel-tune": op_kernel_tune,
-       "link-enable": op_link_enable, "core-restart": op_core_restart}
+       "link-enable": op_link_enable, "core-restart": op_core_restart,
+       "front": op_front}
 READ_ONLY = {"ping", "list", "check", "portcheck", "edge-status", "peer-status"}
 UNLOCKED = {"speedtest"}
 
@@ -3668,7 +3846,7 @@ WIRE = {
     "pc": "portcheck", "sd": "speedtest", "es": "edge-status", "ps": "peer-status", "pl": "peer-select",
     "qs": "pool-select", "rt": "retest-now", "eu": "ech-update",
     "cp": "core-put", "ca": "core-apply", "sk": "set-update-key", "kt": "kernel-tune", "le": "link-enable",
-    "cr": "core-restart",
+    "cr": "core-restart", "fr": "front",
 }
 
 
@@ -4258,6 +4436,10 @@ def serve():
         apply_all()
     except Exception as e:
         logline(f"startup apply_all: {e}")
+    try:
+        _front_resume()
+    except Exception as e:
+        logline(f"startup front: {e}")
     threading.Thread(target=rotation_loop, daemon=True).start()
     threading.Thread(target=health_loop, daemon=True).start()
     _seed_central_cb()
