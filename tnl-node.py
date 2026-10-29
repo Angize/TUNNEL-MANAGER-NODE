@@ -599,6 +599,8 @@ def _core_port(cfg):
 
 RAW_HEADER_LEN = {"bare": 0, "ipip": 28, "etherip": 2, "ipcomp": 4, "gre": 32, "icmp": 8, "udp": 8,
                   "esp": 8, "l2tpv3": 8, "tcp": 32, "ah": 24, "sctp": 12}
+RAW_PROTO_NUM = {"bare": 253, "ipip": 4, "etherip": 97, "ipcomp": 108, "gre": 47, "icmp": 1, "udp": 17,
+                 "esp": 50, "l2tpv3": 115, "tcp": 6, "ah": 51, "sctp": 132}
 PORTED_RAW_PROFILES = ("udp", "tcp", "sctp")
 MAX_WORKERS = 8
 MAX_SPROT_EVERY = 60
@@ -683,10 +685,12 @@ def _core_config(cfg):
     cipher = str(cfg.get("cipher") or "auto")
     crypto_on = bool(cfg.get("psk")) and cipher != "none"
     transport = str(cfg.get("transport") or "udp").lower()
-    raw_profile = str(cfg.get("raw_profile") or "bare").lower()
+    raw_profile, raw_down = _raw_pair(cfg)
+    up_ported = raw_profile in PORTED_RAW_PROFILES
+    raw_ported = up_ported or raw_down in PORTED_RAW_PROFILES
     obfs = bool(cfg.get("obfs")) and crypto_on
     if transport == "raw":
-        outer = 20 + RAW_HEADER_LEN.get(raw_profile, 0)
+        outer = 20 + max(RAW_HEADER_LEN.get(raw_profile, 0), RAW_HEADER_LEN.get(raw_down, 0))
     elif transport == "ws":
         outer = 40 + 14
     else:
@@ -730,37 +734,36 @@ def _core_config(cfg):
             corecfg["peer_src_ips"] = _psrc
     if transport == "raw":
         corecfg["raw_profile"] = raw_profile
-        try:
-            _rp = int(cfg.get("raw_proto") or 0)
-        except (TypeError, ValueError):
-            _rp = 0
-        if raw_profile == "bare" and 1 <= _rp <= 255:
+        if raw_down != raw_profile:
+            corecfg["raw_profile_down"] = raw_down
+        _rp = _raw_proto(cfg)
+        if "bare" in (raw_profile, raw_down) and _rp:
             corecfg["raw_proto"] = _rp
         try:
             _rport = int(cfg.get("raw_port") or 0)
         except (TypeError, ValueError):
             _rport = 0
-        if raw_profile in PORTED_RAW_PROFILES and 1 <= _rport <= 65535:
+        if raw_ported and 1 <= _rport <= 65535:
             corecfg["raw_port"] = _rport
         try:
             _rsport = int(cfg.get("raw_sport") or 0)
         except (TypeError, ValueError):
             _rsport = 0
-        if raw_profile in PORTED_RAW_PROFILES and _as_bool(cfg.get("raw_sport_random")):
+        if up_ported and _as_bool(cfg.get("raw_sport_random")):
             corecfg["raw_sport_random"] = True
-        elif raw_profile in PORTED_RAW_PROFILES and 1 <= _rsport <= 65535:
+        elif raw_ported and 1 <= _rsport <= 65535:
             corecfg["raw_sport"] = _rsport
         try:
             _rrot = int(cfg.get("raw_sport_rotate") or 0)
         except (TypeError, ValueError):
             _rrot = 0
-        if raw_profile in PORTED_RAW_PROFILES and 1 <= _rrot <= MAX_SPROT_EVERY:
+        if raw_ported and 1 <= _rrot <= MAX_SPROT_EVERY:
             corecfg["raw_sport_rotate"] = _rrot
             try:
                 _rdp = int(cfg.get("raw_dports") or 0)
             except (TypeError, ValueError):
                 _rdp = 0
-            if 1 <= _rdp <= MAX_DPORTS:
+            if up_ported and 1 <= _rdp <= MAX_DPORTS:
                 corecfg["raw_dports"] = _rdp
     try:
         _blo = int(cfg.get("sport_lo") or 0)
@@ -1070,7 +1073,8 @@ def _core_relaunch(cfg):
     run(["systemctl", "reset-failed", unit])
     _sweep_owned_rules(name)
     if _as_bool(cfg.get("conntrack_bypass")):
-        _ct_bypass_build(cfg)
+        _install_rules(cfg, _ct_bypass_rules(cfg), "conntrack bypass installed")
+    _install_rules(cfg, _split_rx_rules(cfg), "split raw profile, inbound protocol admitted")
     for p in _core_status_paths(name):
         try:
             os.remove(p)
@@ -1232,33 +1236,60 @@ def _ct_bypass_peers(cfg):
     return out
 
 
-def _ct_bypass_rules(cfg):
+def _raw_pair(cfg):
+    up = str(cfg.get("raw_profile") or "bare").strip().lower()
+    return up, str(cfg.get("raw_profile_down") or up).strip().lower()
+
+
+def _raw_proto(cfg):
+    try:
+        rp = int(cfg.get("raw_proto") or 0)
+    except (TypeError, ValueError):
+        return 0
+    return rp if 1 <= rp <= 255 else 0
+
+
+def _raw_rule_tag(cfg):
     name = cfg.get("name", "")
-    if not NAME_RE.match(name or ""):
+    if (not NAME_RE.match(name or "") or cfg.get("type") != "core"
+            or str(cfg.get("transport") or "").lower() != "raw"):
+        return None
+    return ["-m", "comment", "--comment", RULE_OWNER_PREFIX + name]
+
+
+def _ct_bypass_rules(cfg):
+    tag = _raw_rule_tag(cfg)
+    if tag is None:
         return []
-    if cfg.get("type") != "core" or str(cfg.get("transport") or "").lower() != "raw":
-        return []
-    prof = str(cfg.get("raw_profile") or "bare").lower()
-    if prof not in PORTED_RAW_PROFILES:
-        return []
-    tag = ["-m", "comment", "--comment", RULE_OWNER_PREFIX + name]
+    profs = [p for p in dict.fromkeys(_raw_pair(cfg)) if p in PORTED_RAW_PROFILES]
     out = []
     for ip in _ct_bypass_peers(cfg):
-        out.append(("filter", "INPUT", ["-s", ip, "-p", prof] + tag + ["-j", "ACCEPT"]))
-        out.append(("raw", "OUTPUT", ["-d", ip, "-p", prof] + tag + ["-j", "NOTRACK"]))
-        out.append(("raw", "PREROUTING", ["-s", ip, "-p", prof] + tag + ["-j", "NOTRACK"]))
+        for prof in profs:
+            out.append(("filter", "INPUT", ["-s", ip, "-p", prof] + tag + ["-j", "ACCEPT"]))
+            out.append(("raw", "OUTPUT", ["-d", ip, "-p", prof] + tag + ["-j", "NOTRACK"]))
+            out.append(("raw", "PREROUTING", ["-s", ip, "-p", prof] + tag + ["-j", "NOTRACK"]))
     return out
 
 
-def _ct_bypass_build(cfg):
-    rules = _ct_bypass_rules(cfg)
+def _split_rx_rules(cfg):
+    tag = _raw_rule_tag(cfg)
+    up, down = _raw_pair(cfg)
+    if tag is None or down == up:
+        return []
+    rx = down if str(cfg.get("role")) == "client" else up
+    num = (rx == "bare" and _raw_proto(cfg)) or RAW_PROTO_NUM.get(rx, 0)
+    if not num:
+        return []
+    return [("filter", "INPUT", ["-s", ip, "-p", str(num)] + tag + ["-j", "ACCEPT"]) for ip in _ct_bypass_peers(cfg)]
+
+
+def _install_rules(cfg, rules, what):
     for table, chain, rule in rules:
         _ipt_ins_missing(table, chain, rule)
     if rules:
-        logline("%s: conntrack bypass installed for %s (%d rule(s), owner %s%s)"
-                % (cfg.get("name"), ", ".join(_ct_bypass_peers(cfg)), len(rules),
+        logline("%s: %s for %s (%d rule(s), owner %s%s)"
+                % (cfg.get("name"), what, ", ".join(_ct_bypass_peers(cfg)), len(rules),
                    RULE_OWNER_PREFIX, cfg.get("name")))
-    return len(rules)
 
 
 IPT_WAIT = "5"
@@ -2435,17 +2466,22 @@ def op_tunnel(d):
                         obj["srv_ech_key"] = ek
                         obj["srv_ech_conf"] = ec
         if transport == "raw":
-            profile = str(d.get("raw_profile") or "bare").strip().lower()
+            profile, down = _raw_pair(d)
             if profile not in RAW_HEADER_LEN:
                 raise ValueError("bad raw_profile")
             obj["raw_profile"] = profile
-            if profile == "bare":
+            if down not in RAW_HEADER_LEN:
+                raise ValueError("bad raw_profile_down")
+            if down != profile:
+                obj["raw_profile_down"] = down
+            ported = profile in PORTED_RAW_PROFILES or down in PORTED_RAW_PROFILES
+            if "bare" in (profile, down):
                 rproto = int(d.get("raw_proto") or 0)
                 if rproto and not (1 <= rproto <= 255):
                     raise ValueError("bad raw_proto")
                 if rproto:
                     obj["raw_proto"] = rproto
-            if profile in PORTED_RAW_PROFILES:
+            if ported:
                 rport = int(d.get("raw_port") or 0)
                 if rport and not (1 <= rport <= 65535):
                     raise ValueError("bad raw_port")
@@ -2457,11 +2493,14 @@ def op_tunnel(d):
                 if rsport and _as_bool(d.get("raw_sport_random")):
                     raise ValueError("raw_sport and raw_sport_random are exclusive")
                 if _as_bool(d.get("raw_sport_random")):
+                    if profile not in PORTED_RAW_PROFILES:
+                        raise ValueError("raw_sport_random re-draws the client's source port, so raw_profile "
+                                         "must forge one (%s)" % ", ".join(PORTED_RAW_PROFILES))
                     obj["raw_sport_random"] = True
                 elif rsport:
                     obj["raw_sport"] = rsport
             rrot = int(d.get("raw_sport_rotate") or 0)
-            if rrot and profile not in PORTED_RAW_PROFILES:
+            if rrot and not ported:
                 raise ValueError("raw_sport_rotate cycles a forged source port, so it needs a profile "
                                  "that builds one (%s)" % ", ".join(PORTED_RAW_PROFILES))
             if rrot and not (1 <= rrot <= MAX_SPROT_EVERY):
@@ -2471,7 +2510,7 @@ def op_tunnel(d):
             if rrot:
                 obj["raw_sport_rotate"] = rrot
             if _as_bool(d.get("conntrack_bypass")):
-                if profile not in PORTED_RAW_PROFILES:
+                if not ported:
                     raise ValueError("conntrack bypass only means something for a profile that forges "
                                      "ports (%s); others mint one flow, not one per packet"
                                      % ", ".join(PORTED_RAW_PROFILES))
@@ -2479,6 +2518,9 @@ def op_tunnel(d):
             rdp = int(d.get("raw_dports") or 0)
             if rdp and not rrot:
                 raise ValueError("raw_dports needs raw_sport_rotate")
+            if rdp and profile not in PORTED_RAW_PROFILES:
+                raise ValueError("raw_dports spreads the client's destination port, so raw_profile "
+                                 "must forge one (%s)" % ", ".join(PORTED_RAW_PROFILES))
             if rdp and not (1 <= rdp <= MAX_DPORTS):
                 raise ValueError("bad raw_dports")
             if rdp:
