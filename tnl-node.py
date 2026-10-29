@@ -600,6 +600,9 @@ def _core_port(cfg):
 RAW_HEADER_LEN = {"bare": 0, "ipip": 28, "etherip": 2, "ipcomp": 4, "gre": 32, "icmp": 8, "udp": 8,
                   "esp": 8, "l2tpv3": 8, "tcp": 32, "ah": 24, "sctp": 12}
 PORTED_RAW_PROFILES = ("udp", "tcp", "sctp")
+FLOW_ID_RAW_PROFILES = ("icmp", "gre")
+ROTATABLE_RAW_PROFILES = PORTED_RAW_PROFILES + FLOW_ID_RAW_PROFILES
+GRE_KEYED_HEADER_LEN = 44
 MAX_WORKERS = 8
 MAX_SPROT_EVERY = 60
 MAX_DPORTS = 16
@@ -609,6 +612,16 @@ MAX_PORT_TRIES = 60
 MAX_FEC_DATA = 64
 QUEUEING_TRANSPORTS = ("raw", "udp")
 BUF_KNOBS = (("sock_buf", QUEUEING_TRANSPORTS), ("tcp_buf", ("tcp", "ws")))
+
+
+def _flow_id_every(cfg):
+    if str(cfg.get("raw_profile") or "bare").lower() not in FLOW_ID_RAW_PROFILES:
+        return 0
+    try:
+        every = int(cfg.get("raw_id_rotate") or 0)
+    except (TypeError, ValueError):
+        return 0
+    return every if 1 <= every <= MAX_SPROT_EVERY else 0
 
 
 def band_ok(lo, hi):
@@ -685,8 +698,9 @@ def _core_config(cfg):
     transport = str(cfg.get("transport") or "udp").lower()
     raw_profile = str(cfg.get("raw_profile") or "bare").lower()
     obfs = bool(cfg.get("obfs")) and crypto_on
+    irot = _flow_id_every(cfg) if transport == "raw" else 0
     if transport == "raw":
-        outer = 20 + RAW_HEADER_LEN.get(raw_profile, 0)
+        outer = 20 + (GRE_KEYED_HEADER_LEN if raw_profile == "gre" and irot else RAW_HEADER_LEN.get(raw_profile, 0))
     elif transport == "ws":
         outer = 40 + 14
     else:
@@ -762,6 +776,8 @@ def _core_config(cfg):
                 _rdp = 0
             if 1 <= _rdp <= MAX_DPORTS:
                 corecfg["raw_dports"] = _rdp
+        if irot:
+            corecfg["raw_id_rotate"] = irot
     try:
         _blo = int(cfg.get("sport_lo") or 0)
         _bhi = int(cfg.get("sport_hi") or 0)
@@ -1239,7 +1255,7 @@ def _ct_bypass_rules(cfg):
     if cfg.get("type") != "core" or str(cfg.get("transport") or "").lower() != "raw":
         return []
     prof = str(cfg.get("raw_profile") or "bare").lower()
-    if prof not in PORTED_RAW_PROFILES:
+    if prof not in ROTATABLE_RAW_PROFILES:
         return []
     tag = ["-m", "comment", "--comment", RULE_OWNER_PREFIX + name]
     out = []
@@ -2220,7 +2236,7 @@ def op_list(d):
             pools[nm] = {"dst": dst, "src": src}
         if st["path"]["sport"]:
             sports[nm] = st["path"]["sport"]
-        if st["rot"]["sport"]:
+        if st["rot"]["sport"] or st["rot"]["id"]:
             rots[nm] = st["rot"]
     return {"configs": cfgs, "health": {c["name"]: hc.get(c["name"], {"up": None}) for c in cfgs},
             "pools": pools, "sports": sports, "rots": rots, "ct": _ct_pressure()}
@@ -2470,11 +2486,19 @@ def op_tunnel(d):
                 raise ValueError("raw_sport_rotate excludes raw_sport and raw_sport_random")
             if rrot:
                 obj["raw_sport_rotate"] = rrot
+            irot = int(d.get("raw_id_rotate") or 0)
+            if irot and profile not in FLOW_ID_RAW_PROFILES:
+                raise ValueError("raw_id_rotate cycles the flow identity inside the carrier header, so it "
+                                 "needs a profile that carries one (%s)" % ", ".join(FLOW_ID_RAW_PROFILES))
+            if irot and not (1 <= irot <= MAX_SPROT_EVERY):
+                raise ValueError("bad raw_id_rotate")
+            if irot:
+                obj["raw_id_rotate"] = irot
             if _as_bool(d.get("conntrack_bypass")):
-                if profile not in PORTED_RAW_PROFILES:
-                    raise ValueError("conntrack bypass only means something for a profile that forges "
-                                     "ports (%s); others mint one flow, not one per packet"
-                                     % ", ".join(PORTED_RAW_PROFILES))
+                if profile not in ROTATABLE_RAW_PROFILES:
+                    raise ValueError("conntrack bypass only means something for a profile that opens a flow "
+                                     "every few packets (%s); others mint one flow and keep it"
+                                     % ", ".join(ROTATABLE_RAW_PROFILES))
                 obj["conntrack_bypass"] = True
             rdp = int(d.get("raw_dports") or 0)
             if rdp and not rrot:
@@ -3323,7 +3347,7 @@ def _port_or_zero(v):
 def _read_status(name):
     empty = {"active": "", "epoch": 0, "ready": False, "health": [], "events": [], "ts": 0,
              "pair": {"low": "", "high": "", "low_kind": "", "high_kind": ""},
-             "rot": {"sport": 0, "dport": 0, "dports": 0, "every": 0, "lo": 0, "hi": 0, "drawn": 0},
+             "rot": {"sport": 0, "dport": 0, "id": 0, "dports": 0, "every": 0, "lo": 0, "hi": 0, "drawn": 0},
              "path": {"src": "", "sport": 0, "dst": "", "dport": 0}}
     try:
         with open(_cfg_path(name, ".status")) as f:
@@ -3359,6 +3383,7 @@ def _read_status(name):
                      "high_kind": str(pair.get("high_kind") or "")},
             "rot": {"sport": _port_or_zero(rt.get("sport")),
                     "dport": _port_or_zero(rt.get("dport")),
+                    "id": _port_or_zero(rt.get("id")),
                     "dports": max(0, min(MAX_DPORTS, int(rt.get("dports") or 0))),
                     "every": max(0, min(MAX_SPROT_EVERY, int(rt.get("every") or 0))),
                     "lo": _port_or_zero(rt.get("lo")), "hi": _port_or_zero(rt.get("hi")),
