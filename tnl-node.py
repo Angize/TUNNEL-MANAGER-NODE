@@ -601,8 +601,8 @@ RAW_HEADER_LEN = {"bare": 0, "ipip": 28, "etherip": 2, "ipcomp": 4, "gre": 32, "
                   "esp": 8, "l2tpv3": 8, "tcp": 32, "ah": 24, "sctp": 12}
 PORTED_RAW_PROFILES = ("udp", "tcp", "sctp")
 FLOW_ID_RAW_PROFILES = ("icmp", "gre")
-CT_BYPASS_RAW_PROFILES = PORTED_RAW_PROFILES + FLOW_ID_RAW_PROFILES
-GRE_KEYED_HEADER_LEN = 36
+ROTATABLE_RAW_PROFILES = PORTED_RAW_PROFILES + FLOW_ID_RAW_PROFILES
+GRE_KEYED_HEADER_LEN = 44
 MAX_WORKERS = 8
 MAX_SPROT_EVERY = 60
 MAX_DPORTS = 16
@@ -778,8 +778,9 @@ def _core_config(cfg):
                 _rdp = 0
             if 1 <= _rdp <= MAX_DPORTS:
                 corecfg["raw_dports"] = _rdp
-        if _flow_id_every(cfg):
-            corecfg["raw_id_rotate"] = _flow_id_every(cfg)
+        _irot = _flow_id_every(cfg)
+        if _irot:
+            corecfg["raw_id_rotate"] = _irot
     try:
         _blo = int(cfg.get("sport_lo") or 0)
         _bhi = int(cfg.get("sport_hi") or 0)
@@ -1257,7 +1258,7 @@ def _ct_bypass_rules(cfg):
     if cfg.get("type") != "core" or str(cfg.get("transport") or "").lower() != "raw":
         return []
     prof = str(cfg.get("raw_profile") or "bare").lower()
-    if prof not in CT_BYPASS_RAW_PROFILES:
+    if prof not in ROTATABLE_RAW_PROFILES:
         return []
     tag = ["-m", "comment", "--comment", RULE_OWNER_PREFIX + name]
     out = []
@@ -2497,10 +2498,10 @@ def op_tunnel(d):
             if irot:
                 obj["raw_id_rotate"] = irot
             if _as_bool(d.get("conntrack_bypass")):
-                if profile not in CT_BYPASS_RAW_PROFILES:
+                if profile not in ROTATABLE_RAW_PROFILES:
                     raise ValueError("conntrack bypass only means something for a profile that can open a "
                                      "flow per packet (%s); others mint one flow and keep it"
-                                     % ", ".join(CT_BYPASS_RAW_PROFILES))
+                                     % ", ".join(ROTATABLE_RAW_PROFILES))
                 obj["conntrack_bypass"] = True
             rdp = int(d.get("raw_dports") or 0)
             if rdp and not rrot:
