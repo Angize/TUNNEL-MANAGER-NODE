@@ -698,11 +698,9 @@ def _core_config(cfg):
     transport = str(cfg.get("transport") or "udp").lower()
     raw_profile = str(cfg.get("raw_profile") or "bare").lower()
     obfs = bool(cfg.get("obfs")) and crypto_on
+    irot = _flow_id_every(cfg) if transport == "raw" else 0
     if transport == "raw":
-        _hdr = RAW_HEADER_LEN.get(raw_profile, 0)
-        if raw_profile == "gre" and _flow_id_every(cfg):
-            _hdr = GRE_KEYED_HEADER_LEN
-        outer = 20 + _hdr
+        outer = 20 + (GRE_KEYED_HEADER_LEN if raw_profile == "gre" and irot else RAW_HEADER_LEN.get(raw_profile, 0))
     elif transport == "ws":
         outer = 40 + 14
     else:
@@ -778,9 +776,8 @@ def _core_config(cfg):
                 _rdp = 0
             if 1 <= _rdp <= MAX_DPORTS:
                 corecfg["raw_dports"] = _rdp
-        _irot = _flow_id_every(cfg)
-        if _irot:
-            corecfg["raw_id_rotate"] = _irot
+        if irot:
+            corecfg["raw_id_rotate"] = irot
     try:
         _blo = int(cfg.get("sport_lo") or 0)
         _bhi = int(cfg.get("sport_hi") or 0)
@@ -2499,8 +2496,8 @@ def op_tunnel(d):
                 obj["raw_id_rotate"] = irot
             if _as_bool(d.get("conntrack_bypass")):
                 if profile not in ROTATABLE_RAW_PROFILES:
-                    raise ValueError("conntrack bypass only means something for a profile that can open a "
-                                     "flow per packet (%s); others mint one flow and keep it"
+                    raise ValueError("conntrack bypass only means something for a profile that opens a flow "
+                                     "every few packets (%s); others mint one flow and keep it"
                                      % ", ".join(ROTATABLE_RAW_PROFILES))
                 obj["conntrack_bypass"] = True
             rdp = int(d.get("raw_dports") or 0)
