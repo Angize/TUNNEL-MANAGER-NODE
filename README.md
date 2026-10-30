@@ -12,7 +12,7 @@ curl -fsSL https://github.com/Angize/TUNNEL-MANAGER-NODE/releases/latest/downloa
 sudo python3 /tmp/tnl-node.py --install 8099 <panel-key>
 ```
 
-نصب‌کننده خودش پیش‌نیازها را می‌گیرد (`iproute2`, `iptables`, `openssl`, `procps`, `kmod`,
+نصب‌کننده خودش پیش‌نیازها را می‌گیرد (`iproute2`, `iptables`, `nftables`, `openssl`, `procps`, `kmod`,
 `ca-certificates`)، کلیدِ امضای پنل را نگه می‌دارد، توکن می‌سازد، سرویسِ systemd را بالا
 می‌آورد، و در پایان `host / port / token` را چاپ می‌کند — همان‌ها را در همان پنجرهٔ «دستی» وارد کن.
 

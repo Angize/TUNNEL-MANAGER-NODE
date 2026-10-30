@@ -40,6 +40,7 @@ CORE_DIR = os.path.join(CONFIG_DIR, "core")
 FRONT_DIR = os.path.join(CONFIG_DIR, "front")
 FRONT_CFG = os.path.join(FRONT_DIR, "front.json")
 FRONT_UNIT = "tnl-front"
+RELAY_CFG = os.path.join(FRONT_DIR, "relay.json")
 XTABLES_LOCK = "/run/xtables.lock"
 _core_lock = threading.Lock()
 _core_sha_cache = {"mtime": None, "sha": ""}
@@ -2229,6 +2230,9 @@ def op_ping(d):
             "portfw": len([c for c in cfgs if c.get("type") == "portfw"]),
             "core_ver": _core_ref(), "core_sha": _installed_core_sha()[:12], "arch": _core_arch(),
             **({"front": _front_up()} if os.path.isfile(FRONT_CFG) else {}),
+            **({"relay": {"rules": len(_relay_state["rows"]), "reach": _relay_state["reach"]}}
+               if os.path.isfile(RELAY_CFG) else {}),
+            "nft": bool(shutil.which("nft")),
             "stats": stats}
 
 
@@ -2917,7 +2921,213 @@ def _front_build(d):
             "srv_ech_key": ek, "srv_ech_conf": ec, "tcp_buf": int(d.get("tcp_buf") or 0)}
 
 
+RELAY_TABLE = "tnl_edge"
+RELAY_MARK = 0x746e0000
+RELAY_MAX = 4096
+RELAY_PORTED = (6, 17, 132)
+RELAY_GAP = 15
+RELAY_PROBE_ID = 0x746e
+RELAY_PROBE_WAIT = 1.0
+RELAY_FORWARD = ["-m", "mark", "--mark", "%#x/0xffff0000" % RELAY_MARK,
+                 "-m", "comment", "--comment", RULE_OWNER_PREFIX + "edge-relay", "-j", "ACCEPT"]
+_relay_lock = threading.Lock()
+_relay_state = {"rows": [], "watch": [], "reach": {}}
+_nft_busy = threading.Lock()
+
+
+def _relay_ip(v):
+    return isinstance(v, str) and is_ipv4(v)
+
+
+def _relay_wire(v):
+    if (not isinstance(v, list) or len(v) != 2 or not all(type(x) is int for x in v)
+            or not 1 <= v[0] <= 255 or not 0 <= v[1] <= 65535 or (v[1] and v[0] not in RELAY_PORTED)):
+        raise ValueError("relay: bad wire")
+    return v
+
+
+def _relay_clean(rows):
+    if not isinstance(rows, list) or len(rows) > RELAY_MAX:
+        raise ValueError("relay: bad table")
+    out = []
+    for r in rows:
+        if not isinstance(r, dict):
+            raise ValueError("relay: each row must be an object")
+        edge = r.get("edge")
+        if (not _relay_ip(r.get("client")) or not _relay_ip(r.get("server")) or not isinstance(edge, list)
+                or not edge or not all(_relay_ip(ip) for ip in edge)):
+            raise ValueError("relay: bad address")
+        out.append({"client": r["client"], "server": r["server"], "edge": edge,
+                    "up": _relay_wire(r.get("up")), "down": _relay_wire(r.get("down"))})
+    return out
+
+
+def _relay_watch_clean(rows):
+    if not isinstance(rows, list) or len(rows) > RELAY_MAX:
+        raise ValueError("relay: bad watch list")
+    for r in rows:
+        if (not isinstance(r, list) or len(r) != 2 or not _relay_ip(r[0]) or type(r[1]) is not int
+                or not 1 <= r[1] <= 65535):
+            raise ValueError("relay: bad watch entry")
+    return rows
+
+
+def _relay_script(rows, keep):
+    marks = {ip: RELAY_MARK + i for i, ip in enumerate(sorted({ip for r in rows for ip in r["edge"]}), 1)}
+    chains, maps = {}, {"by_proto": {}, "by_dst": {}, "by_src": {}}
+
+    def step(peer, to, ip, wire, ports):
+        chain = chains.setdefault((to, ip), "c%d" % (len(chains) + 1))
+        key = "%s . %s . %d" % (peer, ip, wire[0])
+        if wire[1]:
+            maps[ports]["%s . %d" % (key, wire[1])] = chain
+        else:
+            maps["by_proto"][key] = chain
+
+    for r in rows:
+        for ip in r["edge"]:
+            step(r["client"], r["server"], ip, r["up"], "by_dst")
+            step(r["server"], r["client"], ip, r["down"], "by_src")
+
+    def vmap(name, key):
+        items = ", ".join("%s : goto %s" % kv for kv in maps[name].items())
+        return "map %s { type %s : verdict; %s}" % (name, key, "elements = { %s } " % items if items else "")
+
+    lead = "ipv4_addr . ipv4_addr . inet_proto"
+    out = ["table ip %s" % RELAY_TABLE, "delete table ip %s" % RELAY_TABLE, "table ip %s {" % RELAY_TABLE,
+           vmap("by_proto", lead), vmap("by_dst", lead + " . inet_service"), vmap("by_src", lead + " . inet_service")]
+    for (to, ip), name in chains.items():
+        out.append("chain %s { meta mark set %#x notrack ip daddr set %s; }" % (name, marks[ip], to))
+    whole = {key.rpartition(" ")[2] for key in maps["by_proto"]}
+    out.append("chain pre { type filter hook prerouting priority -300; policy accept;")
+    if "6" in whole:
+        out.append("tcp dport { %s } accept" % ", ".join(str(p) for p in sorted(set(keep))))
+    if "1" in whole:
+        out.append("icmp id %d accept" % RELAY_PROBE_ID)
+    if whole:
+        out.append("ip saddr . ip daddr . ip protocol vmap @by_proto")
+    if maps["by_dst"]:
+        out.append("ip saddr . ip daddr . ip protocol . th dport vmap @by_dst")
+    if maps["by_src"]:
+        out.append("ip saddr . ip daddr . ip protocol . th sport vmap @by_src")
+    out += ["}", "chain post { type filter hook postrouting priority 100; policy accept;",
+            "ip saddr set meta mark map { %s }" % ", ".join("%#x : %s" % (m, ip) for ip, m in marks.items()),
+            "}", "}"]
+    return "\n".join(out) + "\n"
+
+
+def _relay_load():
+    rows = _relay_state["rows"]
+    if not rows:
+        run(["nft", "delete", "table", "ip", RELAY_TABLE])
+        _ipt_del_all("filter", "FORWARD", RELAY_FORWARD)
+        return
+    if not shutil.which("nft"):
+        raise RuntimeError("nft is not installed on this node yet")
+    with open("/proc/sys/net/ipv4/ip_forward") as f:
+        if f.read().strip() != "1":
+            enable_ip_forward()
+    _ipt_ins_missing("filter", "FORWARD", RELAY_FORWARD)
+    must(["nft", "-f", "-"], stdin=_relay_script(rows, [22, int(load_conf().get("port", 8099))]))
+
+
+def _relay_set(rows, watch):
+    with _relay_lock:
+        _relay_state.update(rows=rows, watch=watch)
+        if rows or watch:
+            os.makedirs(FRONT_DIR, exist_ok=True)
+            _write_json_durable(RELAY_CFG, {"rows": rows, "watch": watch})
+        else:
+            try:
+                os.remove(RELAY_CFG)
+            except FileNotFoundError:
+                pass
+        _relay_load()
+
+
+def _relay_resume():
+    try:
+        with open(RELAY_CFG) as f:
+            st = json.load(f)
+    except (OSError, ValueError):
+        return
+    with _relay_lock:
+        _relay_state.update(rows=st.get("rows") or [], watch=st.get("watch") or [])
+        _relay_load()
+
+
+def _relay_alive():
+    return (run(["nft", "list", "table", "ip", RELAY_TABLE])[0] == 0
+            and _ipt_has("filter", "FORWARD", RELAY_FORWARD) is True)
+
+
+def _icmp_answers(ip):
+    seq = int(time.time()) & 0xffff
+    total = sum(struct.unpack("!8H", struct.pack("!BBHHHQ", 8, 0, 0, RELAY_PROBE_ID, seq, 0)))
+    total = (total >> 16) + (total & 0xffff)
+    total += total >> 16
+    msg = struct.pack("!BBHHHQ", 8, 0, ~total & 0xffff, RELAY_PROBE_ID, seq, 0)
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP) as s:
+            s.settimeout(RELAY_PROBE_WAIT)
+            s.sendto(msg, (ip, 0))
+            end = time.monotonic() + RELAY_PROBE_WAIT
+            while time.monotonic() < end:
+                data, peer = s.recvfrom(1500)
+                at = (data[0] & 15) * 4
+                if (peer[0] == ip and len(data) >= at + 8 and data[at] == 0
+                        and struct.unpack_from("!H", data, at + 4)[0] == RELAY_PROBE_ID):
+                    return True
+    except OSError:
+        pass
+    return False
+
+
+def _relay_reaches(ip, port):
+    return _icmp_answers(ip) or _pf_reachable(ip, str(port)) is True
+
+
+def relay_loop():
+    while True:
+        time.sleep(RELAY_GAP)
+        try:
+            with _relay_lock:
+                if _relay_state["rows"] and shutil.which("nft") and not _relay_alive():
+                    _relay_load()
+                    logline("edge relay table was missing, loaded it again")
+                watch = list(_relay_state["watch"])
+            _relay_state["reach"] = {ip: _relay_reaches(ip, port) for ip, port in watch}
+        except Exception as e:
+            logline(f"edge relay: {e}")
+
+
+def _nft_install():
+    if not _nft_busy.acquire(blocking=False):
+        return
+    try:
+        env = dict(os.environ, DEBIAN_FRONTEND="noninteractive")
+        for args in (["apt-get", "update", "-qq"], ["apt-get", "install", "-yqq", "nftables"]):
+            subprocess.run(args, env=env, timeout=300, capture_output=True)
+    except Exception as e:
+        logline(f"nftables install: {e}")
+    finally:
+        _nft_busy.release()
+
+
 def op_front(d):
+    rows, watch = _relay_clean(d.get("relays") or []), _relay_watch_clean(d.get("watch") or [])
+    if not shutil.which("nft"):
+        threading.Thread(target=_nft_install, daemon=True).start()
+    try:
+        _relay_set(rows, watch)
+        why = ""
+    except RuntimeError as e:
+        why = "relay: " + str(e)[:200]
+    out = _front_apply(d)
+    return {"ok": False, "msg": why} if why and out.get("ok") else dict(out, relays=len(rows))
+
+
+def _front_apply(d):
     if _as_bool(d.get("stop")):
         _front_stop()
         try:
@@ -2979,6 +3189,10 @@ def op_wipe(d):
         except Exception:
             pass
     _front_stop()
+    try:
+        _relay_set([], [])
+    except Exception as e:
+        logline(f"wipe: edge relay removal failed: {e}")
     try:
         revert_kernel_tuning()
     except Exception as e:
@@ -4175,8 +4389,8 @@ def _restart_problem(why, port):
     return "[✘] the service did not come up — journalctl -u " + SERVICE
 
 
-DEP_PACKAGES = ("iproute2", "iptables", "openssl", "procps", "kmod", "ca-certificates")
-DEP_BINARIES = ("ip", "ss", "iptables", "openssl", "sysctl", "modprobe", "systemctl", "systemd-run")
+DEP_PACKAGES = ("iproute2", "iptables", "nftables", "openssl", "procps", "kmod", "ca-certificates")
+DEP_BINARIES = ("ip", "ss", "iptables", "nft", "openssl", "sysctl", "modprobe", "systemctl", "systemd-run")
 
 
 def missing_binaries():
@@ -4482,6 +4696,11 @@ def serve():
         _front_resume()
     except Exception as e:
         logline(f"startup front: {e}")
+    try:
+        _relay_resume()
+    except Exception as e:
+        logline(f"startup edge relay: {e}")
+    threading.Thread(target=relay_loop, daemon=True).start()
     threading.Thread(target=rotation_loop, daemon=True).start()
     threading.Thread(target=health_loop, daemon=True).start()
     _seed_central_cb()
