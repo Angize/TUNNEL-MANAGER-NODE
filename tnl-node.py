@@ -2230,7 +2230,7 @@ def op_ping(d):
             "portfw": len([c for c in cfgs if c.get("type") == "portfw"]),
             "core_ver": _core_ref(), "core_sha": _installed_core_sha()[:12], "arch": _core_arch(),
             **({"front": _front_up()} if os.path.isfile(FRONT_CFG) else {}),
-            **({"relay": {"rules": len(_relay_state["rows"]), "reach": _relay_state["reach"]}}
+            **({"relay": {"rules": len(_relay_state["rows"]) if _relay_state["live"] else 0, "reach": _relay_state["reach"]}}
                if os.path.isfile(RELAY_CFG) else {}),
             "nft": bool(shutil.which("nft")),
             "stats": stats}
@@ -2926,12 +2926,11 @@ RELAY_MARK = 0x746e0000
 RELAY_MAX = 4096
 RELAY_PORTED = (6, 17, 132)
 RELAY_GAP = 15
-RELAY_PROBE_ID = 0x746e
-RELAY_PROBE_WAIT = 1.0
+RELAY_SEEN = re.compile(r"chain (to|from)_(\d+_\d+_\d+_\d+)_\d+ \{\s+counter packets (\d+)")
 RELAY_FORWARD = ["-m", "mark", "--mark", "%#x/0xffff0000" % RELAY_MARK,
                  "-m", "comment", "--comment", RULE_OWNER_PREFIX + "edge-relay", "-j", "ACCEPT"]
 _relay_lock = threading.Lock()
-_relay_state = {"rows": [], "watch": [], "reach": {}}
+_relay_state = {"rows": [], "watch": [], "reach": {}, "live": False}
 _nft_busy = threading.Lock()
 
 
@@ -2976,8 +2975,9 @@ def _relay_script(rows, keep):
     marks = {ip: RELAY_MARK + i for i, ip in enumerate(sorted({ip for r in rows for ip in r["edge"]}), 1)}
     chains, maps = {}, {"by_proto": {}, "by_dst": {}, "by_src": {}}
 
-    def step(peer, to, ip, wire, ports):
-        chain = chains.setdefault((to, ip), "c%d" % (len(chains) + 1))
+    def step(way, peer, to, ip, wire, ports):
+        server = to if way == "to" else peer
+        chain = chains.setdefault((way, peer, to, ip), "%s_%s_%d" % (way, server.replace(".", "_"), len(chains) + 1))
         key = "%s . %s . %d" % (peer, ip, wire[0])
         if wire[1]:
             maps[ports]["%s . %d" % (key, wire[1])] = chain
@@ -2986,8 +2986,8 @@ def _relay_script(rows, keep):
 
     for r in rows:
         for ip in r["edge"]:
-            step(r["client"], r["server"], ip, r["up"], "by_dst")
-            step(r["server"], r["client"], ip, r["down"], "by_src")
+            step("to", r["client"], r["server"], ip, r["up"], "by_dst")
+            step("from", r["server"], r["client"], ip, r["down"], "by_src")
 
     def vmap(name, key):
         items = ", ".join("%s : goto %s" % kv for kv in maps[name].items())
@@ -2996,16 +2996,14 @@ def _relay_script(rows, keep):
     lead = "ipv4_addr . ipv4_addr . inet_proto"
     out = ["table ip %s" % RELAY_TABLE, "delete table ip %s" % RELAY_TABLE, "table ip %s {" % RELAY_TABLE,
            vmap("by_proto", lead), vmap("by_dst", lead + " . inet_service"), vmap("by_src", lead + " . inet_service")]
-    for (to, ip), name in chains.items():
-        out.append("chain %s { ip frag-off set ip frag-off & 0xbfff meta mark set %#x notrack ip daddr set %s; }"
+    for (_way, _peer, to, ip), name in chains.items():
+        out.append("chain %s { counter ip frag-off set ip frag-off & 0xbfff meta mark set %#x notrack ip daddr set %s; }"
                    % (name, marks[ip], to))
     whole = {key.rpartition(" ")[2] for key in maps["by_proto"]}
     out.append("chain defrag { ct state new; }")
     out.append("chain pre { type filter hook prerouting priority -300; policy accept;")
     if "6" in whole:
         out.append("tcp dport { %s } accept" % ", ".join(str(p) for p in sorted(set(keep))))
-    if "1" in whole:
-        out.append("icmp id %d accept" % RELAY_PROBE_ID)
     if whole:
         out.append("ip saddr . ip daddr . ip protocol vmap @by_proto")
     if maps["by_dst"]:
@@ -3020,6 +3018,7 @@ def _relay_script(rows, keep):
 
 def _relay_load():
     rows = _relay_state["rows"]
+    _relay_state["live"] = False
     if not rows:
         run(["nft", "delete", "table", "ip", RELAY_TABLE])
         _ipt_del_all("filter", "FORWARD", RELAY_FORWARD)
@@ -3031,6 +3030,7 @@ def _relay_load():
             enable_ip_forward()
     _ipt_ins_missing("filter", "FORWARD", RELAY_FORWARD)
     must(["nft", "-f", "-"], stdin=_relay_script(rows, [22, int(load_conf().get("port", 8099))]))
+    _relay_state["live"] = True
 
 
 def _relay_set(rows, watch):
@@ -3058,47 +3058,47 @@ def _relay_resume():
         _relay_load()
 
 
-def _relay_alive():
-    return (run(["nft", "list", "table", "ip", RELAY_TABLE])[0] == 0
-            and _ipt_has("filter", "FORWARD", RELAY_FORWARD) is True)
+def _relay_listing():
+    rc, out, _err = run(["nft", "list", "table", "ip", RELAY_TABLE])
+    return out if rc == 0 and _ipt_has("filter", "FORWARD", RELAY_FORWARD) is True else None
 
 
-def _icmp_answers(ip):
-    seq = int(time.time()) & 0xffff
-    total = sum(struct.unpack("!8H", struct.pack("!BBHHHQ", 8, 0, 0, RELAY_PROBE_ID, seq, 0)))
-    total = (total >> 16) + (total & 0xffff)
-    total += total >> 16
-    msg = struct.pack("!BBHHHQ", 8, 0, ~total & 0xffff, RELAY_PROBE_ID, seq, 0)
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP) as s:
-            s.settimeout(RELAY_PROBE_WAIT)
-            s.sendto(msg, (ip, 0))
-            end = time.monotonic() + RELAY_PROBE_WAIT
-            while time.monotonic() < end:
-                data, peer = s.recvfrom(1500)
-                at = (data[0] & 15) * 4
-                if (peer[0] == ip and len(data) >= at + 8 and data[at] == 0
-                        and struct.unpack_from("!H", data, at + 4)[0] == RELAY_PROBE_ID):
-                    return True
-    except OSError:
-        pass
-    return False
+def _relay_counts(listing):
+    seen = {}
+    for way, ip, packets in RELAY_SEEN.findall(listing):
+        ends = seen.setdefault(ip.replace("_", "."), {"to": 0, "from": 0})
+        ends[way] += int(packets)
+    return seen
 
 
-def _relay_reaches(ip, port):
-    return _icmp_answers(ip) or _pf_reachable(ip, str(port)) is True
+def _relay_heard(now, before):
+    reach = {}
+    for ip, ends in now.items():
+        was = before.get(ip, {"to": 0, "from": 0})
+        if ends["from"] > was["from"]:
+            reach[ip] = True
+        elif ends["to"] > was["to"]:
+            reach[ip] = False
+    return reach
 
 
 def relay_loop():
+    seen = {}
     while True:
         time.sleep(RELAY_GAP)
         try:
             with _relay_lock:
-                if _relay_state["rows"] and shutil.which("nft") and not _relay_alive():
+                listing = _relay_listing() if _relay_state["rows"] and shutil.which("nft") else ""
+                if listing is None:
                     _relay_load()
                     logline("edge relay table was missing, loaded it again")
                 watch = list(_relay_state["watch"])
-            _relay_state["reach"] = {ip: _relay_reaches(ip, port) for ip, port in watch}
+            now = _relay_counts(listing or "")
+            reach = _relay_heard(now, seen)
+            seen = now
+            for ip, port in watch:
+                reach[ip] = reach.get(ip) or _pf_reachable(ip, str(port)) is True
+            _relay_state["reach"] = reach
         except Exception as e:
             logline(f"edge relay: {e}")
 
