@@ -2997,8 +2997,10 @@ def _relay_script(rows, keep):
     out = ["table ip %s" % RELAY_TABLE, "delete table ip %s" % RELAY_TABLE, "table ip %s {" % RELAY_TABLE,
            vmap("by_proto", lead), vmap("by_dst", lead + " . inet_service"), vmap("by_src", lead + " . inet_service")]
     for (to, ip), name in chains.items():
-        out.append("chain %s { meta mark set %#x notrack ip daddr set %s; }" % (name, marks[ip], to))
+        out.append("chain %s { ip frag-off set ip frag-off & 0xbfff meta mark set %#x notrack ip daddr set %s; }"
+                   % (name, marks[ip], to))
     whole = {key.rpartition(" ")[2] for key in maps["by_proto"]}
+    out.append("chain defrag { ct state new; }")
     out.append("chain pre { type filter hook prerouting priority -300; policy accept;")
     if "6" in whole:
         out.append("tcp dport { %s } accept" % ", ".join(str(p) for p in sorted(set(keep))))
