@@ -737,12 +737,9 @@ def _core_config(cfg):
         corecfg["raw_profile"] = raw_profile
         if raw_down != raw_profile:
             corecfg["raw_profile_down"] = raw_down
-        _gpt = int(cfg.get("raw_gre_ptype") or 0)
-        _gptd = int(cfg.get("raw_gre_ptype_down") or 0)
-        if _gpt:
-            corecfg["raw_gre_ptype"] = _gpt
-        if _gptd and _gptd != _gpt:
-            corecfg["raw_gre_ptype_down"] = _gptd
+        for key in ("raw_gre_ptype", "raw_gre_ptype_down"):
+            if cfg.get(key):
+                corecfg[key] = cfg[key]
         _rp = _raw_proto(cfg)
         if "bare" in (raw_profile, raw_down) and _rp:
             corecfg["raw_proto"] = _rp
@@ -2484,21 +2481,14 @@ def op_tunnel(d):
                 raise ValueError("bad raw_profile_down")
             if down != profile:
                 obj["raw_profile_down"] = down
-            gpt = int(d.get("raw_gre_ptype") or 0)
-            gptd = int(d.get("raw_gre_ptype_down") or 0)
-            if gpt or gptd:
-                if not (0 <= gpt <= 0xFFFF):
-                    raise ValueError("bad raw_gre_ptype")
-                if not (0 <= gptd <= 0xFFFF):
-                    raise ValueError("bad raw_gre_ptype_down")
-                if gpt and profile != "gre":
-                    raise ValueError("raw_gre_ptype needs raw_profile gre")
-                if gptd and down != "gre":
-                    raise ValueError("raw_gre_ptype_down needs raw_profile_down gre")
-                if gpt:
-                    obj["raw_gre_ptype"] = gpt
-                if gptd and gptd != gpt:
-                    obj["raw_gre_ptype_down"] = gptd
+            for key, sent in (("raw_gre_ptype", profile), ("raw_gre_ptype_down", down)):
+                ptype = int(d.get(key) or 0)
+                if not 0 <= ptype <= 0xFFFF:
+                    raise ValueError("bad " + key)
+                if ptype and sent != "gre":
+                    raise ValueError(key + " needs the gre profile")
+                if ptype:
+                    obj[key] = ptype
             ported = profile in PORTED_RAW_PROFILES or down in PORTED_RAW_PROFILES
             if "bare" in (profile, down):
                 rproto = int(d.get("raw_proto") or 0)
