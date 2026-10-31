@@ -737,6 +737,9 @@ def _core_config(cfg):
         corecfg["raw_profile"] = raw_profile
         if raw_down != raw_profile:
             corecfg["raw_profile_down"] = raw_down
+        for key in ("raw_gre_ptype", "raw_gre_ptype_down"):
+            if cfg.get(key):
+                corecfg[key] = cfg[key]
         _rp = _raw_proto(cfg)
         if "bare" in (raw_profile, raw_down) and _rp:
             corecfg["raw_proto"] = _rp
@@ -2478,6 +2481,14 @@ def op_tunnel(d):
                 raise ValueError("bad raw_profile_down")
             if down != profile:
                 obj["raw_profile_down"] = down
+            for key, sent in (("raw_gre_ptype", profile), ("raw_gre_ptype_down", down)):
+                ptype = int(d.get(key) or 0)
+                if not 0 <= ptype <= 0xFFFF:
+                    raise ValueError("bad " + key)
+                if ptype and sent != "gre":
+                    raise ValueError(key + " needs the gre profile")
+                if ptype:
+                    obj[key] = ptype
             ported = profile in PORTED_RAW_PROFILES or down in PORTED_RAW_PROFILES
             if "bare" in (profile, down):
                 rproto = int(d.get("raw_proto") or 0)
