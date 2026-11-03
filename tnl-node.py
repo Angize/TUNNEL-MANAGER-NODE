@@ -49,6 +49,7 @@ OBFS_DATA_PAD_MAX = 64
 
 NAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
 IFACE_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.@-]*$")
+HOST_RE = re.compile(r"^[A-Za-z0-9.-]{1,253}$")
 
 TRUSTED_CONNS = 32
 OPEN_CONNS = 32
@@ -147,11 +148,8 @@ def ip2int(s):
     return int(ipaddress.IPv4Address(s))
 
 
-def derive_tunnel_ip(ttype, subnet, host):
-    parts = subnet.split("/")
-    base = parts[0]
-    prefix = parts[1] if len(parts) > 1 else ("64" if ttype == "sit" else "24")
-    net = ipaddress.ip_network(f"{base}/{prefix}", strict=False)
+def derive_tunnel_ip(subnet, host):
+    net = ipaddress.ip_network(subnet, strict=False)
     return f"{net.network_address + host}/{net.prefixlen}"
 
 
@@ -160,7 +158,7 @@ def raw_configs():
     if not os.path.isdir(CONFIG_DIR):
         return out
     for fn in sorted(os.listdir(CONFIG_DIR)):
-        if fn.endswith(".json") and fn != "node.conf":
+        if fn.endswith(".json"):
             c = read_config(fn[:-5])
             if c and c.get("name"):
                 out.append(c)
@@ -203,14 +201,6 @@ def used_ids():
         except Exception:
             pass
     return ids
-
-
-def unique_name(ttype, tid):
-    name = f"core{tid}" if ttype == "core" else f"native{tid}"
-    if os.path.exists(os.path.join(CONFIG_DIR, name + ".json")):
-        return None
-    rc, _, _ = run(["ip", "link", "show", name])
-    return name if rc != 0 else None
 
 
 UPLINK_RE = re.compile(r"^(eth|ens|eno|enp|enx|em|bond|venet|vmbr|br)[0-9a-z]*$|^p[0-9]+p[0-9]+$")
@@ -298,17 +288,13 @@ def primary_ip():
     return None
 
 
-def base_mtu(dev=None):
-    asked = dev
-    dev = dev or default_iface()
-    if dev and IFACE_RE.match(dev):
+def base_mtu(dev):
+    if IFACE_RE.match(dev):
         rc, out, _ = run(["ip", "link", "show", dev])
         m = re.search(r"\bmtu (\d+)", out) if rc == 0 else None
         if m:
             return int(m.group(1))
-    if asked:
-        raise RuntimeError("mtu of iface %s unreadable" % asked)
-    return 1500
+    raise RuntimeError("mtu of iface %s unreadable" % dev)
 
 
 def _modprobe(*mods):
@@ -451,9 +437,8 @@ def build_vxlan(cfg):
     name = cfg["name"]
     _modprobe("vxlan")
     run(["ip", "link", "del", name])
-    dstport = int(cfg.get("port") or 4789)
     must(["ip", "link", "add", name, "type", "vxlan", "id", str(cfg["id"]),
-         "local", cfg["local_ip"], "remote", cfg["remote_ip"], "dstport", str(dstport)])
+         "local", cfg["local_ip"], "remote", cfg["remote_ip"], "dstport", str(cfg["port"])])
     _up_netdev(name, cfg, 50)
 
 
@@ -489,13 +474,18 @@ def _l2tp_ids(cfg):
     return tid, port
 
 
+def _l2tp_clear(cfg):
+    tid = str(cfg["id"])
+    run(["ip", "l2tp", "del", "session", "tunnel_id", tid, "session_id", tid])
+    run(["ip", "l2tp", "del", "tunnel", "tunnel_id", tid])
+    run(["ip", "link", "del", cfg["name"]])
+
+
 def build_l2tp(cfg):
     name = cfg["name"]
     tid, port = _l2tp_ids(cfg)
     _modprobe("l2tp_eth", "l2tp_netlink")
-    run(["ip", "l2tp", "del", "session", "tunnel_id", str(tid), "session_id", str(tid)])
-    run(["ip", "l2tp", "del", "tunnel", "tunnel_id", str(tid)])
-    run(["ip", "link", "del", name])
+    _l2tp_clear(cfg)
     must(["ip", "l2tp", "add", "tunnel", "tunnel_id", str(tid), "peer_tunnel_id", str(tid),
          "encap", "udp", "local", cfg["local_ip"], "remote", cfg["remote_ip"],
          "udp_sport", str(port), "udp_dport", str(port)])
@@ -504,13 +494,13 @@ def build_l2tp(cfg):
     _up_netdev(name, cfg, 54)
 
 
-def _fou_port(cfg):
+def _tunnel_port(cfg):
     return int(cfg.get("port") or 20000)
 
 
 def build_fou(cfg):
     name = cfg["name"]
-    port = _fou_port(cfg)
+    port = _tunnel_port(cfg)
     _modprobe("fou", "ipip")
     run(["ip", "link", "del", name])
     run(["ip", "fou", "add", "port", str(port), "ipproto", "4"])
@@ -520,12 +510,16 @@ def build_fou(cfg):
     _up_netdev(name, cfg, 28)
 
 
+def _ipsec_spis(tid):
+    return 0x10000 + tid, 0x20000 + tid
+
+
 def _ipsec_params(cfg):
     tid = int(cfg["id"])
     psk = str(cfg.get("psk") or "")
     enc = hashlib.sha256((psk + "|enc").encode()).hexdigest()
     auth = hashlib.sha256((psk + "|auth").encode()).hexdigest()
-    spi_lo, spi_hi = 0x10000 + tid, 0x20000 + tid
+    spi_lo, spi_hi = _ipsec_spis(tid)
     local_smaller = ip2int(cfg["local_ip"]) < ip2int(cfg["remote_ip"])
     spi_out, spi_in = (spi_lo, spi_hi) if local_smaller else (spi_hi, spi_lo)
     return tid, enc, auth, spi_out, spi_in
@@ -538,7 +532,7 @@ def _ipsec_policy_key(dirn, tid):
 def _ipsec_clear(cfg):
     name = cfg["name"]
     tid = int(cfg["id"])
-    for spi in (0x10000 + tid, 0x20000 + tid):
+    for spi in _ipsec_spis(tid):
         run(["ip", "xfrm", "state", "deleteall", "proto", "esp", "spi", hex(spi)])
     for dirn in ("out", "in", "fwd"):
         run(["ip", "xfrm", "policy", "delete"] + _ipsec_policy_key(dirn, tid))
@@ -548,8 +542,6 @@ def _ipsec_clear(cfg):
 def build_ipsec(cfg):
     name, local, remote = cfg["name"], cfg["local_ip"], cfg["remote_ip"]
     tid, enc, auth, spi_out, spi_in = _ipsec_params(cfg)
-    if not cfg.get("psk"):
-        raise ValueError("ipsec needs a psk")
     _modprobe("esp4", "xfrm_interface")
     _ipsec_clear(cfg)
     common = " proto esp mode tunnel reqid %d replay-window 32 enc cbc(aes) 0x%s auth hmac(sha256) 0x%s if_id %d\n" % (
@@ -559,7 +551,7 @@ def build_ipsec(cfg):
     for dirn, s, dst in (("out", local, remote), ("in", remote, local), ("fwd", remote, local)):
         must(["ip", "xfrm", "policy", "add"] + _ipsec_policy_key(dirn, tid) +
              ["tmpl", "src", s, "dst", dst, "proto", "esp", "reqid", str(tid), "mode", "tunnel"])
-    phys = iface_for_ip(local) or default_iface()
+    phys = iface_for_ip(local)
     must(["ip", "link", "add", name, "type", "xfrm", "dev", phys, "if_id", str(tid)])
     _up_netdev(name, cfg, 80)
 
@@ -598,10 +590,6 @@ def _ensure_core():
         raise CoreMissing("core not installed on this node (push it from the panel)")
 
 
-def _core_port(cfg):
-    return int(cfg.get("port") or 20000)
-
-
 RAW_HEADER_LEN = {"bare": 0, "ipip": 28, "etherip": 2, "ipcomp": 4, "gre": 32, "icmp": 8, "udp": 8,
                   "esp": 8, "l2tpv3": 8, "tcp": 32, "ah": 24, "sctp": 12}
 RAW_PROTO_NUM = {"bare": 253, "ipip": 4, "etherip": 97, "ipcomp": 108, "gre": 47, "icmp": 1, "udp": 17,
@@ -624,9 +612,8 @@ def band_ok(lo, hi):
     return MIN_BAND_LO <= lo <= hi <= 65535 and hi - lo + 1 >= MIN_BAND_SPAN
 
 
-def _rotate_secs(d, key, default, hi):
-    v = d.get(key)
-    n = default if v is None else int(v)
+def _rotate_secs(d, key, hi):
+    n = int(d[key])
     if n < 0 or n > hi or 0 < n < MIN_ROTATE_SECS:
         raise ValueError("%s must be 0 or between %d and %d" % (key, MIN_ROTATE_SECS, hi))
     return n
@@ -687,8 +674,7 @@ def _live_local(name, key, ips):
 
 def _ordered_pool(primary, extras):
     seen, ordered = set(), []
-    for x in [primary] + [str(v) for v in (extras or [])]:
-        ip = str(x).strip().split(":", 1)[0].strip()
+    for ip in [primary] + [str(v) for v in (extras or [])]:
         if ip and ip not in seen:
             seen.add(ip)
             ordered.append(ip)
@@ -697,14 +683,12 @@ def _ordered_pool(primary, extras):
 
 def _core_config(cfg):
     name = cfg["name"]
-    port = _core_port(cfg)
-    cipher = str(cfg.get("cipher") or "auto")
+    port = _tunnel_port(cfg)
+    cipher = cfg["cipher"]
     crypto_on = bool(cfg.get("psk")) and cipher != "none"
-    transport = str(cfg.get("transport") or "udp").lower()
+    transport = cfg["transport"]
     raw_profile, raw_down = _raw_pair(cfg)
-    up_ported = raw_profile in PORTED_RAW_PROFILES
-    raw_ported = up_ported or raw_down in PORTED_RAW_PROFILES
-    obfs = bool(cfg.get("obfs")) and crypto_on
+    obfs = cfg["obfs"]
     if transport == "raw":
         outer = 20 + max(RAW_HEADER_LEN.get(raw_profile, 0), RAW_HEADER_LEN.get(raw_down, 0))
     elif transport == "ws":
@@ -731,85 +715,45 @@ def _core_config(cfg):
         "mtu": mtu,
         "crypto": {"enabled": crypto_on, "psk": cfg.get("psk", ""), "cipher": cipher},
     }
-    _tn = _core_tuning(cfg.get("tuning"))
-    if _tn:
-        corecfg["tuning"] = _tn
+    if cfg.get("tuning"):
+        corecfg["tuning"] = cfg["tuning"]
     for _k, _carriers in BUF_KNOBS:
         _v = int(cfg.get(_k) or 0)
         if _v and transport in _carriers:
             corecfg[_k] = _v
     if bool(cfg.get("cover")):
         corecfg["cover"] = True
-        sni = str(cfg.get("cover_sni") or "").strip()
-        if sni:
-            corecfg["cover_sni"] = sni
+        corecfg["cover_sni"] = cfg["cover_sni"]
     corecfg["status_path"] = _cfg_path(name, ".status")
-    if transport == "raw" and str(cfg.get("role")) == "server":
-        _psrc = [str(x).strip() for x in (cfg.get("peer_src_ips") or []) if is_ipv4(str(x).strip())]
-        if _psrc:
-            corecfg["peer_src_ips"] = _psrc
+    if transport == "raw" and str(cfg.get("role")) == "server" and cfg.get("peer_src_ips"):
+        corecfg["peer_src_ips"] = cfg["peer_src_ips"]
     if transport == "raw":
         corecfg["raw_profile"] = raw_profile
         if raw_down != raw_profile:
             corecfg["raw_profile_down"] = raw_down
-        for key in ("raw_gre_ptype", "raw_gre_ptype_down"):
+        for key in ("raw_gre_ptype", "raw_gre_ptype_down", "raw_proto", "raw_port"):
             if cfg.get(key):
                 corecfg[key] = cfg[key]
-        _rp = _raw_proto(cfg)
-        if "bare" in (raw_profile, raw_down) and _rp:
-            corecfg["raw_proto"] = _rp
-        try:
-            _rport = int(cfg.get("raw_port") or 0)
-        except (TypeError, ValueError):
-            _rport = 0
-        if raw_ported and 1 <= _rport <= 65535:
-            corecfg["raw_port"] = _rport
-        try:
-            _rsport = int(cfg.get("raw_sport") or 0)
-        except (TypeError, ValueError):
-            _rsport = 0
-        if up_ported and _as_bool(cfg.get("raw_sport_random")):
+        if cfg.get("raw_sport_random"):
             corecfg["raw_sport_random"] = True
-        elif raw_ported and 1 <= _rsport <= 65535:
-            corecfg["raw_sport"] = _rsport
-        try:
-            _rrot = int(cfg.get("raw_sport_rotate") or 0)
-        except (TypeError, ValueError):
-            _rrot = 0
-        if raw_ported and 1 <= _rrot <= MAX_SPROT_EVERY:
-            corecfg["raw_sport_rotate"] = _rrot
-            try:
-                _rdp = int(cfg.get("raw_dports") or 0)
-            except (TypeError, ValueError):
-                _rdp = 0
-            if up_ported and 1 <= _rdp <= MAX_DPORTS:
-                corecfg["raw_dports"] = _rdp
-    try:
-        _blo = int(cfg.get("sport_lo") or 0)
-        _bhi = int(cfg.get("sport_hi") or 0)
-    except (TypeError, ValueError):
-        _blo = _bhi = 0
-    if band_ok(_blo, _bhi):
-        corecfg["sport_lo"], corecfg["sport_hi"] = _blo, _bhi
-    try:
-        _ptries = int(cfg.get("port_tries") or 0)
-    except (TypeError, ValueError):
-        _ptries = 0
-    if 1 <= _ptries <= MAX_PORT_TRIES:
-        corecfg["port_tries"] = _ptries
-    try:
-        _wk = int(cfg.get("workers") or 0)
-    except (TypeError, ValueError):
-        _wk = 0
-    if 2 <= _wk <= MAX_WORKERS and not bool(cfg.get("fec")):
-        corecfg["workers"] = _wk
+        elif cfg.get("raw_sport"):
+            corecfg["raw_sport"] = cfg["raw_sport"]
+        for key in ("raw_sport_rotate", "raw_dports"):
+            if cfg.get(key):
+                corecfg[key] = cfg[key]
+    if cfg.get("sport_lo"):
+        corecfg["sport_lo"], corecfg["sport_hi"] = cfg["sport_lo"], cfg["sport_hi"]
+    if cfg.get("port_tries"):
+        corecfg["port_tries"] = cfg["port_tries"]
+    if cfg.get("workers") and not bool(cfg.get("fec")):
+        corecfg["workers"] = cfg["workers"]
     if transport == "ws":
         if cfg.get("ws_host") and str(cfg.get("role")) == "client":
             corecfg["ws_host"] = str(cfg["ws_host"])
         if cfg.get("ws_path"):
             corecfg["ws_path"] = str(cfg["ws_path"])
-        cdn = str(cfg.get("cdn_carrier") or "ws").strip().lower()
-        if cdn in ("http", "grpc"):
+        cdn = cfg.get("cdn_carrier")
+        if cdn:
             corecfg["cdn_carrier"] = cdn
 
             if cfg.get("role") == "client":
@@ -821,56 +765,41 @@ def _core_config(cfg):
             else:
                 _shape = ()
             for _k in _shape:
-                try:
-                    _v = int(cfg.get(_k) or 0)
-                except (TypeError, ValueError):
-                    _v = 0
-                if _v > 0:
-                    corecfg[_k] = _v
+                if cfg.get(_k):
+                    corecfg[_k] = cfg[_k]
         if bool(cfg.get("ws_tls")) and cfg.get("role") == "client":
             corecfg["ws_tls"] = True
             if bool(cfg.get("sni_split")):
                 corecfg["sni_split"] = True
-                sp = int(cfg.get("split_pos") or 0)
-                if sp:
-                    corecfg["split_pos"] = max(0, min(1400, sp))
-                mode = str(cfg.get("sni_mode") or "").strip().lower()
-                if mode in ("disorder", "fake"):
-                    corecfg["sni_mode"] = mode
+                if cfg.get("split_pos"):
+                    corecfg["split_pos"] = cfg["split_pos"]
+                if cfg.get("sni_mode"):
+                    corecfg["sni_mode"] = cfg["sni_mode"]
                     if cfg.get("split_ttl"):
                         corecfg["split_ttl"] = cfg["split_ttl"]
-            ech = str(cfg.get("ws_ech") or "").strip()
-            if ech:
-                corecfg["ws_ech"] = ech
+            if cfg.get("ws_ech"):
+                corecfg["ws_ech"] = cfg["ws_ech"]
             ca = str(cfg.get("ws_ca") or "").strip()
             if ca:
                 corecfg["ws_ca"] = ca
-            ips = [str(x).strip() for x in (cfg.get("ws_edge_ips") or []) if str(x).strip()]
-            snis = [s for s in (cfg.get("ws_edge_snis") or []) if isinstance(s, dict) and str(s.get("host") or "").strip()]
-            if ips and snis:
-                corecfg["ws_edge_ips"] = ips
-                corecfg["ws_edge_snis"] = [{"host": str(s["host"]).strip(), "ech": str(s.get("ech") or "").strip(),
-                                         **({"group": s["group"]} if s.get("group") else {})} for s in snis]
+            if cfg.get("ws_edge_ips"):
+                corecfg["ws_edge_ips"] = cfg["ws_edge_ips"]
+                corecfg["ws_edge_snis"] = cfg["ws_edge_snis"]
                 if cfg.get("ws_edge_ip_groups"):
                     corecfg["ws_edge_ip_groups"] = dict(cfg["ws_edge_ip_groups"])
                 corecfg["ws_rotate_secs"] = cfg["ws_rotate_secs"]
         if bool(cfg.get("ws_port_roll")):
             corecfg["ws_port_roll"] = True
-        if cfg.get("role") == "server":
-            sc = str(cfg.get("srv_cert") or "")
-            sk = str(cfg.get("srv_key") or "")
-            if sc and sk:
-                corecfg["srv_cert"] = sc
-                corecfg["srv_key"] = sk
-                ek = str(cfg.get("srv_ech_key") or "").strip()
-                ec = str(cfg.get("srv_ech_conf") or "").strip()
-                if ek and ec:
-                    corecfg["srv_ech_key"] = ek
-                    corecfg["srv_ech_conf"] = ec
+        if cfg.get("role") == "server" and cfg.get("srv_cert"):
+            corecfg["srv_cert"] = cfg["srv_cert"]
+            corecfg["srv_key"] = cfg["srv_key"]
+            if cfg.get("srv_ech_key"):
+                corecfg["srv_ech_key"] = cfg["srv_ech_key"]
+                corecfg["srv_ech_conf"] = cfg["srv_ech_conf"]
     if transport in ("udp", "raw") and bool(cfg.get("fec")):
         corecfg["fec"] = True
-        corecfg["fec_data"] = int(cfg.get("fec_data") or 16)
-        corecfg["fec_parity"] = int(cfg.get("fec_parity") or 4)
+        corecfg["fec_data"] = cfg["fec_data"]
+        corecfg["fec_parity"] = cfg["fec_parity"]
     if bool(cfg.get("gso")):
         corecfg["gso"] = True
     if transport in ("raw", "tcp", "ws") and cfg.get("role") == "client" and bool(cfg.get("fake_desync")):
@@ -884,15 +813,14 @@ def _core_config(cfg):
         if len(ordered) >= 2:
             corecfg["peer_ips"] = [f"{ip}:{port}" if transport in ("udp", "tcp") else ip for ip in ordered]
             corecfg["peer_rotate_secs"] = cfg["peer_rotate_secs"]
-        _src_sel = [str(x).strip() for x in (cfg.get("src_ips") or []) if str(x).strip()]
-        sord = _ordered_pool(str(cfg.get("local_ip") or ""), _src_sel)
+        sord = _ordered_pool(str(cfg.get("local_ip") or ""), cfg.get("src_ips"))
         if len(sord) >= 2:
             sord = _live_local(name, "src_ips", sord)
             if len(sord) >= 2:
                 corecfg["src_ips"] = sord
                 corecfg.setdefault("peer_rotate_secs", cfg["peer_rotate_secs"])
     if cfg.get("role") == "server":
-        lip = cfg.get("local_ip") or "0.0.0.0"
+        lip = cfg["local_ip"]
         pooled = bool(cfg.get("pool_listen"))
         pool_ips = []
         if pooled and transport in ("udp", "tcp"):
@@ -925,12 +853,12 @@ def _core_unit(name):
     return "tnl-cor-" + name
 
 
-def _core_last_error(name, lines=40):
-    return _unit_last_error(_core_unit(name), lines)
+def _core_last_error(name):
+    return _unit_last_error(_core_unit(name))
 
 
-def _unit_last_error(unit, lines=40):
-    args = ["journalctl", "-u", unit, "-n", str(int(lines)), "--no-pager", "-o", "cat"]
+def _unit_last_error(unit):
+    args = ["journalctl", "-u", unit, "-n", "40", "--no-pager", "-o", "cat"]
     _, inv, _ = run(["systemctl", "show", "-p", "InvocationID", "--value", unit], timeout=10)
     inv = inv.strip()
     if inv:
@@ -960,7 +888,7 @@ def _master_of(name):
 
 
 def _netdev_missing_reason(name, ttype):
-    if run(["ip", "link", "show", name])[0] == 0:
+    if _netdev_exists(name):
         return ""
     if ttype == "core":
         if _core_alive(name):
@@ -1043,7 +971,7 @@ def _is_ws_pool(name):
 
 def _is_ws_single(name):
     cc = _read_core_cfg(name)
-    return bool(cc.get("ws_host") and cc.get("status_path")) and not cc.get("ws_edge_ips")
+    return bool(cc.get("ws_host")) and not cc.get("ws_edge_ips")
 
 
 def _is_peer_pool(name):
@@ -1086,7 +1014,7 @@ def _core_relaunch(cfg):
     run(["systemctl", "stop", unit])
     run(["systemctl", "reset-failed", unit])
     _sweep_owned_rules(name)
-    if _as_bool(cfg.get("conntrack_bypass")):
+    if cfg.get("conntrack_bypass"):
         _install_rules(cfg, _ct_bypass_rules(cfg), "conntrack bypass installed")
     _install_rules(cfg, _split_rx_rules(cfg), "split raw profile, inbound protocol admitted")
     for p in _core_status_paths(name):
@@ -1255,14 +1183,6 @@ def _raw_pair(cfg):
     return up, str(cfg.get("raw_profile_down") or up).strip().lower()
 
 
-def _raw_proto(cfg):
-    try:
-        rp = int(cfg.get("raw_proto") or 0)
-    except (TypeError, ValueError):
-        return 0
-    return rp if 1 <= rp <= 255 else 0
-
-
 def _raw_rule_tag(cfg):
     name = cfg.get("name", "")
     if (not NAME_RE.match(name or "") or cfg.get("type") != "core"
@@ -1291,7 +1211,7 @@ def _split_rx_rules(cfg):
     if tag is None or down == up:
         return []
     rx = down if str(cfg.get("role")) == "client" else up
-    num = (rx == "bare" and _raw_proto(cfg)) or RAW_PROTO_NUM.get(rx, 0)
+    num = (rx == "bare" and cfg.get("raw_proto")) or RAW_PROTO_NUM.get(rx, 0)
     if not num:
         return []
     return [("filter", "INPUT", ["-s", ip, "-p", str(num)] + tag + ["-j", "ACCEPT"]) for ip in _ct_bypass_peers(cfg)]
@@ -1314,11 +1234,11 @@ def _ipt(table, args, ipt="iptables"):
     return run([ipt, "-w", IPT_WAIT, "-t", table] + args)
 
 
-def _ipt_must(table, args, ipt="iptables"):
-    rc, out, err = _ipt(table, args, ipt)
+def _ipt_must(table, args):
+    rc, out, err = _ipt(table, args)
     if rc != 0:
         raise RuntimeError((err or out or ("rc=" + str(rc))).strip()
-                           + "  [" + " ".join([ipt, "-t", table] + args) + "]")
+                           + "  [" + " ".join(["iptables", "-t", table] + args) + "]")
 
 
 def _ipt_has(table, chain, rule, ipt="iptables"):
@@ -1336,8 +1256,8 @@ def _ipt_ins_missing(table, chain, rule, ipt="iptables"):
         _ipt(table, ["-I", chain, "1"] + rule, ipt)
 
 
-def _ipt_del_all(table, chain, rule, tries=64, ipt="iptables"):
-    for _ in range(tries):
+def _ipt_del_all(table, chain, rule, ipt="iptables"):
+    for _ in range(64):
         if _ipt_has(table, chain, rule, ipt) is not True:
             break
         _ipt(table, ["-D", chain] + rule, ipt)
@@ -1378,16 +1298,9 @@ def _read_pf_net(cfgs):
 def build_portfw(cfg):
     iface = cfg["iface"]
     lp, dp = str(cfg["listen_port"]), str(cfg["dst_port"])
-    if not (IFACE_RE.match(iface) and lp.isdigit() and dp.isdigit()):
-        return
-    ips = [ip for ip in cfg.get("dst_ips", []) if is_ipv4(ip)]
-    if not ips:
-        return
+    ips = cfg["dst_ips"]
     enable_ip_forward()
-    idx = int(cfg.get("current_index", 0) or 0)
-    if idx >= len(ips):
-        idx = 0
-    active = ips[idx]
+    active = ips[cfg["current_index"]]
     for proto in ("tcp", "udp"):
         for ip in ips:
             _ipt_del_all("nat", "PREROUTING", _pf_dnat(cfg, iface, proto, lp, ip, dp))
@@ -1445,20 +1358,17 @@ def apply_config(cfg):
 
 
 def teardown_config(cfg):
-    ttype, name, tid = cfg.get("type"), cfg.get("name", ""), str(cfg.get("id", ""))
+    ttype, name = cfg.get("type"), cfg.get("name", "")
     if not NAME_RE.match(name):
         return
     if ttype in ("vxlan", "gre", "sit", "ipip"):
         run(["ip", "link", "del", name])
     elif ttype == "l2tpv3":
-        if tid.isdigit():
-            run(["ip", "l2tp", "del", "session", "tunnel_id", tid, "session_id", tid])
-            run(["ip", "l2tp", "del", "tunnel", "tunnel_id", tid])
-        run(["ip", "link", "del", name])
+        _l2tp_clear(cfg)
     elif ttype == "fou":
         run(["ip", "link", "del", name])
-        port = _fou_port(cfg)
-        if not any(c.get("name") != name and c.get("type") == "fou" and _fou_port(c) == port for c in raw_configs()):
+        port = _tunnel_port(cfg)
+        if not any(c.get("name") != name and c.get("type") == "fou" and _tunnel_port(c) == port for c in raw_configs()):
             run(["ip", "fou", "del", "port", str(port), "ipproto", "4"])
     elif ttype == "ipsec":
         _ipsec_clear(cfg)
@@ -1466,14 +1376,11 @@ def teardown_config(cfg):
         _core_teardown(cfg)
     elif ttype == "portfw":
         _pf_acct_teardown(cfg)
-        iface, lp, dp = cfg.get("iface", ""), str(cfg.get("listen_port", "")), str(cfg.get("dst_port", ""))
-        if IFACE_RE.match(iface) and lp.isdigit() and dp.isdigit():
-            for proto in ("tcp", "udp"):
-                for ip in cfg.get("dst_ips", []):
-                    if not is_ipv4(ip):
-                        continue
-                    _ipt_del_all("nat", "PREROUTING", _pf_dnat(cfg, iface, proto, lp, ip, dp))
-                    _ipt_del_all("nat", "POSTROUTING", _pf_masq(cfg, proto, ip, dp, lp))
+        iface, lp, dp = cfg["iface"], str(cfg["listen_port"]), str(cfg["dst_port"])
+        for proto in ("tcp", "udp"):
+            for ip in cfg["dst_ips"]:
+                _ipt_del_all("nat", "PREROUTING", _pf_dnat(cfg, iface, proto, lp, ip, dp))
+                _ipt_del_all("nat", "POSTROUTING", _pf_masq(cfg, proto, ip, dp, lp))
 
 
 def apply_all():
@@ -1496,11 +1403,8 @@ def rotate_once():
     for cfg in raw_configs():
         if cfg.get("type") != "portfw" or not cfg.get("enabled", True):
             continue
-        try:
-            interval = int(cfg.get("switch_interval", 0) or 0)
-        except Exception:
-            interval = 0
-        ips = [ip for ip in cfg.get("dst_ips", []) if is_ipv4(ip)]
+        interval = cfg["switch_interval"]
+        ips = cfg["dst_ips"]
         if interval <= 0 or len(ips) < 2:
             continue
         if now - int(cfg.get("last_switch", 0) or 0) < interval:
@@ -1527,10 +1431,9 @@ def rotation_loop():
             logline(f"rotate loop: {e}")
 
 
-def peer_of(tunnel_ip, ttype):
+def peer_of(tunnel_ip):
     addr = tunnel_ip.split("/")[0]
-    prefix = tunnel_ip.split("/")[1] if "/" in tunnel_ip else ("64" if ttype == "sit" else "24")
-    net = ipaddress.ip_network(f"{addr}/{prefix}", strict=False)
+    net = ipaddress.ip_network(tunnel_ip, strict=False)
     mine = int(ipaddress.ip_address(addr)) - int(net.network_address)
     return str(net.network_address + (3 - mine))
 
@@ -1548,9 +1451,9 @@ _ANSWERED = (0, errno.ECONNREFUSED)
 _PENDING = (errno.EINPROGRESS, errno.EWOULDBLOCK, errno.EALREADY)
 
 
-def tun_probe(iface, tunnel_ip, ttype, count=PROBE_COUNT):
+def tun_probe(iface, tunnel_ip, ttype):
     self_ip = tunnel_ip.split("/")[0]
-    peer = peer_of(tunnel_ip, ttype)
+    peer = peer_of(tunnel_ip)
     fam = socket.AF_INET6 if ttype == "sit" else socket.AF_INET
     hits = sent = 0
     best = None
@@ -1560,7 +1463,7 @@ def tun_probe(iface, tunnel_ip, ttype, count=PROBE_COUNT):
         return ms if prev is None else min(prev, ms)
 
     waiting = {}
-    for _ in range(max(1, count)):
+    for _ in range(PROBE_COUNT):
         try:
             s = socket.socket(fam, socket.SOCK_STREAM)
         except OSError:
@@ -1585,7 +1488,7 @@ def tun_probe(iface, tunnel_ip, ttype, count=PROBE_COUNT):
         else:
             s.close()
 
-    if sent * 2 < max(1, count):
+    if sent * 2 < PROBE_COUNT:
         for s in waiting:
             s.close()
         return 0, 0, None
@@ -1617,12 +1520,7 @@ def tun_probe(iface, tunnel_ip, ttype, count=PROBE_COUNT):
 
 
 def probe_min_pct(cfg):
-    lo, hi = PROBE_MIN_PCT_RANGE
-    try:
-        v = int(cfg.get("probe_min_pct"))
-    except (TypeError, ValueError):
-        return PROBE_MIN_PCT
-    return max(lo, min(hi, v))
+    return cfg.get("probe_min_pct", PROBE_MIN_PCT)
 
 
 def carrying(hits, sent, pct):
@@ -1646,7 +1544,7 @@ def _rta(kind, data):
 def route_leak(cfg):
     tip, ttype = cfg["tunnel_ip"], cfg.get("type")
     fam = socket.AF_INET6 if ttype == "sit" else socket.AF_INET
-    dst = socket.inet_pton(fam, peer_of(tip, ttype))
+    dst = socket.inet_pton(fam, peer_of(tip))
     src = socket.inet_pton(fam, tip.split("/")[0])
     body = struct.pack("BBBBBBBBI", fam, len(dst) * 8, len(src) * 8, 0, 0, 0, 0, 0, 0) + _rta(RTA_DST, dst) + _rta(RTA_SRC, src)
     try:
@@ -1689,34 +1587,19 @@ def settle(name, ok):
         return st["pub"]
 
 
-def _read_path_state(name):
-    try:
-        with open(_cfg_path(name, ".status")) as f:
-            st = json.load(f)
-    except (OSError, ValueError):
-        return 0, False
-    if not isinstance(st, dict):
-        return 0, False
-    try:
-        epoch = int(st.get("epoch") or 0)
-    except (TypeError, ValueError):
-        return 0, False
-    return epoch, bool(st.get("ready"))
-
-
 def _condemned(st, kind, key):
     return bool(key) and any(h["key"] == key and h["kind"] == kind and h["state"] != "healthy"
                              for h in st["health"])
 
 
-def _report_carrying(name, edge, epoch):
+def _report_carrying(name, edge):
     st = _read_status(name)
     pair = st["pair"]
     low, high = pair["low"], pair["high"]
     if not edge and not (_condemned(st, pair["low_kind"], low) or _condemned(st, pair["high_kind"], high)):
         return
     err = _atomic_write_json(_cfg_path(name, ".status.verdict"),
-                             {"cmd": "ok", "low": low, "high": high, "epoch": epoch})
+                             {"cmd": "ok", "low": low, "high": high})
     carrying = f"{low or '?'} / {high or '?'} are carrying" if low or high else "the path is carrying"
     logline(f"{name}: probe found traffic crossing — told the core {carrying}"
             + (f" [{err}]" if err else ""))
@@ -1743,7 +1626,7 @@ def pool_failover(name, alive, crossed, epoch, session_up, stable):
         onbad = st.get("onbad", 0)
     if alive is not False:
         if crossed and session_up:
-            _report_carrying(name, was_red and alive is True, epoch)
+            _report_carrying(name, was_red and alive is True)
         return
     if not counted or onbad < RED_SWEEPS:
         return
@@ -1773,8 +1656,6 @@ PF_DEAD_ERRNOS = (errno.EHOSTUNREACH, errno.ENETUNREACH, errno.EHOSTDOWN, errno.
 
 
 def _pf_reachable(ip, port):
-    if not (ip and port.isdigit()):
-        return None
     try:
         socket.create_connection((ip, int(port)), timeout=2).close()
         return True
@@ -1789,36 +1670,29 @@ def _pf_reachable(ip, port):
 def health_of(cfg):
     ttype, name = cfg.get("type"), cfg.get("name", "")
     if ttype == "portfw":
-        iface, lp, dp = cfg.get("iface", ""), str(cfg.get("listen_port", "")), str(cfg.get("dst_port", ""))
-        ips = [ip for ip in cfg.get("dst_ips", []) if is_ipv4(ip)]
-        idx = int(cfg.get("current_index", 0) or 0)
-        if idx >= len(ips):
-            idx = 0
-        active = ips[idx] if ips else ""
+        iface, lp, dp = cfg["iface"], str(cfg["listen_port"]), str(cfg["dst_port"])
+        active = cfg["dst_ips"][cfg["current_index"]]
         if not cfg.get("enabled", True):
             return {"active": active, "rule": False, "reachable": None, "up": False}
-        rule = False
-        if active and IFACE_RE.match(iface) and lp.isdigit() and dp.isdigit():
-            rule = True
-            for proto in ("tcp", "udp"):
-                got = _ipt_has("nat", "PREROUTING", _pf_dnat(cfg, iface, proto, lp, active, dp))
-                if got is not True:
-                    rule = got
-                    break
+        rule = True
+        for proto in ("tcp", "udp"):
+            got = _ipt_has("nat", "PREROUTING", _pf_dnat(cfg, iface, proto, lp, active, dp))
+            if got is not True:
+                rule = got
+                break
         return {"active": active, "rule": rule, "reachable": _pf_reachable(active, dp), "up": rule}
     up = _netdev_exists(name)
     if not up:
         _verdict_forget(name)
     alive, rtt, loss, crossed, leak = None, None, None, None, ""
-    tip = cfg.get("tunnel_ip", "")
-    if up and tip and tip != "N/A":
-        epoch_before, ready_before = _read_path_state(name)
+    if up:
+        before = _read_status(name)
         crossed, rtt, loss = probe_verdict(cfg)
         if crossed is not None:
             alive = settle(name, crossed)
-            epoch, ready = _read_path_state(name)
-            pool_failover(name, alive, crossed, epoch_before, ready_before and ready,
-                          epoch == epoch_before)
+            after = _read_status(name)
+            pool_failover(name, alive, crossed, before["epoch"], before["ready"] and after["ready"],
+                          after["epoch"] == before["epoch"])
             leak = route_leak(cfg)
             if leak:
                 alive = False
@@ -2033,6 +1907,22 @@ def _req_name(d):
     return name
 
 
+def _b64_ok(s, cap):
+    return len(s) <= cap and bool(re.match(r"^[A-Za-z0-9+/=]+$", s))
+
+
+def _srv_ech_ok(ek, ec):
+    return bool(re.match(r"^[0-9a-fA-F]+$", ek)) and len(ek) <= 256 and _b64_ok(ec, 8192)
+
+
+def _cert_ok(cert):
+    return "BEGIN CERTIFICATE" in cert and len(cert) <= 16384
+
+
+def _pem_pair_ok(cert, key):
+    return _cert_ok(cert) and "BEGIN" in key and len(key) <= 16384
+
+
 def _self_sha():
     try:
         with open(INSTALLED, "rb") as f:
@@ -2244,7 +2134,6 @@ def op_ping(d):
             **({"front": _front_up()} if os.path.isfile(FRONT_CFG) else {}),
             **({"relay": {"rules": len(_relay_state["rows"]) if _relay_state["live"] else 0, "reach": _relay_state["reach"]}}
                if os.path.isfile(RELAY_CFG) else {}),
-            "nft": bool(shutil.which("nft")),
             "stats": stats}
 
 
@@ -2274,7 +2163,7 @@ def op_list(d):
 
 
 def op_tunnel(d):
-    _require(d, ["type", "self_ip", "peer_ip", "subnet", "host"])
+    _require(d, ["type", "self_ip", "peer_ip", "subnet", "host", "name"])
     ttype = d["type"]
     if ttype not in ("vxlan", "gre", "sit", "ipip", "l2tpv3", "fou", "ipsec", "core"):
         raise ValueError("bad type")
@@ -2294,13 +2183,13 @@ def op_tunnel(d):
     host = int(d["host"])
     if host not in (1, 2):
         raise ValueError("host must be 1 (server) or 2 (client)")
-    iface = d.get("iface") or iface_for_ip(self_ip)
+    iface = iface_for_ip(self_ip)
     if not iface or not IFACE_RE.match(iface):
         raise ValueError("no local interface for that IP")
-    name = d.get("name") or unique_name(ttype, tid)
-    if not name or not NAME_RE.match(name):
+    name = d["name"]
+    if not NAME_RE.match(name):
         raise ValueError("bad name")
-    tunnel_ip = derive_tunnel_ip(ttype, subnet, host)
+    tunnel_ip = derive_tunnel_ip(subnet, host)
     obj = {"name": name, "type": ttype, "id": tid, "iface": iface,
            "remote_ip": peer_ip, "tunnel_ip": tunnel_ip, "local_ip": self_ip}
     old = read_config(name)
@@ -2354,7 +2243,7 @@ def op_tunnel(d):
         if transport == "ws":
             wh = str(d.get("ws_host") or "").strip()
             if wh:
-                if not re.match(r"^[A-Za-z0-9.-]{1,253}$", wh):
+                if not HOST_RE.match(wh):
                     raise ValueError("bad ws_host")
                 obj["ws_host"] = wh
             wp = str(d.get("ws_path") or "").strip()
@@ -2389,12 +2278,12 @@ def op_tunnel(d):
                     raise ValueError("ws_tls requires ws_host")
                 ech = str(d.get("ws_ech") or "").strip()
                 if ech:
-                    if len(ech) > 4096 or not re.match(r"^[A-Za-z0-9+/=]+$", ech):
+                    if not _b64_ok(ech, 4096):
                         raise ValueError("bad ws_ech")
                     obj["ws_ech"] = ech
                 ca = str(d.get("ws_ca") or "")
                 if ca.strip():
-                    if len(ca) > 16384 or "BEGIN CERTIFICATE" not in ca:
+                    if not _cert_ok(ca):
                         raise ValueError("bad ws_ca")
                     obj["ws_ca"] = ca
                 if _as_bool(d.get("sni_split")):
@@ -2435,10 +2324,10 @@ def op_tunnel(d):
                         if not isinstance(s, dict):
                             raise ValueError("bad ws_edge_sni")
                         h = str(s.get("host") or "").strip()
-                        if not re.match(r"^[A-Za-z0-9.\-]{1,253}$", h):
+                        if not HOST_RE.match(h):
                             raise ValueError("bad ws_edge_sni host")
                         se = str(s.get("ech") or "").strip()
-                        if se and (len(se) > 4096 or not re.match(r"^[A-Za-z0-9+/=]+$", se)):
+                        if se and not _b64_ok(se, 4096):
                             raise ValueError("bad ws_edge_sni ech")
                         sg = _group(s.get("group"), "ws_edge_sni")
                         clean_snis.append({"host": h, "ech": se, **({"group": sg} if sg else {})})
@@ -2467,7 +2356,7 @@ def op_tunnel(d):
                         obj["ws_edge_snis"] = clean_snis
                         if ip_groups:
                             obj["ws_edge_ip_groups"] = ip_groups
-                        obj["ws_rotate_secs"] = _rotate_secs(d, "ws_rotate_secs", 600, 28800)
+                        obj["ws_rotate_secs"] = _rotate_secs(d, "ws_rotate_secs", 28800)
             if role == "client" and _as_bool(d.get("ws_port_roll")):
                 obj["ws_port_roll"] = True
             edge = str(d.get("edge_ip") or "").strip()
@@ -2475,7 +2364,7 @@ def op_tunnel(d):
                 host, sep, eport = edge.rpartition(":")
                 if not sep:
                     host = edge
-                if not re.match(r"^[A-Za-z0-9.\-]{1,253}$", host) or (
+                if not HOST_RE.match(host) or (
                         sep and not (eport.isdigit() and 1 <= int(eport) <= 65535)):
                     raise ValueError("bad edge_ip")
                 obj["edge_ip"] = edge
@@ -2485,16 +2374,14 @@ def op_tunnel(d):
                 if sc.strip() or sk.strip():
                     if obj.get("cdn_carrier") == "grpc":
                         raise ValueError("server TLS termination covers the ws and http carriers only (grpc speaks HTTP/2)")
-                    if ("BEGIN CERTIFICATE" not in sc or "BEGIN" not in sk
-                            or len(sc) > 16384 or len(sk) > 16384):
+                    if not _pem_pair_ok(sc, sk):
                         raise ValueError("bad srv_cert/srv_key")
                     obj["srv_cert"] = sc
                     obj["srv_key"] = sk
                     ek = str(d.get("srv_ech_key") or "").strip()
                     ec = str(d.get("srv_ech_conf") or "").strip()
                     if ek or ec:
-                        if (not re.match(r"^[0-9a-fA-F]+$", ek) or len(ek) > 256
-                                or not re.match(r"^[A-Za-z0-9+/=]+$", ec) or len(ec) > 8192):
+                        if not _srv_ech_ok(ek, ec):
                             raise ValueError("bad srv_ech")
                         obj["srv_ech_key"] = ek
                         obj["srv_ech_conf"] = ec
@@ -2604,7 +2491,7 @@ def op_tunnel(d):
                     obj["peer_ips"] = pips
                 if sips:
                     obj["src_ips"] = sips
-                obj["peer_rotate_secs"] = _rotate_secs(d, "peer_rotate_secs", 0, 86400)
+                obj["peer_rotate_secs"] = _rotate_secs(d, "peer_rotate_secs", 86400)
         if transport in ("udp", "tcp", "raw") and role == "server" and _as_bool(d.get("pool_listen")):
             obj["pool_listen"] = True
             if transport in ("udp", "tcp"):
@@ -2633,7 +2520,7 @@ def op_tunnel(d):
             sni = str(d.get("cover_sni") or "").strip()
             if not sni:
                 raise ValueError("cover requires cover_sni")
-            if not re.match(r"^[A-Za-z0-9.-]{1,253}$", sni):
+            if not HOST_RE.match(sni):
                 raise ValueError("bad cover_sni")
             obj["cover_sni"] = sni
         if _as_bool(d.get("gso")):
@@ -2672,13 +2559,13 @@ def op_tunnel(d):
             except Exception:
                 restored = False
             old_async_tun = old.get("type") == "core"
-            if restored and (not old.get("enabled", True) or old_async_tun or run(["ip", "link", "show", name])[0] == 0):
-                return {"ok": False, "error": msg, "restored": True}
+            if restored and (not old.get("enabled", True) or old_async_tun or _netdev_exists(name)):
+                return {"ok": False, "error": msg}
         try:
             os.remove(os.path.join(CONFIG_DIR, name + ".json"))
         except OSError:
             pass
-        return {"ok": False, "error": msg, "restored": False}
+        return {"ok": False, "error": msg}
 
     try:
         apply_config(obj)
@@ -2687,11 +2574,11 @@ def op_tunnel(d):
     except Exception as e:
         return _fail(str(e))
     if not obj.get("enabled", True):
-        return {"ok": True, "name": name, "tunnel_ip": tunnel_ip}
+        return {"ok": True, "name": name}
     why = _netdev_missing_reason(name, ttype)
     if why:
         return _fail(why)
-    return {"ok": True, "name": name, "tunnel_ip": tunnel_ip}
+    return {"ok": True, "name": name}
 
 
 def op_portfw(d):
@@ -2719,7 +2606,7 @@ def op_portfw(d):
     why = _pf_conflict(iface, lp, listen_ip)
     if why:
         raise ValueError(why)
-    tid = int(d.get("id") or 0) or (max(used_ids(), default=41) + 1)
+    tid = max(used_ids(), default=41) + 1
     name = f"portfw{tid}"
     if os.path.exists(os.path.join(CONFIG_DIR, name + ".json")):
         raise ValueError("no free name")
@@ -2819,7 +2706,7 @@ def op_delete(d):
     _require(d, ["name"])
     cfg = read_config(d["name"])
     if not cfg:
-        return {"ok": True, "already": True}
+        return {"ok": True}
     teardown_config(cfg)
     try:
         os.remove(os.path.join(CONFIG_DIR, d["name"] + ".json"))
@@ -2829,10 +2716,7 @@ def op_delete(d):
 
 
 def op_link_enable(d):
-    _require(d, ["name"])
-    name = d["name"]
-    if not NAME_RE.match(name):
-        raise ValueError("bad name")
+    name = _req_name(d)
     enabled = _as_bool(d.get("enabled", True))
     cfg = read_config(name)
     if not cfg:
@@ -2845,7 +2729,7 @@ def op_link_enable(d):
     write_config(name, cfg)
     if cfg.get("type") == "portfw":
         _health_now(cfg)
-    return {"ok": True, "enabled": enabled}
+    return {"ok": True}
 
 
 FRONT_UNIT_PROPS = (
@@ -2938,8 +2822,7 @@ def _front_build(d):
     if not ek or not ec:
         raise ValueError("front: srv_ech_key and srv_ech_conf are required (without ECH every inner name "
                          "travels in the clear)")
-    if (not re.match(r"^[0-9a-fA-F]+$", ek) or len(ek) > 256
-            or not re.match(r"^[A-Za-z0-9+/=]+$", ec) or len(ec) > 8192):
+    if not _srv_ech_ok(ek, ec):
         raise ValueError("front: bad srv_ech")
     routes_in = d.get("routes")
     if not isinstance(routes_in, list) or not routes_in:
@@ -2961,7 +2844,7 @@ def _front_build(d):
             raise ValueError("front: route %s backend must be \"ipv4:port\"" % inner)
         cert = str(r.get("cert") or "")
         key = str(r.get("key") or "")
-        if "BEGIN CERTIFICATE" not in cert or "BEGIN" not in key or len(cert) > 16384 or len(key) > 16384:
+        if not _pem_pair_ok(cert, key):
             raise ValueError("front: route %s needs a valid cert and key" % inner)
         routes.append({"inner": inner, "backend": backend, "cert": cert, "key": key})
     return {"role": "front", "listen": "0.0.0.0:%d" % int(port), "routes": routes,
@@ -2971,14 +2854,13 @@ def _front_build(d):
 RELAY_TABLE = "tnl_edge"
 RELAY_MARK = 0x746e0000
 RELAY_MAX = 4096
-RELAY_PORTED = (6, 17, 132)
+RELAY_PORTED = tuple(RAW_PROTO_NUM[p] for p in PORTED_RAW_PROFILES)
 RELAY_GAP = 15
 RELAY_SEEN = re.compile(r"chain (to|from)_(\d+_\d+_\d+_\d+)_\d+ \{\s+counter packets (\d+)")
 RELAY_FORWARD = ["-m", "mark", "--mark", "%#x/0xffff0000" % RELAY_MARK,
                  "-m", "comment", "--comment", RULE_OWNER_PREFIX + "edge-relay", "-j", "ACCEPT"]
 _relay_lock = threading.Lock()
 _relay_state = {"rows": [], "watch": [], "reach": {}, "live": False}
-_nft_busy = threading.Lock()
 
 
 def _relay_ip(v):
@@ -3070,8 +2952,6 @@ def _relay_load():
         run(["nft", "delete", "table", "ip", RELAY_TABLE])
         _ipt_del_all("filter", "FORWARD", RELAY_FORWARD)
         return
-    if not shutil.which("nft"):
-        raise RuntimeError("nft is not installed on this node yet")
     with open("/proc/sys/net/ipv4/ip_forward") as f:
         if f.read().strip() != "1":
             enable_ip_forward()
@@ -3135,7 +3015,7 @@ def relay_loop():
         time.sleep(RELAY_GAP)
         try:
             with _relay_lock:
-                listing = _relay_listing() if _relay_state["rows"] and shutil.which("nft") else ""
+                listing = _relay_listing() if _relay_state["rows"] else ""
                 if listing is None:
                     _relay_load()
                     logline("edge relay table was missing, loaded it again")
@@ -3150,30 +3030,15 @@ def relay_loop():
             logline(f"edge relay: {e}")
 
 
-def _nft_install():
-    if not _nft_busy.acquire(blocking=False):
-        return
-    try:
-        env = dict(os.environ, DEBIAN_FRONTEND="noninteractive")
-        for args in (["apt-get", "update", "-qq"], ["apt-get", "install", "-yqq", "nftables"]):
-            subprocess.run(args, env=env, timeout=300, capture_output=True)
-    except Exception as e:
-        logline(f"nftables install: {e}")
-    finally:
-        _nft_busy.release()
-
-
 def op_front(d):
     rows, watch = _relay_clean(d.get("relays") or []), _relay_watch_clean(d.get("watch") or [])
-    if not shutil.which("nft"):
-        threading.Thread(target=_nft_install, daemon=True).start()
     try:
         _relay_set(rows, watch)
         why = ""
     except RuntimeError as e:
         why = "relay: " + str(e)[:200]
     out = _front_apply(d)
-    return {"ok": False, "error": why} if why and out.get("ok") else dict(out, relays=len(rows))
+    return {"ok": False, "error": why} if why and out.get("ok") else out
 
 
 def _front_apply(d):
@@ -3183,7 +3048,7 @@ def _front_apply(d):
             os.remove(FRONT_CFG)
         except FileNotFoundError:
             pass
-        return {"ok": True, "stopped": True}
+        return {"ok": True}
     obj = _front_build(d)
     _ensure_core()
     prev = _front_read()
@@ -3193,7 +3058,7 @@ def _front_apply(d):
     if warm and _front_up():
         why = _front_reload()
         if why == "":
-            return {"ok": True, "routes": len(obj["routes"]), "reloaded": True}
+            return {"ok": True}
         if why:
             _write_json_durable(FRONT_CFG, prev)
             return {"ok": False, "error": why}
@@ -3207,7 +3072,7 @@ def _front_apply(d):
         else:
             os.remove(FRONT_CFG)
         return {"ok": False, "error": why}
-    return {"ok": True, "routes": len(obj["routes"]), "reloaded": False}
+    return {"ok": True}
 
 
 def op_core_restart(d):
@@ -3254,7 +3119,7 @@ def op_wipe(d):
         return {"ok": False}
     _restart_pending.set()
     logline("node wiped by panel request")
-    return {"ok": True, "wiped": True}
+    return {"ok": True}
 
 
 def op_check(d):
@@ -3262,10 +3127,10 @@ def op_check(d):
     cfg = read_config(d["name"])
     if not cfg or cfg.get("type") == "portfw":
         raise ValueError("not found")
-    up = os.path.exists("/sys/class/net/" + cfg["name"])
+    up = _netdev_exists(cfg["name"])
     crossed = rtt = loss = None
     leak = ""
-    if up and cfg.get("tunnel_ip") and cfg.get("tunnel_ip") != "N/A":
+    if up:
         crossed, rtt, loss = probe_verdict(cfg)
         if crossed is not None:
             leak = route_leak(cfg)
@@ -3360,11 +3225,9 @@ def _ip_overlap(a, b):
     return not a or not b or a in _WILD or b in _WILD or a == b
 
 
-def _port_busy(port, proto, ip=None, own=""):
-    proto = "tcp" if str(proto).lower() == "tcp" else "udp"
-    tip = _norm_ip(ip)
+def _port_busy(port, proto, ip, own):
     for host, who, tunnels in _port_listeners(port, proto):
-        if not _ip_overlap(tip, host) or (own and tunnels == {own}):
+        if not _ip_overlap(ip, host) or (own and tunnels == {own}):
             continue
         return True, who, next((t for t in tunnels if t), "")
     return False, "", ""
@@ -3376,14 +3239,14 @@ def _tunnel_ports(c):
         transport = str(c.get("transport") or "udp").lower()
         if c.get("role") != "server" or transport == "raw":
             return []
-        port = _core_port(c)
+        port = _tunnel_port(c)
         pool = ([str(x).strip() for x in (c.get("listen_ips") or []) if str(x).strip()]
                 if c.get("pool_listen") and transport in ("udp", "tcp") else [])
         return [(ip, port) for ip in pool] or [(str(c.get("local_ip") or ""), port)]
     if t == "vxlan":
-        return [("", int(c.get("port") or 4789))]
+        return [("", c["port"])]
     if t == "fou":
-        return [("", _fou_port(c))]
+        return [("", _tunnel_port(c))]
     if t == "l2tpv3":
         return [(str(c.get("local_ip") or ""), _l2tp_ids(c)[1])]
     return []
@@ -3534,10 +3397,8 @@ def _speed_dir(mode, ip, port, src, secs, streams):
 
 
 def op_speedtest(d):
-    name = str(d.get("name") or "")
-    if not NAME_RE.match(name):
-        raise ValueError("bad name")
-    secs = min(SPEED_MAX_SECS, max(3, int(d.get("secs") or 8)))
+    name = _req_name(d)
+    secs = min(SPEED_MAX_SECS, max(3, int(d["secs"])))
     mode = str(d.get("mode") or "")
     if mode == "serve":
         ip = _tun_ip(name)
@@ -3550,7 +3411,7 @@ def op_speedtest(d):
         with _apply_lock:
             _ipt_ins_missing("filter", "INPUT", rule, _ipt_for(ip))
         threading.Thread(target=_speed_serve, args=(s, rule, secs, _ipt_for(ip)), daemon=True).start()
-        return {"ok": True, "ip": ip, "port": port, "secs": secs}
+        return {"ok": True, "ip": ip, "port": port}
     if mode == "run":
         if not _speed_lock.acquire(blocking=False):
             raise ValueError("a speed test is already running on this node")
@@ -3570,15 +3431,14 @@ def _speed_run(d, name, secs):
         raise ValueError("bad peer")
     if not 1 <= port <= 65535:
         raise ValueError("bad peer")
-    streams = min(SPEED_MAX_STREAMS, max(1, int(d.get("streams") or 4)))
+    streams = min(SPEED_MAX_STREAMS, max(1, int(d["streams"])))
     src = _tun_ip(name)
     up, nup = _speed_dir(b"U", ip, port, src, secs, streams)
     down, ndown = _speed_dir(b"D", ip, port, src, secs, streams)
     if not nup and not ndown:
         raise ValueError("nothing reached %s:%d over %s -- the far end is not listening or the "
                          "tunnel is not carrying" % (ip, port, name))
-    return {"ok": True, "secs": secs, "streams": streams, "up_mbit": up, "down_mbit": down,
-            "up_streams": nup, "down_streams": ndown}
+    return {"ok": True, "up_mbit": up, "down_mbit": down, "up_streams": nup, "down_streams": ndown}
 
 
 def op_portcheck(d):
@@ -3599,7 +3459,7 @@ def op_portcheck(d):
                     and str(c.get("listen_port")) == str(port)
                     and _ip_overlap(ip, str(c.get("listen_ip") or ""))), "")
         busy = bool(who)
-    return {"ok": True, "busy": busy, "who": who, "tunnel": tunnel, "port": port, "proto": proto, "ip": ip or ""}
+    return {"ok": True, "busy": busy, "who": who, "tunnel": tunnel}
 
 
 def op_edge_status(d):
@@ -3617,19 +3477,11 @@ def op_edge_status(d):
 _PEER_ADDR_RE = re.compile(r"^[0-9A-Fa-f:.]{1,64}$")
 
 
-def _port_or_zero(v):
-    try:
-        n = int(v or 0)
-    except (TypeError, ValueError):
-        return 0
-    return n if 1 <= n <= 65535 else 0
-
-
 def _read_status(name):
     empty = {"active": "", "epoch": 0, "ready": False, "health": [], "events": [], "ts": 0,
              "pair": {"low": "", "high": "", "low_kind": "", "high_kind": ""},
              "rot": {"sport": 0, "dport": 0, "dports": 0, "every": 0, "lo": 0, "hi": 0, "drawn": 0},
-             "path": {"src": "", "sport": 0, "dst": "", "dport": 0}}
+             "path": {"sport": 0}}
     try:
         with open(_cfg_path(name, ".status")) as f:
             st = json.load(f)
@@ -3662,22 +3514,18 @@ def _read_status(name):
             "pair": {"low": str(pair.get("low") or ""), "high": str(pair.get("high") or ""),
                      "low_kind": str(pair.get("low_kind") or ""),
                      "high_kind": str(pair.get("high_kind") or "")},
-            "rot": {"sport": _port_or_zero(rt.get("sport")),
-                    "dport": _port_or_zero(rt.get("dport")),
+            "rot": {"sport": _port_or(rt.get("sport"), 0),
+                    "dport": _port_or(rt.get("dport"), 0),
                     "dports": max(0, min(MAX_DPORTS, int(rt.get("dports") or 0))),
                     "every": max(0, min(MAX_SPROT_EVERY, int(rt.get("every") or 0))),
-                    "lo": _port_or_zero(rt.get("lo")), "hi": _port_or_zero(rt.get("hi")),
+                    "lo": _port_or(rt.get("lo"), 0), "hi": _port_or(rt.get("hi"), 0),
                     "drawn": max(0, int(rt.get("drawn") or 0))},
-            "path": {"src": str(pk.get("src") or ""), "sport": _port_or_zero(pk.get("sport")),
-                     "dst": str(pk.get("dst") or ""), "dport": _port_or_zero(pk.get("dport"))}}
+            "path": {"sport": _port_or(pk.get("sport"), 0)}}
 
 
 def _axis_rows(st, kind):
     ok = lambda v: bool(v) and bool(_PEER_ADDR_RE.match(v))
-    rows = [h for h in st["health"] if h["kind"] == kind]
-    if kind in ("dst", "src"):
-        rows = [h for h in rows if ok(h["key"])]
-    return rows
+    return [h for h in st["health"] if h["kind"] == kind and ok(h["key"])]
 
 
 def _axis_section(st, kind, active):
@@ -3756,6 +3604,7 @@ CORE_SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 FETCH_MAX_AGENT = 262144
 FETCH_MAX_CORE = 64 << 20
 FETCH_BUDGET = 150
+FETCH_TIMEOUT = 45
 FETCH_CHUNK = 256 * 1024
 FETCH_TRIES = 6
 
@@ -3779,7 +3628,7 @@ def _resumes_at(resp, offset):
     return bool(m) and int(m.group(1)) == offset
 
 
-def _fetch_url(url, max_bytes, timeout=45, budget=FETCH_BUDGET):
+def _fetch_url(url, max_bytes):
     u = str(url or "").strip()
     low = u.lower()
     if low.startswith("http://"):
@@ -3787,7 +3636,7 @@ def _fetch_url(url, max_bytes, timeout=45, budget=FETCH_BUDGET):
             raise ValueError("update url must be https (plaintext is allowed only for the panel's own origin)")
     elif not low.startswith("https://"):
         raise ValueError("update url must be https")
-    deadline = time.monotonic() + budget
+    deadline = time.monotonic() + FETCH_BUDGET
     chunks, got, want, err = [], 0, 0, None
     done = False
     for _ in range(FETCH_TRIES):
@@ -3798,7 +3647,7 @@ def _fetch_url(url, max_bytes, timeout=45, budget=FETCH_BUDGET):
             hdrs["Range"] = "bytes=%d-" % got
         req = urllib.request.Request(u, headers=hdrs)
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
+            with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT) as r:
                 if got and not _resumes_at(r, got):
                     chunks, got = [], 0
                 try:
@@ -3809,7 +3658,7 @@ def _fetch_url(url, max_bytes, timeout=45, budget=FETCH_BUDGET):
                 while got <= max_bytes:
                     if time.monotonic() > deadline:
                         raise ValueError("download gave up after %ds with %d of %d bytes"
-                                         % (budget, got, want))
+                                         % (FETCH_BUDGET, got, want))
                     c = r.read1(FETCH_CHUNK)
                     if not c:
                         done = not want or got >= want
@@ -3908,7 +3757,7 @@ def op_set_update_key(d):
     conf = load_conf()
     cur = str(conf.get("update_pubkey") or "").strip()
     if cur == pub:
-        return {"ok": True, "already": True}
+        return {"ok": True}
     if not cur:
         return {"ok": False, "code": "no_update_key",
                 "error": "this node was installed without the panel key; reinstall it with the panel's install command"}
@@ -3918,7 +3767,7 @@ def op_set_update_key(d):
                 "error": "update key set by another panel; reinstall this node with this panel's install command"}
     conf["update_pubkey"] = pub
     save_conf(conf)
-    return {"ok": True, "rotated": True}
+    return {"ok": True}
 
 
 CORE_STAGED = CORE_BIN + ".new"
@@ -3956,7 +3805,7 @@ def op_core_put(d):
         if conf.get("core_version") != m["version"]:
             conf["core_version"] = m["version"]
             save_conf(conf)
-        return {"ok": True, "code": "same", "core_sha": want[:12]}
+        return {"ok": True, "code": "same"}
     if not _fresh(m, "core"):
         return STALE
     with _core_lock:
@@ -3965,7 +3814,7 @@ def op_core_put(d):
             f.write(raw)
         os.chmod(tmp, 0o755)
         os.replace(tmp, CORE_STAGED)
-    return {"ok": True, "code": "staged", "core_sha": want[:12]}
+    return {"ok": True, "code": "staged"}
 
 
 def op_core_apply(d):
@@ -3976,7 +3825,7 @@ def op_core_apply(d):
     with _core_lock:
         if not os.path.isfile(CORE_STAGED):
             if os.path.isfile(CORE_BIN) and _installed_core_sha() == want:
-                return {"ok": True, "code": "same", "core_sha": want[:12], "restarted": 0}
+                return {"ok": True, "code": "same", "restarted": 0}
             return {"ok": False, "code": "nothing_staged"}
         conf = load_conf()
         if not _fresh(m, "core", conf):
@@ -4009,8 +3858,7 @@ def op_core_apply(d):
         if why:
             failed.append({"name": FRONT_UNIT, "error": why[:120]})
     logline("core %s applied (sha %s); relaunched %d tunnel(s)" % (label, want[:12], restarted))
-    return {"ok": True, "code": "applied", "version": label, "core_sha": want[:12],
-            "restarted": restarted, "failed": failed}
+    return {"ok": True, "code": "applied", "restarted": restarted, "failed": failed}
 
 
 def op_update(d):
@@ -4033,7 +3881,7 @@ def op_update(d):
     if m["sha256"] != h:
         return {"ok": False, "code": "sha_mismatch"}
     if h == _SELF_SHA:
-        return {"ok": True, "sha256": h, "restarting": False, "already": True}
+        return {"ok": True}
     if not _fresh(m, "agent"):
         return STALE
     try:
@@ -4074,7 +3922,7 @@ def op_update(d):
     subprocess.Popen(["sh", "-c", "sleep 1; systemctl restart tnl-node"],
                      start_new_session=True, stdin=subprocess.DEVNULL,
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return {"ok": True, "sha256": h, "restarting": True}
+    return {"ok": True}
 
 
 def _ech_patch(obj, clean):
@@ -4089,10 +3937,8 @@ def _ech_patch(obj, clean):
 
 
 def op_ech_update(d):
-    _require(d, ["name", "snis"])
-    name = str(d["name"])
-    if not NAME_RE.match(name):
-        raise ValueError("bad name")
+    name = _req_name(d)
+    _require(d, ["snis"])
     if not (_is_ws_pool(name) or _is_ws_single(name)):
         return {"ok": False, "error": "not a ws tunnel"}
     snis = d.get("snis") or {}
@@ -4101,7 +3947,7 @@ def op_ech_update(d):
     clean = {}
     for h, e in snis.items():
         e = str(e or "").strip()
-        if e and len(e) <= 4096 and re.match(r"^[A-Za-z0-9+/=]+$", e):
+        if e and _b64_ok(e, 4096):
             clean[str(h)[:255]] = e
     if not clean:
         return {"ok": False, "error": "no valid ech"}
@@ -4111,7 +3957,7 @@ def op_ech_update(d):
     err = _atomic_write_json(path, {"snis": clean})
     if err:
         return {"ok": False, "error": err}
-    return {"ok": True, "hosts": list(clean.keys())}
+    return {"ok": True}
 
 
 def op_kernel_tune(d):
@@ -4282,13 +4128,13 @@ class Handler(BaseHTTPRequestHandler):
     def _authed(self, method):
         want = self.server.conf.get("token", "")
         if not want:
-            return ""
+            return False
         sig = self.headers.get("X-Sig", "")
         if not sig:
-            return ""
+            return False
         central = "|".join(self.headers.get(h, "") for h in ("X-Central-Host", "X-Central-Port", "X-Central-TLS"))
-        return "sig" if _sig_ok(want, method, self.path, self.headers.get("X-Ctr", ""),
-                                self.headers.get("X-Body", ""), central, sig) else ""
+        return _sig_ok(want, method, self.path, self.headers.get("X-Ctr", ""),
+                       self.headers.get("X-Body", ""), central, sig)
 
     def _resp_sig(self, code, data):
         tok = self.server.conf.get("token", "")
@@ -4338,20 +4184,18 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, {"error": "not found"})
             return
         cmd = WIRE.get(path[5:], "")
-        how = self._authed(method)
-        if not how:
+        if not self._authed(method):
             self._send(401, {"error": "bad or missing node token"})
             return
-        if how == "sig":
-            try:
-                ctr = int(self.headers.get("X-Ctr", ""))
-            except (TypeError, ValueError):
-                ctr = -1
-            if not _accept_ctr(ctr):
-                with _req_ctr_lock:
-                    cur = _req_ctr
-                self._send(409, {"code": "stale_counter", "error": "stale counter", "ctr": cur})
-                return
+        try:
+            ctr = int(self.headers.get("X-Ctr", ""))
+        except (TypeError, ValueError):
+            ctr = -1
+        if not _accept_ctr(ctr):
+            with _req_ctr_lock:
+                cur = _req_ctr
+            self._send(409, {"code": "stale_counter", "error": "stale counter", "ctr": cur})
+            return
         if cmd not in OPS:
             self._send(404, {"error": "unknown endpoint"})
             return
@@ -4360,7 +4204,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         cap = 33554432 if cmd == "core-put" else 1048576
         d = self._body(cap) if method == "POST" else {}
-        if how == "sig" and not self._body_matches_sig():
+        if not self._body_matches_sig():
             self._send(401, {"error": "body does not match the signature"})
             return
         _trust(self.client_address[0])
@@ -4412,19 +4256,13 @@ def service_active():
 SETTLE_SECS = 6
 
 
-def _unit_state():
-    out = run(["systemctl", "show", "-p", "ActiveState", "-p", "SubState", "-p", "ExecMainStatus", SERVICE],
-              timeout=10)[1]
-    return dict(ln.split("=", 1) for ln in out.splitlines() if "=" in ln)
-
-
 def service_restart():
     svc("stop")
     svc("reset-failed")
     svc("start")
     end = time.monotonic() + SETTLE_SECS
     while True:
-        st = _unit_state()
+        st = _unit_show(SERVICE, "ActiveState", "SubState", "ExecMainStatus")
         if st.get("ActiveState") == "failed" or st.get("SubState", "").startswith("auto-restart"):
             return "port" if st.get("ExecMainStatus") == str(errno.EADDRINUSE) else "down"
         if time.monotonic() >= end:
@@ -4571,7 +4409,6 @@ def do_auto_install(port, key=""):
         print(f"TNL_INSTALL_FAIL={why}")
         sys.exit(1)
     print("TNL_INSTALL_OK")
-    print(f"TNL_NODE_PORT={conf['port']}")
     print(f"TNL_NODE_TOKEN={conf['token']}")
 
 
