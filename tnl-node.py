@@ -612,9 +612,8 @@ def band_ok(lo, hi):
     return MIN_BAND_LO <= lo <= hi <= 65535 and hi - lo + 1 >= MIN_BAND_SPAN
 
 
-def _rotate_secs(d, key, default, hi):
-    v = d.get(key)
-    n = default if v is None else int(v)
+def _rotate_secs(d, key, hi):
+    n = int(d[key])
     if n < 0 or n > hi or 0 < n < MIN_ROTATE_SECS:
         raise ValueError("%s must be 0 or between %d and %d" % (key, MIN_ROTATE_SECS, hi))
     return n
@@ -2357,7 +2356,7 @@ def op_tunnel(d):
                         obj["ws_edge_snis"] = clean_snis
                         if ip_groups:
                             obj["ws_edge_ip_groups"] = ip_groups
-                        obj["ws_rotate_secs"] = _rotate_secs(d, "ws_rotate_secs", 600, 28800)
+                        obj["ws_rotate_secs"] = _rotate_secs(d, "ws_rotate_secs", 28800)
             if role == "client" and _as_bool(d.get("ws_port_roll")):
                 obj["ws_port_roll"] = True
             edge = str(d.get("edge_ip") or "").strip()
@@ -2492,7 +2491,7 @@ def op_tunnel(d):
                     obj["peer_ips"] = pips
                 if sips:
                     obj["src_ips"] = sips
-                obj["peer_rotate_secs"] = _rotate_secs(d, "peer_rotate_secs", 0, 86400)
+                obj["peer_rotate_secs"] = _rotate_secs(d, "peer_rotate_secs", 86400)
         if transport in ("udp", "tcp", "raw") and role == "server" and _as_bool(d.get("pool_listen")):
             obj["pool_listen"] = True
             if transport in ("udp", "tcp"):
