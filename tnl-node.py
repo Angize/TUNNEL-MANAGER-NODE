@@ -589,9 +589,13 @@ def _installed_core_sha():
         return ""
 
 
+class CoreMissing(RuntimeError):
+    pass
+
+
 def _ensure_core():
     if not os.path.isfile(CORE_BIN):
-        raise RuntimeError("core not installed on this node (push it from the panel)")
+        raise CoreMissing("core not installed on this node (push it from the panel)")
 
 
 def _core_port(cfg):
@@ -610,12 +614,22 @@ MIN_BAND_LO = 1024
 MIN_BAND_SPAN = 100
 MAX_PORT_TRIES = 60
 MAX_FEC_DATA = 64
+MAX_HOP_BUDGET = 8
+MIN_ROTATE_SECS = 10
 QUEUEING_TRANSPORTS = ("raw", "udp")
 BUF_KNOBS = (("sock_buf", QUEUEING_TRANSPORTS), ("tcp_buf", ("tcp", "ws")))
 
 
 def band_ok(lo, hi):
     return MIN_BAND_LO <= lo <= hi <= 65535 and hi - lo + 1 >= MIN_BAND_SPAN
+
+
+def _rotate_secs(d, key, default, hi):
+    v = d.get(key)
+    n = default if v is None else int(v)
+    if n < 0 or n > hi or 0 < n < MIN_ROTATE_SECS:
+        raise ValueError("%s must be 0 or between %d and %d" % (key, MIN_ROTATE_SECS, hi))
+    return n
 
 
 DEAD_RETEST_MIN = 5
@@ -653,7 +667,8 @@ def _core_tuning(tn):
                 iv = int(x)
             except (TypeError, ValueError):
                 continue
-            steps.append(max(lo, min(hi, iv)))
+            if lo <= iv <= hi:
+                steps.append(iv)
         if steps:
             out[k] = steps
     return out
@@ -723,7 +738,7 @@ def _core_config(cfg):
         _v = int(cfg.get(_k) or 0)
         if _v and transport in _carriers:
             corecfg[_k] = _v
-    if bool(cfg.get("cover")) and transport == "tcp" and crypto_on:
+    if bool(cfg.get("cover")):
         corecfg["cover"] = True
         sni = str(cfg.get("cover_sni") or "").strip()
         if sni:
@@ -822,9 +837,8 @@ def _core_config(cfg):
                 mode = str(cfg.get("sni_mode") or "").strip().lower()
                 if mode in ("disorder", "fake"):
                     corecfg["sni_mode"] = mode
-                    st = int(cfg.get("split_ttl") or 0)
-                    if st:
-                        corecfg["split_ttl"] = max(0, min(255, st))
+                    if cfg.get("split_ttl"):
+                        corecfg["split_ttl"] = cfg["split_ttl"]
             ech = str(cfg.get("ws_ech") or "").strip()
             if ech:
                 corecfg["ws_ech"] = ech
@@ -839,8 +853,7 @@ def _core_config(cfg):
                                          **({"group": s["group"]} if s.get("group") else {})} for s in snis]
                 if cfg.get("ws_edge_ip_groups"):
                     corecfg["ws_edge_ip_groups"] = dict(cfg["ws_edge_ip_groups"])
-                _wrs = cfg.get("ws_rotate_secs")
-                corecfg["ws_rotate_secs"] = 600 if _wrs is None else max(0, min(28800, int(_wrs)))
+                corecfg["ws_rotate_secs"] = cfg["ws_rotate_secs"]
         if bool(cfg.get("ws_port_roll")):
             corecfg["ws_port_roll"] = True
         if cfg.get("role") == "server":
@@ -862,25 +875,22 @@ def _core_config(cfg):
         corecfg["gso"] = True
     if transport in ("raw", "tcp", "ws") and cfg.get("role") == "client" and bool(cfg.get("fake_desync")):
         corecfg["fake_desync"] = True
-        corecfg["fake_count"] = max(1, min(64, int(cfg.get("fake_count") or 2)))
-        mode = str(cfg.get("fake_mode") or "ttl").strip().lower()
-        if mode not in ("ttl", "badsum", "both"):
-            mode = "ttl"
-        corecfg["fake_mode"] = mode
-        if not (transport == "raw" and mode == "badsum"):
-            corecfg["fake_ttl"] = max(1, min(255, int(cfg.get("fake_ttl") or 4)))
+        corecfg["fake_count"] = cfg["fake_count"]
+        corecfg["fake_mode"] = cfg["fake_mode"]
+        if not (transport == "raw" and cfg["fake_mode"] == "badsum"):
+            corecfg["fake_ttl"] = cfg["fake_ttl"]
     if transport in ("udp", "tcp", "raw") and str(cfg.get("role")) == "client":
         ordered = _ordered_pool(str(cfg.get("remote_ip") or ""), cfg.get("peer_ips"))
         if len(ordered) >= 2:
             corecfg["peer_ips"] = [f"{ip}:{port}" if transport in ("udp", "tcp") else ip for ip in ordered]
-            corecfg["peer_rotate_secs"] = max(0, int(cfg.get("peer_rotate_secs") or 0))
+            corecfg["peer_rotate_secs"] = cfg["peer_rotate_secs"]
         _src_sel = [str(x).strip() for x in (cfg.get("src_ips") or []) if str(x).strip()]
         sord = _ordered_pool(str(cfg.get("local_ip") or ""), _src_sel)
         if len(sord) >= 2:
             sord = _live_local(name, "src_ips", sord)
             if len(sord) >= 2:
                 corecfg["src_ips"] = sord
-                corecfg.setdefault("peer_rotate_secs", max(0, int(cfg.get("peer_rotate_secs") or 0)))
+                corecfg.setdefault("peer_rotate_secs", cfg["peer_rotate_secs"])
     if cfg.get("role") == "server":
         lip = cfg.get("local_ip") or "0.0.0.0"
         pooled = bool(cfg.get("pool_listen"))
@@ -928,7 +938,7 @@ def _unit_last_error(unit, lines=40):
     rc, out, _ = run(args, timeout=10)
     if rc != 0 or not out:
         return ""
-    tag = "tnl-core: "
+    tag = "tnl-core: fatal: "
     for ln in reversed(out.splitlines()):
         i = ln.find(tag)
         if i >= 0:
@@ -958,9 +968,9 @@ def _netdev_missing_reason(name, ttype):
         why = _core_last_error(name)
         if why:
             return "core did not come up: " + why
+        return "core did not come up (no iface)"
     need = {"vxlan": "vxlan", "gre": "ip_gre", "sit": "sit", "ipip": "ipip",
-            "l2tpv3": "l2tp_eth", "fou": "fou and ipip", "ipsec": "xfrm_interface",
-            "core": "tnl-core"}.get(ttype, ttype)
+            "l2tpv3": "l2tp_eth", "fou": "fou and ipip", "ipsec": "xfrm_interface"}.get(ttype, ttype)
     return "iface %s not created: %s is missing on this node" % (name, need)
 
 
@@ -1528,7 +1538,6 @@ def peer_of(tunnel_ip, ttype):
 PROBE_PORT = 9
 PROBE_WAIT = 0.8
 PROBE_COUNT = 20
-PROBE_MIN_SAMPLE = 5
 PROBE_MIN_PCT = 15
 PROBE_MIN_PCT_RANGE = (5, 100)
 SWEEP_SLOW = 3.0
@@ -1622,7 +1631,7 @@ def carrying(hits, sent, pct):
 
 def probe_verdict(cfg):
     hits, sent, rtt = tun_probe(cfg["name"], cfg["tunnel_ip"], cfg.get("type"))
-    if sent < PROBE_MIN_SAMPLE:
+    if not sent:
         return None, None, None
     return carrying(hits, sent, probe_min_pct(cfg)), rtt, round((sent - hits) * 100.0 / sent, 1)
 
@@ -2350,13 +2359,15 @@ def op_tunnel(d):
                 obj["ws_host"] = wh
             wp = str(d.get("ws_path") or "").strip()
             if wp:
-                if len(wp) > 1024 or not re.match(r"^/[\x21-\x7e]*$", wp):
+                if len(wp) > 256 or not re.match(r"^/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-Fa-f]{2})*$", wp):
                     raise ValueError("bad ws_path")
                 obj["ws_path"] = wp
             _cdn = str(d.get("cdn_carrier") or "").strip().lower()
             if _cdn:
                 if _cdn not in ("ws", "http", "grpc"):
                     raise ValueError("bad cdn_carrier")
+                if _cdn == "grpc" and role == "client" and not _as_bool(d.get("ws_tls")):
+                    raise ValueError("cdn_carrier grpc requires ws_tls")
                 if _cdn != "ws":
                     obj["cdn_carrier"] = _cdn
                 _up_max = {"http_up_workers": 16, "http_up_batch_kb": 512, "http_up_rate": 1000,
@@ -2397,8 +2408,8 @@ def op_tunnel(d):
                     if _sm in ("disorder", "fake"):
                         obj["sni_mode"] = _sm
                         st = int(d.get("split_ttl") or 0)
-                        if st < 0 or st > 255:
-                            raise ValueError("bad split_ttl")
+                        if st < 0 or st > MAX_HOP_BUDGET:
+                            raise ValueError("split_ttl must be between 0 and %d" % MAX_HOP_BUDGET)
                         if st:
                             obj["split_ttl"] = st
                 pips = [str(x).strip() for x in (d.get("ws_edge_ips") or []) if str(x).strip()]
@@ -2438,12 +2449,25 @@ def op_tunnel(d):
                     if not set(ip_groups) <= set(pips):
                         raise ValueError("ws_edge_ip_groups names an IP that is not in ws_edge_ips")
                     if pips and clean_snis:
+                        if ip_groups or any("group" in s for s in clean_snis):
+                            have = set()
+                            for ip in pips:
+                                if not ip_groups.get(ip):
+                                    raise ValueError("ws_edge_ip_groups: edge IP %s has no group" % ip)
+                                have.add(ip_groups[ip])
+                            used = set()
+                            for s in clean_snis:
+                                if s.get("group") not in have:
+                                    raise ValueError("ws edge pool: SNI %s is in no group that has an edge IP" % s["host"])
+                                used.add(s["group"])
+                            if have - used:
+                                raise ValueError("ws_edge_ip_groups: group %s has edge IPs but no SNI"
+                                                 % sorted(have - used)[0])
                         obj["ws_edge_ips"] = pips
                         obj["ws_edge_snis"] = clean_snis
                         if ip_groups:
                             obj["ws_edge_ip_groups"] = ip_groups
-                        _rs = d.get("ws_rotate_secs")
-                        obj["ws_rotate_secs"] = max(0, min(28800, int(_rs))) if _rs is not None else 600
+                        obj["ws_rotate_secs"] = _rotate_secs(d, "ws_rotate_secs", 600, 28800)
             if role == "client" and _as_bool(d.get("ws_port_roll")):
                 obj["ws_port_roll"] = True
             edge = str(d.get("edge_ip") or "").strip()
@@ -2459,6 +2483,8 @@ def op_tunnel(d):
                 sc = str(d.get("srv_cert") or "")
                 sk = str(d.get("srv_key") or "")
                 if sc.strip() or sk.strip():
+                    if obj.get("cdn_carrier") == "grpc":
+                        raise ValueError("server TLS termination covers the ws and http carriers only (grpc speaks HTTP/2)")
                     if ("BEGIN CERTIFICATE" not in sc or "BEGIN" not in sk
                             or len(sc) > 16384 or len(sk) > 16384):
                         raise ValueError("bad srv_cert/srv_key")
@@ -2494,6 +2520,10 @@ def op_tunnel(d):
                 rproto = int(d.get("raw_proto") or 0)
                 if rproto and not (1 <= rproto <= 255):
                     raise ValueError("bad raw_proto")
+                owner = next((k for k, v in RAW_PROTO_NUM.items() if v == rproto and k != "bare"), "")
+                if owner:
+                    raise ValueError('raw_proto %d is the "%s" profile\'s protocol number; use raw_profile "%s"'
+                                     % (rproto, owner, owner))
                 if rproto:
                     obj["raw_proto"] = rproto
             if ported:
@@ -2574,8 +2604,7 @@ def op_tunnel(d):
                     obj["peer_ips"] = pips
                 if sips:
                     obj["src_ips"] = sips
-                _prs = d.get("peer_rotate_secs")
-                obj["peer_rotate_secs"] = max(0, min(86400, int(_prs))) if _prs is not None else 0
+                obj["peer_rotate_secs"] = _rotate_secs(d, "peer_rotate_secs", 0, 86400)
         if transport in ("udp", "tcp", "raw") and role == "server" and _as_bool(d.get("pool_listen")):
             obj["pool_listen"] = True
             if transport in ("udp", "tcp"):
@@ -2598,6 +2627,8 @@ def op_tunnel(d):
         if transport == "raw" and (not psk or cipher == "none"):
             raise ValueError("raw requires a psk")
         if _as_bool(d.get("cover")) and transport == "tcp":
+            if not psk or cipher == "none":
+                raise ValueError("cover requires a psk and encryption")
             obj["cover"] = True
             sni = str(d.get("cover_sni") or "").strip()
             if not sni:
@@ -2610,10 +2641,12 @@ def op_tunnel(d):
         if _as_bool(d.get("fake_desync")):
             if transport not in ("raw", "tcp", "ws"):
                 raise ValueError("fake_desync is supported on the raw, tcp and ws carriers (not udp)")
+            if obj.get("cdn_carrier") in ("http", "grpc"):
+                raise ValueError("fake_desync does not work on the http/grpc carrier")
             obj["fake_desync"] = True
             ttl = int(d.get("fake_ttl") or 4)
-            if ttl < 1 or ttl > 255:
-                raise ValueError("fake_ttl out of range (1..255)")
+            if ttl < 1 or ttl > MAX_HOP_BUDGET:
+                raise ValueError("fake_ttl out of range (1..%d)" % MAX_HOP_BUDGET)
             obj["fake_ttl"] = ttl
             cnt = int(d.get("fake_count") or 2)
             if cnt < 1 or cnt > 64:
@@ -2622,6 +2655,8 @@ def op_tunnel(d):
             mode = str(d.get("fake_mode") or "ttl").strip().lower()
             if mode not in ("ttl", "badsum", "both"):
                 raise ValueError("bad fake_mode")
+            if mode == "both" and cnt == 1:
+                raise ValueError("fake_mode both needs fake_count >= 2")
             obj["fake_mode"] = mode
     if old and old.get("type") != "portfw":
         teardown_config(old)
@@ -2638,15 +2673,17 @@ def op_tunnel(d):
                 restored = False
             old_async_tun = old.get("type") == "core"
             if restored and (not old.get("enabled", True) or old_async_tun or run(["ip", "link", "show", name])[0] == 0):
-                return {"ok": False, "msg": msg, "restored": True}
+                return {"ok": False, "error": msg, "restored": True}
         try:
             os.remove(os.path.join(CONFIG_DIR, name + ".json"))
         except OSError:
             pass
-        return {"ok": False, "msg": msg, "restored": False}
+        return {"ok": False, "error": msg, "restored": False}
 
     try:
         apply_config(obj)
+    except CoreMissing as e:
+        return dict(_fail(str(e)), code="no_core")
     except Exception as e:
         return _fail(str(e))
     if not obj.get("enabled", True):
@@ -2696,7 +2733,7 @@ def op_portfw(d):
     try:
         _pf_swap(obj)
     except Exception as e:
-        return {"ok": False, "msg": str(e)}
+        return {"ok": False, "error": str(e)}
     return {"ok": True, "name": name}
 
 
@@ -2720,11 +2757,10 @@ def op_portfw_edit(d):
     if not ips or not all(is_ipv4(x) for x in ips):
         raise ValueError("bad destination IP")
     rot = d.get("rotate")
-    if rot is None:
-        interval = (int(d["interval_min"]) * 60 if d.get("interval_min") not in (None, "")
-                    else int(old.get("switch_interval", 0) or 0))
-    else:
-        interval = int(d.get("interval_min", 5)) * 60 if rot else 0
+    interval = (int(d["interval_min"]) * 60 if d.get("interval_min") not in (None, "")
+                else int(old.get("switch_interval", 0) or 0))
+    if rot is not None:
+        interval = (interval or 300) if rot else 0
     if len(ips) < 2:
         interval = 0
     if "listen_ip" in d:
@@ -2757,7 +2793,7 @@ def op_portfw_edit(d):
     try:
         _pf_swap(obj, old)
     except Exception as e:
-        return {"ok": False, "msg": str(e)}
+        return {"ok": False, "error": str(e)}
     _health_now(obj)
     return {"ok": True, "name": old["name"]}
 
@@ -2805,7 +2841,7 @@ def op_link_enable(d):
     try:
         _set_link_state(cfg, enabled)
     except Exception as e:
-        return {"ok": False, "msg": str(e)}
+        return {"ok": False, "error": str(e)}
     write_config(name, cfg)
     if cfg.get("type") == "portfw":
         _health_now(cfg)
@@ -3137,7 +3173,7 @@ def op_front(d):
     except RuntimeError as e:
         why = "relay: " + str(e)[:200]
     out = _front_apply(d)
-    return {"ok": False, "msg": why} if why and out.get("ok") else dict(out, relays=len(rows))
+    return {"ok": False, "error": why} if why and out.get("ok") else dict(out, relays=len(rows))
 
 
 def _front_apply(d):
@@ -3160,7 +3196,7 @@ def _front_apply(d):
             return {"ok": True, "routes": len(obj["routes"]), "reloaded": True}
         if why:
             _write_json_durable(FRONT_CFG, prev)
-            return {"ok": False, "msg": why}
+            return {"ok": False, "error": why}
     why = _front_start()
     if why:
         if prev:
@@ -3170,7 +3206,7 @@ def _front_apply(d):
                 why = "%s; the previous front did not come back either: %s" % (why, back)
         else:
             os.remove(FRONT_CFG)
-        return {"ok": False, "msg": why}
+        return {"ok": False, "error": why}
     return {"ok": True, "routes": len(obj["routes"]), "reloaded": False}
 
 
@@ -3182,15 +3218,15 @@ def op_core_restart(d):
     if cfg.get("type") != "core":
         raise ValueError("only a core tunnel has a process to restart")
     if not _as_bool(cfg.get("enabled", True)):
-        return {"ok": False, "msg": "tunnel disabled"}
+        return {"ok": False, "error": "tunnel disabled"}
     if not os.path.exists(_cfg_path(name, ".json")):
-        return {"ok": False, "msg": "core config missing on this node"}
+        return {"ok": False, "error": "core config missing on this node"}
     try:
         up = _core_relaunch(cfg)
     except RuntimeError as e:
-        return {"ok": False, "msg": str(e)[:300]}
+        return {"ok": False, "error": str(e)[:300]}
     if not up:
-        return {"ok": False, "msg": "core did not come up (no iface)"}
+        return {"ok": False, "error": "core did not come up (no iface)"}
     return {"ok": True}
 
 
@@ -3875,11 +3911,11 @@ def op_set_update_key(d):
         return {"ok": True, "already": True}
     if not cur:
         return {"ok": False, "code": "no_update_key",
-                "msg": "this node was installed without the panel key; reinstall it with the panel's install command"}
+                "error": "this node was installed without the panel key; reinstall it with the panel's install command"}
     m = _statement(str(d.get("rotate") or ""), ROTATE_TAG, d.get("sig"))
     if m is None or m.get("pubkey_sha256") != hashlib.sha256(pub.encode()).hexdigest():
         return {"ok": False, "code": "key_mismatch",
-                "msg": "update key set by another panel; reinstall this node with this panel's install command"}
+                "error": "update key set by another panel; reinstall this node with this panel's install command"}
     conf["update_pubkey"] = pub
     save_conf(conf)
     return {"ok": True, "rotated": True}
@@ -3893,7 +3929,7 @@ def _core_bytes(d, want):
         try:
             raw = _fetch_url(d["url"], FETCH_MAX_CORE)
         except Exception as e:
-            return None, {"ok": False, "code": "download_failed", "msg": str(e)[:140]}
+            return None, {"ok": False, "code": "download_failed", "error": str(e)[:140]}
     else:
         _require(d, ["data"])
         try:
@@ -3964,14 +4000,14 @@ def op_core_apply(d):
                 restarted += 1
             else:
                 failed.append({"name": c.get("name"),
-                               "msg": _netdev_missing_reason(c.get("name", ""), "core")
+                               "error": _netdev_missing_reason(c.get("name", ""), "core")
                                       or "core did not come up"})
         except Exception as e:
-            failed.append({"name": c.get("name"), "msg": str(e)[:120]})
+            failed.append({"name": c.get("name"), "error": str(e)[:120]})
     if os.path.isfile(FRONT_CFG):
         why = _front_start()
         if why:
-            failed.append({"name": FRONT_UNIT, "msg": why[:120]})
+            failed.append({"name": FRONT_UNIT, "error": why[:120]})
     logline("core %s applied (sha %s); relaunched %d tunnel(s)" % (label, want[:12], restarted))
     return {"ok": True, "code": "applied", "version": label, "core_sha": want[:12],
             "restarted": restarted, "failed": failed}
@@ -3986,11 +4022,11 @@ def op_update(d):
         try:
             raw = _fetch_url(d["url"], FETCH_MAX_AGENT)
         except Exception as e:
-            return {"ok": False, "code": "download_failed", "msg": str(e)[:140]}
+            return {"ok": False, "code": "download_failed", "error": str(e)[:140]}
         try:
             src = raw.decode()
         except UnicodeDecodeError:
-            return {"ok": False, "code": "bad_agent", "msg": "not utf-8 text"}
+            return {"ok": False, "code": "bad_agent", "error": "not utf-8 text"}
     if not isinstance(src, str) or not src.strip():
         raise ValueError("empty code")
     h = hashlib.sha256(src.encode()).hexdigest()
@@ -4003,7 +4039,7 @@ def op_update(d):
     try:
         compile(src, "tnl-node.py", "exec")
     except SyntaxError as e:
-        return {"ok": False, "code": "bad_agent", "msg": str(e)[:140]}
+        return {"ok": False, "code": "bad_agent", "error": str(e)[:140]}
     tmp = INSTALLED + ".new"
     try:
         with open(tmp, "w") as f:
@@ -4015,7 +4051,7 @@ def op_update(d):
             os.remove(tmp)
         except OSError:
             pass
-        return {"ok": False, "code": "bad_agent", "msg": str(e)[:140]}
+        return {"ok": False, "code": "bad_agent", "error": str(e)[:140]}
     try:
         with open(INSTALLED, "rb") as f:
             disk_sha = hashlib.sha256(f.read()).hexdigest()
@@ -4314,7 +4350,7 @@ class Handler(BaseHTTPRequestHandler):
             if not _accept_ctr(ctr):
                 with _req_ctr_lock:
                     cur = _req_ctr
-                self._send(409, {"error": "stale counter", "ctr": cur})
+                self._send(409, {"code": "stale_counter", "error": "stale counter", "ctr": cur})
                 return
         if cmd not in OPS:
             self._send(404, {"error": "unknown endpoint"})
