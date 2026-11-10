@@ -2581,6 +2581,20 @@ def op_tunnel(d):
     return {"ok": True, "name": name}
 
 
+def _pf_listen(d, iface):
+    listen_ip = str(d.get("listen_ip") or "").strip()
+    if listen_ip:
+        if not is_ipv4(listen_ip):
+            raise ValueError("bad listen IP")
+        if listen_ip not in local_ips_flat():
+            raise ValueError(f"{listen_ip} is not a local IP on this node")
+    if not d.get("iface"):
+        liface = iface_for_ip(listen_ip)
+        if liface and IFACE_RE.match(liface):
+            iface = liface
+    return listen_ip, iface
+
+
 def op_portfw(d):
     _require(d, ["listen_port", "dst_port", "dst_ips"])
     iface = d.get("iface") or default_iface()
@@ -2593,15 +2607,7 @@ def op_portfw(d):
     ips = [x.strip() for x in ips if x.strip()]
     if not ips or not all(is_ipv4(x) for x in ips):
         raise ValueError("bad destination IP")
-    listen_ip = str(d.get("listen_ip") or "").strip()
-    if listen_ip:
-        if not is_ipv4(listen_ip):
-            raise ValueError("bad listen IP")
-        if listen_ip not in local_ips_flat():
-            raise ValueError(f"{listen_ip} is not a local IP on this node")
-        liface = iface_for_ip(listen_ip)
-        if liface and IFACE_RE.match(liface):
-            iface = liface
+    listen_ip, iface = _pf_listen(d, iface)
     interval = int(d.get("interval_min", 5)) * 60 if d.get("rotate") and len(ips) > 1 else 0
     why = _pf_conflict(iface, lp, listen_ip)
     if why:
@@ -2651,16 +2657,7 @@ def op_portfw_edit(d):
     if len(ips) < 2:
         interval = 0
     if "listen_ip" in d:
-        listen_ip = str(d.get("listen_ip") or "").strip()
-        if listen_ip:
-            if not is_ipv4(listen_ip):
-                raise ValueError("bad listen IP")
-            if listen_ip not in local_ips_flat():
-                raise ValueError(f"{listen_ip} is not a local IP on this node")
-        if not d.get("iface"):
-            liface = iface_for_ip(listen_ip)
-            if liface and IFACE_RE.match(liface):
-                iface = liface
+        listen_ip, iface = _pf_listen(d, iface)
     else:
         listen_ip = str(old.get("listen_ip") or "")
     why = _pf_conflict(iface, lp, listen_ip, skip=old["name"])
