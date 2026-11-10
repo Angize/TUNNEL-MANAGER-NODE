@@ -595,6 +595,7 @@ RAW_HEADER_LEN = {"bare": 0, "ipip": 28, "etherip": 2, "ipcomp": 4, "gre": 32, "
 RAW_PROTO_NUM = {"bare": 253, "ipip": 4, "etherip": 97, "ipcomp": 108, "gre": 47, "icmp": 1, "udp": 17,
                  "esp": 50, "l2tpv3": 115, "tcp": 6, "ah": 51, "sctp": 132}
 PORTED_RAW_PROFILES = ("udp", "tcp", "sctp")
+RAW_SUM_PROFILES = ("udp", "tcp", "sctp", "icmp")
 MAX_WORKERS = 8
 MAX_SPROT_EVERY = 60
 MAX_DPORTS = 16
@@ -2544,6 +2545,10 @@ def op_tunnel(d):
                 raise ValueError("bad fake_mode")
             if mode == "both" and cnt == 1:
                 raise ValueError("fake_mode both needs fake_count >= 2")
+            if (transport == "raw" and role == "client" and mode in ("badsum", "both")
+                    and obj["raw_profile"] not in RAW_SUM_PROFILES):
+                raise ValueError("fake_mode %s needs a raw profile with a checksum (%s); %s has none"
+                                 % (mode, ", ".join(RAW_SUM_PROFILES), obj["raw_profile"]))
             obj["fake_mode"] = mode
     if old and old.get("type") != "portfw":
         teardown_config(old)
