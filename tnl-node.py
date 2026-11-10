@@ -256,6 +256,19 @@ def all_ips():
     return {i: iface_ips(i) for i in list_ifaces()}
 
 
+def all_addrs():
+    rc, out, _ = run(["ip", "-o", "addr", "show", "scope", "global"])
+    res = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) > 3 and parts[2] in ("inet", "inet6"):
+            ips = res.setdefault(parts[1].split("@")[0], [])
+            ips.append(parts[3])
+            if len(parts) > 5 and parts[4] == "peer":
+                ips.append(parts[5])
+    return res
+
+
 def local_ips_flat():
     return [ip for ips in all_ips().values() for ip in ips]
 
@@ -2128,7 +2141,7 @@ def op_ping(d):
         pass
     return {"ok": True, "agent": "tnl-node", "version": AGENT_VERSION, "ready": True,
             "central": central_origin(),
-            "hostname": socket.gethostname(), "ips": all_ips(), "sha256": _SELF_SHA, "pin": _tls_pin,
+            "hostname": socket.gethostname(), "ips": all_ips(), "addrs": all_addrs(), "sha256": _SELF_SHA, "pin": _tls_pin,
             "tunnels": len([c for c in cfgs if c.get("type") != "portfw"]),
             "portfw": len([c for c in cfgs if c.get("type") == "portfw"]),
             "core_ver": _core_ref(), "core_sha": _installed_core_sha()[:12], "arch": _core_arch(),
