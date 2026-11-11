@@ -482,9 +482,7 @@ def build_ipip(cfg):
 
 
 def _l2tp_ids(cfg):
-    tid = int(cfg["id"])
-    port = int(cfg.get("port") or (20000 + tid))
-    return tid, port
+    return int(cfg["id"]), int(cfg["port"])
 
 
 def _l2tp_clear(cfg):
@@ -507,13 +505,9 @@ def build_l2tp(cfg):
     _up_netdev(name, cfg, 54)
 
 
-def _tunnel_port(cfg):
-    return int(cfg.get("port") or 20000)
-
-
 def build_fou(cfg):
     name = cfg["name"]
-    port = _tunnel_port(cfg)
+    port = int(cfg["port"])
     _modprobe("fou", "ipip")
     run(["ip", "link", "del", name])
     run(["ip", "fou", "add", "port", str(port), "ipproto", "4"])
@@ -697,7 +691,6 @@ def _ordered_pool(primary, extras):
 
 def _core_config(cfg):
     name = cfg["name"]
-    port = _tunnel_port(cfg)
     cipher = cfg["cipher"]
     crypto_on = bool(cfg.get("psk")) and cipher != "none"
     transport = cfg["transport"]
@@ -825,7 +818,7 @@ def _core_config(cfg):
     if transport in ("udp", "tcp", "raw") and str(cfg.get("role")) == "client":
         ordered = _ordered_pool(str(cfg.get("remote_ip") or ""), cfg.get("peer_ips"))
         if len(ordered) >= 2:
-            corecfg["peer_ips"] = [f"{ip}:{port}" if transport in ("udp", "tcp") else ip for ip in ordered]
+            corecfg["peer_ips"] = [f"{ip}:{int(cfg['port'])}" if transport in ("udp", "tcp") else ip for ip in ordered]
             corecfg["peer_rotate_secs"] = cfg["peer_rotate_secs"]
         sord = _ordered_pool(str(cfg.get("local_ip") or ""), cfg.get("src_ips"))
         if len(sord) >= 2:
@@ -841,22 +834,26 @@ def _core_config(cfg):
             pool_ips = _live_local(name, "listen_ips",
                                    [str(x).strip() for x in (cfg.get("listen_ips") or []) if str(x).strip()])
         if pool_ips:
+            port = int(cfg["port"])
             corecfg["listen"] = f"{pool_ips[0]}:{port}"
             corecfg["listen_ips"] = [f"{ip}:{port}" for ip in pool_ips]
         elif transport == "raw":
             corecfg["listen"] = "0.0.0.0" if pooled else lip
         else:
-            corecfg["listen"] = f"{lip}:{port}"
+            corecfg["listen"] = f"{lip}:{int(cfg['port'])}"
     else:
-        dial, dport = cfg["remote_ip"], port
-        edge = str(cfg.get("edge_ip") or "").strip()
-        if transport == "ws" and edge:
-            h, sep, p = edge.rpartition(":")
-            if sep:
-                dial, dport = h, int(p)
-            else:
-                dial, dport = edge, (443 if bool(cfg.get("ws_tls")) else 80)
-        corecfg["peer"] = dial if transport == "raw" else f"{dial}:{dport}"
+        if transport == "raw":
+            corecfg["peer"] = cfg["remote_ip"]
+        else:
+            dial, dport = cfg["remote_ip"], int(cfg["port"])
+            edge = str(cfg.get("edge_ip") or "").strip()
+            if transport == "ws" and edge:
+                h, sep, p = edge.rpartition(":")
+                if sep:
+                    dial, dport = h, int(p)
+                else:
+                    dial, dport = edge, (443 if bool(cfg.get("ws_tls")) else 80)
+            corecfg["peer"] = f"{dial}:{dport}"
         lip = str(cfg.get("local_ip") or "").strip()
         if lip:
             corecfg["bind_ip"] = lip
@@ -1381,8 +1378,8 @@ def teardown_config(cfg):
         _l2tp_clear(cfg)
     elif ttype == "fou":
         run(["ip", "link", "del", name])
-        port = _tunnel_port(cfg)
-        if not any(c.get("name") != name and c.get("type") == "fou" and _tunnel_port(c) == port for c in raw_configs()):
+        port = int(cfg["port"])
+        if not any(c.get("name") != name and c.get("type") == "fou" and int(c["port"]) == port for c in raw_configs()):
             run(["ip", "fou", "del", "port", str(port), "ipproto", "4"])
     elif ttype == "ipsec":
         _ipsec_clear(cfg)
@@ -3254,14 +3251,14 @@ def _tunnel_ports(c):
         transport = str(c.get("transport") or "udp").lower()
         if c.get("role") != "server" or transport == "raw":
             return []
-        port = _tunnel_port(c)
+        port = int(c["port"])
         pool = ([str(x).strip() for x in (c.get("listen_ips") or []) if str(x).strip()]
                 if c.get("pool_listen") and transport in ("udp", "tcp") else [])
         return [(ip, port) for ip in pool] or [(str(c.get("local_ip") or ""), port)]
     if t == "vxlan":
         return [("", c["port"])]
     if t == "fou":
-        return [("", _tunnel_port(c))]
+        return [("", int(c["port"]))]
     if t == "l2tpv3":
         return [(str(c.get("local_ip") or ""), _l2tp_ids(c)[1])]
     return []
