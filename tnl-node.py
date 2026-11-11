@@ -627,48 +627,6 @@ def _rotate_secs(d, key, hi):
     return n
 
 
-DEAD_RETEST_MIN = 5
-DEAD_RETEST_MAX = 86400
-
-_TUNING_INT_RANGES = {"dead_retest_secs": (DEAD_RETEST_MIN, DEAD_RETEST_MAX)}
-
-REVIVE_STEP_MIN = 10
-REVIVE_STEP_MAX = 3600
-BACKOFF_STEP_MIN = 1
-BACKOFF_STEP_MAX = 86400
-
-_TUNING_LIST_RANGES = {"suspect_backoff": (BACKOFF_STEP_MIN, BACKOFF_STEP_MAX),
-                       "ladder_revive": (REVIVE_STEP_MIN, REVIVE_STEP_MAX)}
-
-
-def _core_tuning(tn):
-    if not isinstance(tn, dict):
-        return {}
-    out = {}
-    for k, (lo, hi) in _TUNING_INT_RANGES.items():
-        try:
-            v = int(tn.get(k) or 0)
-        except (TypeError, ValueError):
-            continue
-        if v > 0:
-            out[k] = max(lo, min(hi, v))
-    for k, (lo, hi) in _TUNING_LIST_RANGES.items():
-        raw = tn.get(k)
-        if not isinstance(raw, (list, tuple)):
-            continue
-        steps = []
-        for x in raw:
-            try:
-                iv = int(x)
-            except (TypeError, ValueError):
-                continue
-            if lo <= iv <= hi:
-                steps.append(iv)
-        if steps:
-            out[k] = steps
-    return out
-
-
 def _live_local(name, key, ips):
     live = set(local_ips_flat())
     keep, gone = [], []
@@ -1453,7 +1411,6 @@ PROBE_PORT = 9
 PROBE_WAIT = 0.8
 PROBE_COUNT = 20
 PROBE_MIN_PCT = 15
-PROBE_MIN_PCT_RANGE = (5, 100)
 SWEEP_SLOW = 3.0
 SWEEP_FAST = 1.0
 RED_SWEEPS = 2
@@ -2205,14 +2162,11 @@ def op_tunnel(d):
            "remote_ip": peer_ip, "tunnel_ip": tunnel_ip, "local_ip": self_ip}
     old = read_config(name)
     obj["enabled"] = _as_bool(d.get("enabled", (old or {}).get("enabled", True)))
-    if d.get("probe_min_pct") not in (None, ""):
-        _lo, _hi = PROBE_MIN_PCT_RANGE
-        obj["probe_min_pct"] = max(_lo, min(_hi, int(d["probe_min_pct"])))
+    if "probe_min_pct" in d:
+        obj["probe_min_pct"] = int(d["probe_min_pct"])
     if ttype == "core":
-        _tn = _core_tuning(d.get("tuning"))
-        if _tn:
-            obj["tuning"] = _tn
-    if ttype == "core":
+        if d.get("tuning"):
+            obj["tuning"] = d["tuning"]
         for _k, _ in BUF_KNOBS:
             if d.get(_k) not in (None, ""):
                 _v = int(d[_k])
