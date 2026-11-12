@@ -602,7 +602,7 @@ RAW_HEADER_LEN = {"bare": 0, "ipip": 28, "etherip": 2, "ipcomp": 4, "gre": 32, "
 RAW_PROTO_NUM = {"bare": 253, "ipip": 4, "etherip": 97, "ipcomp": 108, "gre": 47, "icmp": 1, "udp": 17,
                  "esp": 50, "l2tpv3": 115, "tcp": 6, "ah": 51, "sctp": 132}
 PORTED_RAW_PROFILES = ("udp", "tcp", "sctp")
-RAW_FACADE_PORT = {"udp": 53, "tcp": 80}
+RAW_FACADE_PROFILES = ("udp", "tcp")
 RAW_SUM_PROFILES = ("udp", "tcp", "sctp", "icmp")
 MAX_WORKERS = 8
 MAX_SPROT_EVERY = 60
@@ -2426,15 +2426,12 @@ def op_tunnel(d):
             if rdp:
                 obj["raw_dports"] = rdp
             if _as_bool(d.get("raw_facade")):
-                if profile not in RAW_FACADE_PORT or down not in RAW_FACADE_PORT:
-                    raise ValueError("raw_facade dresses udp as DNS or tcp as HTTP, so raw_profile and "
-                                     "raw_profile_down must both be udp or both tcp")
-                if RAW_FACADE_PORT[profile] != RAW_FACADE_PORT[down]:
-                    raise ValueError("raw_facade imitates one protocol both ways, so raw_profile and "
-                                     "raw_profile_down must match")
-                if rdp:
-                    raise ValueError("raw_facade pins the forged destination port, so it cannot "
-                                     "combine with raw_dports")
+                if profile != down or profile not in RAW_FACADE_PROFILES:
+                    raise ValueError("raw_facade dresses udp as DNS and tcp as HTTP in both directions, so "
+                                     "raw_profile and raw_profile_down must both be udp or both tcp")
+                if obj.get("raw_port") or rdp:
+                    raise ValueError("raw_facade sets the forged service port itself, so it cannot "
+                                     "combine with raw_port or raw_dports")
                 obj["raw_facade"] = True
         blo = int(d.get("sport_lo") or 0)
         bhi = int(d.get("sport_hi") or 0)
