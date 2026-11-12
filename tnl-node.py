@@ -704,11 +704,9 @@ def _core_config(cfg):
             corecfg["raw_sport_random"] = True
         elif cfg.get("raw_sport"):
             corecfg["raw_sport"] = cfg["raw_sport"]
-        for key in ("raw_sport_rotate", "raw_dports"):
+        for key in ("raw_sport_rotate", "raw_dports", "raw_facade"):
             if cfg.get(key):
                 corecfg[key] = cfg[key]
-        if cfg.get("raw_facade"):
-            corecfg["raw_facade"] = True
     if cfg.get("sport_lo"):
         corecfg["sport_lo"], corecfg["sport_hi"] = cfg["sport_lo"], cfg["sport_hi"]
     if cfg.get("port_tries"):
