@@ -602,6 +602,7 @@ RAW_HEADER_LEN = {"bare": 0, "ipip": 28, "etherip": 2, "ipcomp": 4, "gre": 32, "
 RAW_PROTO_NUM = {"bare": 253, "ipip": 4, "etherip": 97, "ipcomp": 108, "gre": 47, "icmp": 1, "udp": 17,
                  "esp": 50, "l2tpv3": 115, "tcp": 6, "ah": 51, "sctp": 132}
 PORTED_RAW_PROFILES = ("udp", "tcp", "sctp")
+RAW_FACADE_PROFILES = ("udp", "tcp")
 RAW_SUM_PROFILES = ("udp", "tcp", "sctp", "icmp")
 MAX_WORKERS = 8
 MAX_SPROT_EVERY = 60
@@ -703,7 +704,7 @@ def _core_config(cfg):
             corecfg["raw_sport_random"] = True
         elif cfg.get("raw_sport"):
             corecfg["raw_sport"] = cfg["raw_sport"]
-        for key in ("raw_sport_rotate", "raw_dports"):
+        for key in ("raw_sport_rotate", "raw_dports", "raw_facade"):
             if cfg.get(key):
                 corecfg[key] = cfg[key]
     if cfg.get("sport_lo"):
@@ -2422,6 +2423,14 @@ def op_tunnel(d):
                 raise ValueError("bad raw_dports")
             if rdp:
                 obj["raw_dports"] = rdp
+            if _as_bool(d.get("raw_facade")):
+                if profile != down or profile not in RAW_FACADE_PROFILES:
+                    raise ValueError("raw_facade dresses udp as DNS and tcp as HTTP in both directions, so "
+                                     "raw_profile and raw_profile_down must both be udp or both tcp")
+                if obj.get("raw_port") or rdp:
+                    raise ValueError("raw_facade sets the forged service port itself, so it cannot "
+                                     "combine with raw_port or raw_dports")
+                obj["raw_facade"] = True
         blo = int(d.get("sport_lo") or 0)
         bhi = int(d.get("sport_hi") or 0)
         if blo or bhi:
